@@ -33,6 +33,20 @@ jobs:
       - name: Check Formatting
         run: cargo fmt --all -- --check
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - name: Install UI Dependencies
+        run: pnpm install
+
       - name: Run Tests
         run: cargo test --workspace --all-targets
 
