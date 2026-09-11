@@ -148,7 +148,9 @@ impl ActionExecutor {
                 FieldType::Text | FieldType::PathPicker => shell_quote(&val),
                 FieldType::Number { .. } => {
                     // Sanitize to only numeric chars
-                    val.chars().filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-').collect()
+                    val.chars()
+                        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                        .collect()
                 }
                 FieldType::Select { .. } => val, // verified against whitelist
                 FieldType::Checkbox => {
@@ -175,8 +177,14 @@ mod tests {
     #[test]
     fn test_shell_quote_escaping() {
         assert_eq!(shell_quote("simple"), "'simple'");
-        assert_eq!(shell_quote("file with spaces.txt"), "'file with spaces.txt'");
-        assert_eq!(shell_quote("file'with'quotes.txt"), "'file'\\''with'\\''quotes.txt'");
+        assert_eq!(
+            shell_quote("file with spaces.txt"),
+            "'file with spaces.txt'"
+        );
+        assert_eq!(
+            shell_quote("file'with'quotes.txt"),
+            "'file'\\''with'\\''quotes.txt'"
+        );
         assert_eq!(shell_quote("foo; rm -rf /"), "'foo; rm -rf /'");
     }
 
@@ -190,24 +198,25 @@ mod tests {
             scope: Scope::SelectedFiles,
             name: LocalizedText::new("Compress Tar", "Compactar Tar"),
             description: LocalizedText::new("Create tar.gz", "Criar tar.gz"),
-            fields: vec![
-                ActionField {
-                    id: "archive_name".to_string(),
-                    field_type: FieldType::Text,
-                    label: LocalizedText::new("Archive Name", "Nome do Arquivo"),
-                    description: None,
-                    default_value: Some("archive.tar.gz".to_string()),
-                    required: true,
-                    validation_regex: Some(r"^[a-zA-Z0-9_\-\.]+\.tar\.gz$".to_string()),
-                    risk_warning: false,
-                },
-            ],
+            fields: vec![ActionField {
+                id: "archive_name".to_string(),
+                field_type: FieldType::Text,
+                label: LocalizedText::new("Archive Name", "Nome do Arquivo"),
+                description: None,
+                default_value: Some("archive.tar.gz".to_string()),
+                required: true,
+                validation_regex: Some(r"^[a-zA-Z0-9_\-\.]+\.tar\.gz$".to_string()),
+                risk_warning: false,
+            }],
             template: "tar -czf {{archive_name}} ${selected_files}".to_string(),
         };
 
         let context = ActionContext::new(
             "/var/www",
-            vec!["/var/www/index.html".to_string(), "/var/www/style.css".to_string()],
+            vec![
+                "/var/www/index.html".to_string(),
+                "/var/www/style.css".to_string(),
+            ],
         );
 
         let mut params = HashMap::new();

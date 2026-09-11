@@ -9,7 +9,7 @@ use chrono::{TimeZone, Utc};
 use ssh2::{HashType, OpenFlags, Session};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::{Path};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task;
@@ -45,7 +45,10 @@ impl SftpDriver {
     fn create_authenticated_ssh_session(config: &ConnectionConfig) -> CoreResult<Session> {
         let addr = format!("{}:{}", config.host, config.port);
         let socket_addrs = addr.to_socket_addrs().map_err(|e| {
-            CoreError::ConnectionFailed(format!("Falha ao resolver endereço '{}:{}': {}", config.host, config.port, e))
+            CoreError::ConnectionFailed(format!(
+                "Falha ao resolver endereço '{}:{}': {}",
+                config.host, config.port, e
+            ))
         })?;
 
         let timeout = std::time::Duration::from_secs(6);
@@ -78,28 +81,23 @@ impl SftpDriver {
         let mut sess = Session::new().map_err(|e| CoreError::ConnectionFailed(e.to_string()))?;
         sess.set_timeout(10000); // 10 seconds timeout for SSH handshake and authentication
         sess.set_tcp_stream(tcp);
-        sess.handshake().map_err(|e| {
-            CoreError::ConnectionFailed(format!("Falha no handshake SSH: {}", e))
-        })?;
+        sess.handshake()
+            .map_err(|e| CoreError::ConnectionFailed(format!("Falha no handshake SSH: {}", e)))?;
 
         // Authenticate
         match &config.auth {
             AuthMethod::Password(pass) => {
-                sess.userauth_password(&config.username, pass).map_err(|e| {
-                    CoreError::AuthFailed(format!("Password authentication failed: {}", e))
-                })?;
+                sess.userauth_password(&config.username, pass)
+                    .map_err(|e| {
+                        CoreError::AuthFailed(format!("Password authentication failed: {}", e))
+                    })?;
             }
             AuthMethod::PrivateKey { path, passphrase } => {
                 let key_path = Path::new(path);
-                sess.userauth_pubkey_file(
-                    &config.username,
-                    None,
-                    key_path,
-                    passphrase.as_deref(),
-                )
-                .map_err(|e| {
-                    CoreError::AuthFailed(format!("Private key authentication failed: {}", e))
-                })?;
+                sess.userauth_pubkey_file(&config.username, None, key_path, passphrase.as_deref())
+                    .map_err(|e| {
+                        CoreError::AuthFailed(format!("Private key authentication failed: {}", e))
+                    })?;
             }
             AuthMethod::KeyringRef(_) | AuthMethod::None => {
                 // Try SSH Agent
@@ -129,7 +127,7 @@ impl SftpDriver {
     /// Establish real SSH connection and authenticate with password, key file or agent
     pub async fn connect(&self) -> CoreResult<()> {
         let config = self.config.clone();
-        
+
         // 1. Primary SFTP Session
         let session = task::spawn_blocking({
             let cfg = config.clone();
@@ -147,10 +145,8 @@ impl SftpDriver {
         // This ensures terminal commands and quick delete (rm -rf) execute instantly without
         // requesting a secondary login or conflicting with active SFTP subsystem file operations.
         let shell_cfg = config.clone();
-        let shell_res = task::spawn_blocking(move || {
-            Self::create_authenticated_ssh_session(&shell_cfg)
-        })
-        .await;
+        let shell_res =
+            task::spawn_blocking(move || Self::create_authenticated_ssh_session(&shell_cfg)).await;
 
         if let Ok(Ok(shell_sess)) = shell_res {
             let mut lock = self.shell_session.lock().await;
@@ -161,7 +157,10 @@ impl SftpDriver {
     }
 
     /// Execute arbitrary remote command on server over dedicated SSH channel (WinSCP Execute Command)
-    pub async fn execute_remote_command(&self, command: String) -> CoreResult<(i32, String, String)> {
+    pub async fn execute_remote_command(
+        &self,
+        command: String,
+    ) -> CoreResult<(i32, String, String)> {
         // Try dedicated shell session first
         let dedicated_opt = {
             let lock = self.shell_session.lock().await;
@@ -173,9 +172,9 @@ impl SftpDriver {
             _ => {
                 // Connect dedicated shell session or fall back to primary session
                 let config = self.config.clone();
-                let try_connect = task::spawn_blocking(move || {
-                    Self::create_authenticated_ssh_session(&config)
-                }).await;
+                let try_connect =
+                    task::spawn_blocking(move || Self::create_authenticated_ssh_session(&config))
+                        .await;
 
                 if let Ok(Ok(new_s)) = try_connect {
                     let mut lock = self.shell_session.lock().await;
@@ -191,8 +190,12 @@ impl SftpDriver {
         };
 
         task::spawn_blocking(move || {
-            let mut channel = sess.channel_session().map_err(|e| CoreError::Protocol(e.to_string()))?;
-            channel.exec(&command).map_err(|e| CoreError::Protocol(e.to_string()))?;
+            let mut channel = sess
+                .channel_session()
+                .map_err(|e| CoreError::Protocol(e.to_string()))?;
+            channel
+                .exec(&command)
+                .map_err(|e| CoreError::Protocol(e.to_string()))?;
 
             let mut stdout = String::new();
             let mut stderr = String::new();
@@ -239,8 +242,11 @@ echo "---WHO---"
 id -u 2>/dev/null
 hostname 2>/dev/null || uname -n
 "#;
-        let (_, stdout, _) = self.execute_remote_command(probe_cmd.to_string()).await.unwrap_or((0, String::new(), String::new()));
-        
+        let (_, stdout, _) = self
+            .execute_remote_command(probe_cmd.to_string())
+            .await
+            .unwrap_or((0, String::new(), String::new()));
+
         let mut os_name = "Linux".to_string();
         let mut distro_id = "linux".to_string();
         let mut kernel = "Linux".to_string();
@@ -287,7 +293,10 @@ hostname 2>/dev/null || uname -n
                 "---WHO---" => {
                     if line == "0" {
                         is_root = true;
-                    } else if !line.is_empty() && !line.chars().all(|c| c.is_ascii_digit()) && hostname == "remote-server" {
+                    } else if !line.is_empty()
+                        && !line.chars().all(|c| c.is_ascii_digit())
+                        && hostname == "remote-server"
+                    {
                         hostname = line.to_string();
                     }
                 }
@@ -325,7 +334,10 @@ hostname 2>/dev/null || uname -n
         }
 
         let has_sudo = is_root || {
-            let (code, _, _) = self.execute_remote_command("sudo -n true 2>/dev/null".to_string()).await.unwrap_or((-1, String::new(), String::new()));
+            let (code, _, _) = self
+                .execute_remote_command("sudo -n true 2>/dev/null".to_string())
+                .await
+                .unwrap_or((-1, String::new(), String::new()));
             code == 0
         };
 
@@ -378,7 +390,9 @@ impl VirtualFileSystem for SftpDriver {
             .clone();
 
         task::spawn_blocking(move || {
-            let sftp = sess.sftp().map_err(|e| CoreError::Protocol(e.to_string()))?;
+            let sftp = sess
+                .sftp()
+                .map_err(|e| CoreError::Protocol(e.to_string()))?;
             let target_path = Path::new(&path_owned);
             let dir_entries = match sftp.readdir(target_path) {
                 Ok(entries) => entries,
@@ -386,10 +400,17 @@ impl VirtualFileSystem for SftpDriver {
                     let err_str = err.to_string();
                     if err_str.to_lowercase().contains("permission denied") {
                         // If parent (like /home with 0711) is unreadable, check if user's canonical home is inside it
-                        let user_home = sftp.realpath(Path::new(".")).ok().or_else(|| sftp.realpath(Path::new("")).ok());
+                        let user_home = sftp
+                            .realpath(Path::new("."))
+                            .ok()
+                            .or_else(|| sftp.realpath(Path::new("")).ok());
                         if let Some(home_path) = user_home {
                             let home_str = home_path.to_string_lossy().to_string();
-                            let clean_path = if path_owned == "/" { "" } else { path_owned.trim_end_matches('/') };
+                            let clean_path = if path_owned == "/" {
+                                ""
+                            } else {
+                                path_owned.trim_end_matches('/')
+                            };
                             if home_str.starts_with(clean_path) && home_str != clean_path {
                                 let relative = home_str[clean_path.len()..].trim_start_matches('/');
                                 let next_segment = relative.split('/').next().unwrap_or("");
@@ -400,10 +421,16 @@ impl VirtualFileSystem for SftpDriver {
                                         return Ok(vec![FileEntry {
                                             name: next_segment.to_string(),
                                             path: full_subpath,
-                                            file_type: if stat.is_dir() { FileType::Directory } else { FileType::File },
+                                            file_type: if stat.is_dir() {
+                                                FileType::Directory
+                                            } else {
+                                                FileType::File
+                                            },
                                             size: stat.size.unwrap_or(0),
                                             modified_at: stat.mtime.map(|sec| {
-                                                Utc.timestamp_opt(sec as i64, 0).single().unwrap_or_else(Utc::now)
+                                                Utc.timestamp_opt(sec as i64, 0)
+                                                    .single()
+                                                    .unwrap_or_else(Utc::now)
                                             }),
                                             created_at: None,
                                             permissions: Permissions {
@@ -419,7 +446,10 @@ impl VirtualFileSystem for SftpDriver {
                             }
                         }
                     }
-                    return Err(CoreError::NotFound(format!("Cannot list SFTP directory '{}': {}", path_owned, err)));
+                    return Err(CoreError::NotFound(format!(
+                        "Cannot list SFTP directory '{}': {}",
+                        path_owned, err
+                    )));
                 }
             };
 
@@ -445,7 +475,9 @@ impl VirtualFileSystem for SftpDriver {
 
                 let mode = stat.perm.unwrap_or(0o644);
                 let modified_at = stat.mtime.map(|sec| {
-                    Utc.timestamp_opt(sec as i64, 0).single().unwrap_or_else(Utc::now)
+                    Utc.timestamp_opt(sec as i64, 0)
+                        .single()
+                        .unwrap_or_else(Utc::now)
                 });
 
                 result.push(FileEntry {
@@ -487,7 +519,9 @@ impl VirtualFileSystem for SftpDriver {
             .clone();
 
         task::spawn_blocking(move || {
-            let sftp = sess.sftp().map_err(|e| CoreError::Protocol(e.to_string()))?;
+            let sftp = sess
+                .sftp()
+                .map_err(|e| CoreError::Protocol(e.to_string()))?;
             let target_path = Path::new(&path_owned);
             let stat = sftp.stat(target_path).map_err(|e| {
                 CoreError::NotFound(format!("Cannot stat SFTP path '{}': {}", path_owned, e))
@@ -500,13 +534,19 @@ impl VirtualFileSystem for SftpDriver {
 
             let mode = stat.perm.unwrap_or(0o644);
             let modified_at = stat.mtime.map(|sec| {
-                Utc.timestamp_opt(sec as i64, 0).single().unwrap_or_else(Utc::now)
+                Utc.timestamp_opt(sec as i64, 0)
+                    .single()
+                    .unwrap_or_else(Utc::now)
             });
 
             Ok(FileEntry {
                 name: name.clone(),
                 path: path_owned,
-                file_type: if stat.is_dir() { FileType::Directory } else { FileType::File },
+                file_type: if stat.is_dir() {
+                    FileType::Directory
+                } else {
+                    FileType::File
+                },
                 size: stat.size.unwrap_or(0),
                 modified_at,
                 created_at: None,
@@ -532,9 +572,14 @@ impl VirtualFileSystem for SftpDriver {
             .clone();
 
         task::spawn_blocking(move || {
-            let sftp = sess.sftp().map_err(|e| CoreError::Protocol(e.to_string()))?;
+            let sftp = sess
+                .sftp()
+                .map_err(|e| CoreError::Protocol(e.to_string()))?;
             let mut file = sftp.open(Path::new(&path_owned)).map_err(|e| {
-                CoreError::NotFound(format!("Failed to open remote file '{}': {}", path_owned, e))
+                CoreError::NotFound(format!(
+                    "Failed to open remote file '{}': {}",
+                    path_owned, e
+                ))
             })?;
 
             let mut buffer = Vec::new();
@@ -554,9 +599,14 @@ impl VirtualFileSystem for SftpDriver {
             .clone();
 
         task::spawn_blocking(move || {
-            let sftp = sess.sftp().map_err(|e| CoreError::Protocol(e.to_string()))?;
+            let sftp = sess
+                .sftp()
+                .map_err(|e| CoreError::Protocol(e.to_string()))?;
             let mut file = sftp.open(Path::new(&path_owned)).map_err(|e| {
-                CoreError::NotFound(format!("Failed to open remote file '{}': {}", path_owned, e))
+                CoreError::NotFound(format!(
+                    "Failed to open remote file '{}': {}",
+                    path_owned, e
+                ))
             })?;
 
             use std::io::Seek;
@@ -580,15 +630,22 @@ impl VirtualFileSystem for SftpDriver {
             .clone();
 
         task::spawn_blocking(move || {
-            let sftp = sess.sftp().map_err(|e| CoreError::Protocol(e.to_string()))?;
-            let mut file = sftp.open_mode(
-                Path::new(&path_owned),
-                OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
-                0o644,
-                ssh2::OpenType::File,
-            ).map_err(|e| {
-                CoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            })?;
+            let sftp = sess
+                .sftp()
+                .map_err(|e| CoreError::Protocol(e.to_string()))?;
+            let mut file = sftp
+                .open_mode(
+                    Path::new(&path_owned),
+                    OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+                    0o644,
+                    ssh2::OpenType::File,
+                )
+                .map_err(|e| {
+                    CoreError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    ))
+                })?;
 
             file.write_all(&data)?;
             file.flush()?;
@@ -607,10 +664,11 @@ impl VirtualFileSystem for SftpDriver {
             .clone();
 
         task::spawn_blocking(move || {
-            let sftp = sess.sftp().map_err(|e| CoreError::Protocol(e.to_string()))?;
-            sftp.mkdir(Path::new(&path_owned), 0o755).map_err(|e| {
-                CoreError::Io(std::io::Error::other(e.to_string()))
-            })?;
+            let sftp = sess
+                .sftp()
+                .map_err(|e| CoreError::Protocol(e.to_string()))?;
+            sftp.mkdir(Path::new(&path_owned), 0o755)
+                .map_err(|e| CoreError::Io(std::io::Error::other(e.to_string())))?;
             Ok(())
         })
         .await
@@ -626,10 +684,11 @@ impl VirtualFileSystem for SftpDriver {
             .clone();
 
         task::spawn_blocking(move || {
-            let sftp = sess.sftp().map_err(|e| CoreError::Protocol(e.to_string()))?;
-            sftp.unlink(Path::new(&path_owned)).map_err(|e| {
-                CoreError::Io(std::io::Error::other(e.to_string()))
-            })?;
+            let sftp = sess
+                .sftp()
+                .map_err(|e| CoreError::Protocol(e.to_string()))?;
+            sftp.unlink(Path::new(&path_owned))
+                .map_err(|e| CoreError::Io(std::io::Error::other(e.to_string())))?;
             Ok(())
         })
         .await
@@ -661,16 +720,16 @@ impl VirtualFileSystem for SftpDriver {
             .clone();
 
         task::spawn_blocking(move || {
-            let sftp = sess.sftp().map_err(|e| CoreError::Protocol(e.to_string()))?;
+            let sftp = sess
+                .sftp()
+                .map_err(|e| CoreError::Protocol(e.to_string()))?;
             let target_path = Path::new(&target_trimmed);
             if recursive {
-                remove_dir_all_sftp(&sftp, target_path).map_err(|e| {
-                    CoreError::Io(std::io::Error::other(e.to_string()))
-                })?;
+                remove_dir_all_sftp(&sftp, target_path)
+                    .map_err(|e| CoreError::Io(std::io::Error::other(e.to_string())))?;
             } else {
-                sftp.rmdir(target_path).map_err(|e| {
-                    CoreError::Io(std::io::Error::other(e.to_string()))
-                })?;
+                sftp.rmdir(target_path)
+                    .map_err(|e| CoreError::Io(std::io::Error::other(e.to_string())))?;
             }
             Ok(())
         })
@@ -688,10 +747,11 @@ impl VirtualFileSystem for SftpDriver {
             .clone();
 
         task::spawn_blocking(move || {
-            let sftp = sess.sftp().map_err(|e| CoreError::Protocol(e.to_string()))?;
-            sftp.rename(Path::new(&from_owned), Path::new(&to_owned), None).map_err(|e| {
-                CoreError::Io(std::io::Error::other(e.to_string()))
-            })?;
+            let sftp = sess
+                .sftp()
+                .map_err(|e| CoreError::Protocol(e.to_string()))?;
+            sftp.rename(Path::new(&from_owned), Path::new(&to_owned), None)
+                .map_err(|e| CoreError::Io(std::io::Error::other(e.to_string())))?;
             Ok(())
         })
         .await
@@ -707,14 +767,15 @@ impl VirtualFileSystem for SftpDriver {
             .clone();
 
         task::spawn_blocking(move || {
-            let sftp = sess.sftp().map_err(|e| CoreError::Protocol(e.to_string()))?;
-            let mut stat = sftp.stat(Path::new(&path_owned)).map_err(|e| {
-                CoreError::NotFound(format!("Path not found: {}", e))
-            })?;
+            let sftp = sess
+                .sftp()
+                .map_err(|e| CoreError::Protocol(e.to_string()))?;
+            let mut stat = sftp
+                .stat(Path::new(&path_owned))
+                .map_err(|e| CoreError::NotFound(format!("Path not found: {}", e)))?;
             stat.perm = Some(mode);
-            sftp.setstat(Path::new(&path_owned), stat).map_err(|e| {
-                CoreError::Io(std::io::Error::other(e.to_string()))
-            })?;
+            sftp.setstat(Path::new(&path_owned), stat)
+                .map_err(|e| CoreError::Io(std::io::Error::other(e.to_string())))?;
             Ok(())
         })
         .await
@@ -730,16 +791,26 @@ impl VirtualFileSystem for SftpDriver {
         };
 
         task::spawn_blocking(move || {
-            let sftp = sess.sftp().map_err(|e| CoreError::Protocol(e.to_string()))?;
+            let sftp = sess
+                .sftp()
+                .map_err(|e| CoreError::Protocol(e.to_string()))?;
             Ok(sftp.stat(Path::new(&path_owned)).is_ok())
         })
         .await
         .map_err(|e| CoreError::General(e.to_string()))?
     }
 
-    async fn search(&self, root_path: &str, pattern: &str, max_results: usize) -> CoreResult<Vec<FileEntry>> {
+    async fn search(
+        &self,
+        root_path: &str,
+        pattern: &str,
+        max_results: usize,
+    ) -> CoreResult<Vec<FileEntry>> {
         // Simple search via remote 'find' command over SSH channel
-        let cmd = format!("find {} -name '{}' -maxdepth 5 2>/dev/null | head -n {}", root_path, pattern, max_results);
+        let cmd = format!(
+            "find {} -name '{}' -maxdepth 5 2>/dev/null | head -n {}",
+            root_path, pattern, max_results
+        );
         let (_, stdout, _) = self.execute_remote_command(cmd).await?;
 
         let mut results = Vec::new();
@@ -754,12 +825,25 @@ impl VirtualFileSystem for SftpDriver {
         Ok(results)
     }
 
-    async fn create_symlink(&self, target: &str, link_path: &str, is_symbolic: bool) -> CoreResult<()> {
+    async fn create_symlink(
+        &self,
+        target: &str,
+        link_path: &str,
+        is_symbolic: bool,
+    ) -> CoreResult<()> {
         let flag = if is_symbolic { "-s" } else { "" };
-        let cmd = format!("ln {} '{}' '{}'", flag, target.replace('\'', "'\\''"), link_path.replace('\'', "'\\''"));
+        let cmd = format!(
+            "ln {} '{}' '{}'",
+            flag,
+            target.replace('\'', "'\\''"),
+            link_path.replace('\'', "'\\''")
+        );
         let (exit_code, _, stderr) = self.execute_remote_command(cmd).await?;
         if exit_code != 0 {
-            return Err(CoreError::General(format!("Failed to create link: {}", stderr)));
+            return Err(CoreError::General(format!(
+                "Failed to create link: {}",
+                stderr
+            )));
         }
         Ok(())
     }
@@ -770,10 +854,17 @@ impl VirtualFileSystem for SftpDriver {
             if let Some(sess) = lock.as_ref() {
                 let sha = sess.host_key_hash(HashType::Sha256).map(hex::encode);
                 let md5 = sess.host_key_hash(HashType::Md5).map(|h| {
-                    h.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(":")
+                    h.iter()
+                        .map(|b| format!("{:02X}", b))
+                        .collect::<Vec<_>>()
+                        .join(":")
                 });
-                let ciph = sess.methods(ssh2::MethodType::CryptCs).map(|s| s.to_string());
-                let comp = sess.methods(ssh2::MethodType::CompCs).map(|s| s.to_string());
+                let ciph = sess
+                    .methods(ssh2::MethodType::CryptCs)
+                    .map(|s| s.to_string());
+                let comp = sess
+                    .methods(ssh2::MethodType::CompCs)
+                    .map(|s| s.to_string());
                 (sha, md5, ciph, comp)
             } else {
                 (None, None, None, None)
@@ -782,7 +873,10 @@ impl VirtualFileSystem for SftpDriver {
 
         // Query df -Pk for disk space
         let cmd = format!("df -Pk '{}' 2>/dev/null", path.replace('\'', "'\\''"));
-        let (_, stdout, _) = self.execute_remote_command(cmd).await.unwrap_or((0, String::new(), String::new()));
+        let (_, stdout, _) =
+            self.execute_remote_command(cmd)
+                .await
+                .unwrap_or((0, String::new(), String::new()));
         let mut total_bytes = 0u64;
         let mut used_bytes = 0u64;
         let mut avail_bytes = 0u64;
@@ -790,7 +884,11 @@ impl VirtualFileSystem for SftpDriver {
         for line in stdout.lines().skip(1) {
             let tokens: Vec<&str> = line.split_whitespace().collect();
             if tokens.len() >= 4 {
-                if let (Ok(tot_k), Ok(usd_k), Ok(avl_k)) = (tokens[1].parse::<u64>(), tokens[2].parse::<u64>(), tokens[3].parse::<u64>()) {
+                if let (Ok(tot_k), Ok(usd_k), Ok(avl_k)) = (
+                    tokens[1].parse::<u64>(),
+                    tokens[2].parse::<u64>(),
+                    tokens[3].parse::<u64>(),
+                ) {
                     total_bytes = tot_k * 1024;
                     used_bytes = usd_k * 1024;
                     avail_bytes = avl_k * 1024;
@@ -801,14 +899,21 @@ impl VirtualFileSystem for SftpDriver {
 
         // Query df -i for inodes
         let cmd_i = format!("df -i '{}' 2>/dev/null", path.replace('\'', "'\\''"));
-        let (_, stdout_i, _) = self.execute_remote_command(cmd_i).await.unwrap_or((0, String::new(), String::new()));
+        let (_, stdout_i, _) =
+            self.execute_remote_command(cmd_i)
+                .await
+                .unwrap_or((0, String::new(), String::new()));
         let mut total_inodes = None;
         let mut free_inodes = None;
 
         for line in stdout_i.lines().skip(1) {
             let tokens: Vec<&str> = line.split_whitespace().collect();
             if tokens.len() >= 4 {
-                if let (Ok(tot_i), Ok(usd_i), Ok(fre_i)) = (tokens[1].parse::<u64>(), tokens[2].parse::<u64>(), tokens[3].parse::<u64>()) {
+                if let (Ok(tot_i), Ok(usd_i), Ok(fre_i)) = (
+                    tokens[1].parse::<u64>(),
+                    tokens[2].parse::<u64>(),
+                    tokens[3].parse::<u64>(),
+                ) {
                     let _ = usd_i;
                     total_inodes = Some(tot_i);
                     free_inodes = Some(fre_i);
@@ -835,7 +940,11 @@ impl VirtualFileSystem for SftpDriver {
     }
 
     async fn calculate_size(&self, path: &str) -> CoreResult<u64> {
-        let cmd = format!("du -sb '{}' 2>/dev/null || du -sk '{}' 2>/dev/null", path.replace('\'', "'\\''"), path.replace('\'', "'\\''"));
+        let cmd = format!(
+            "du -sb '{}' 2>/dev/null || du -sk '{}' 2>/dev/null",
+            path.replace('\'', "'\\''"),
+            path.replace('\'', "'\\''")
+        );
         let (exit_code, stdout, _) = self.execute_remote_command(cmd).await?;
         if exit_code == 0 {
             if let Some(first_line) = stdout.lines().next() {
@@ -850,8 +959,16 @@ impl VirtualFileSystem for SftpDriver {
     }
 
     async fn find_files(&self, query: &FindFileQuery) -> CoreResult<Vec<FindFileMatch>> {
-        let clean_mask = if query.mask.is_empty() { "*".to_string() } else { query.mask.clone() };
-        let depth_arg = if let Some(d) = query.max_depth { format!("-maxdepth {}", d) } else { "".to_string() };
+        let clean_mask = if query.mask.is_empty() {
+            "*".to_string()
+        } else {
+            query.mask.clone()
+        };
+        let depth_arg = if let Some(d) = query.max_depth {
+            format!("-maxdepth {}", d)
+        } else {
+            "".to_string()
+        };
 
         if let Some(ref text) = query.contains_text {
             if !text.is_empty() {
@@ -866,7 +983,8 @@ impl VirtualFileSystem for SftpDriver {
                     query.max_results
                 );
                 let (_, stdout, _) = self.execute_remote_command(cmd).await?;
-                let mut matches_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+                let mut matches_map: std::collections::HashMap<String, Vec<String>> =
+                    std::collections::HashMap::new();
 
                 for line in stdout.lines() {
                     let parts: Vec<&str> = line.splitn(3, ':').collect();
@@ -924,7 +1042,9 @@ impl VirtualFileSystem for SftpDriver {
         let username = self.config.username.clone();
 
         task::spawn_blocking(move || {
-            let sftp = sess.sftp().map_err(|e| CoreError::Protocol(e.to_string()))?;
+            let sftp = sess
+                .sftp()
+                .map_err(|e| CoreError::Protocol(e.to_string()))?;
 
             // 1. Realpath "." (standard OpenSSH returns user's home directory)
             if let Ok(p) = sftp.realpath(Path::new(".")) {
@@ -987,4 +1107,3 @@ impl VirtualFileSystem for SftpDriver {
         self.execute_remote_command(cmd.to_string()).await
     }
 }
-

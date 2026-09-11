@@ -15,7 +15,11 @@ impl FileMaskFilter {
         let mut include = Vec::new();
         let mut exclude = Vec::new();
 
-        for part in mask_str.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        for part in mask_str
+            .split(';')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
             let (is_exclude, clean_pattern) = if let Some(stripped) = part.strip_prefix('!') {
                 (true, stripped)
             } else {

@@ -34,7 +34,10 @@ impl ScriptInterpreter {
 
         match cmd.as_str() {
             "pwd" => {
-                let out = format!("Remote: {}\nLocal: {}", current_remote_dir, current_local_dir);
+                let out = format!(
+                    "Remote: {}\nLocal: {}",
+                    current_remote_dir, current_local_dir
+                );
                 ScriptCommandOutput {
                     command: line.to_string(),
                     success: true,
@@ -150,7 +153,8 @@ impl ScriptInterpreter {
 
             "mkdir" => {
                 if let Some(dir_name) = args.first() {
-                    let target = format!("{}/{}", current_remote_dir.trim_end_matches('/'), dir_name);
+                    let target =
+                        format!("{}/{}", current_remote_dir.trim_end_matches('/'), dir_name);
                     if let Some(rvfs) = &remote_vfs {
                         match rvfs.create_dir(&target).await {
                             Ok(_) => ScriptCommandOutput {
@@ -182,7 +186,8 @@ impl ScriptInterpreter {
 
             "rm" | "del" => {
                 if let Some(file_name) = args.first() {
-                    let target = format!("{}/{}", current_remote_dir.trim_end_matches('/'), file_name);
+                    let target =
+                        format!("{}/{}", current_remote_dir.trim_end_matches('/'), file_name);
                     if let Some(rvfs) = &remote_vfs {
                         match rvfs.remove_file(&target).await {
                             Ok(_) => ScriptCommandOutput {
@@ -238,7 +243,10 @@ Available RustSCP Automation Script Commands:
             unknown => ScriptCommandOutput {
                 command: line.to_string(),
                 success: false,
-                output: format!("Unknown command '{}'. Type 'help' for command list.", unknown),
+                output: format!(
+                    "Unknown command '{}'. Type 'help' for command list.",
+                    unknown
+                ),
             },
         }
     }

@@ -24,17 +24,28 @@ impl CodeGenerator {
         local_path: &str,
     ) -> String {
         let proto = config.protocol.to_string();
-        let user = if config.username.is_empty() { "user" } else { &config.username };
+        let user = if config.username.is_empty() {
+            "user"
+        } else {
+            &config.username
+        };
         let pass = match &config.auth {
             AuthMethod::Password(p) => p.as_str(),
             _ => "password",
         };
-        let host = if config.host.is_empty() { "example.com" } else { &config.host };
+        let host = if config.host.is_empty() {
+            "example.com"
+        } else {
+            &config.host
+        };
         let port = if config.port == 0 { 22 } else { config.port };
 
         match target_lang {
             CodeTargetLanguage::WinScpUrl => {
-                format!("{}://{}:{}@{}:{}{}", proto, user, pass, host, port, remote_path)
+                format!(
+                    "{}://{}:{}@{}:{}{}",
+                    proto, user, pass, host, port, remote_path
+                )
             }
 
             CodeTargetLanguage::WinScpScript => {

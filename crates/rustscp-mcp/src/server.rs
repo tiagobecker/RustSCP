@@ -1,7 +1,5 @@
 use crate::audit::AuditLogger;
-use crate::protocol::{
-    JsonRpcRequest, JsonRpcResponse, McpToolDefinition, McpToolResult,
-};
+use crate::protocol::{JsonRpcRequest, JsonRpcResponse, McpToolDefinition, McpToolResult};
 use bytes::Bytes;
 use rustscp_actions::{ActionCatalog, ActionContext, ActionExecutor};
 use rustscp_core::{LocalFsDriver, VirtualFileSystem};
@@ -133,13 +131,23 @@ impl McpServer {
                 let conns = self.connections.read().await;
                 let list: Vec<String> = conns.keys().cloned().collect();
                 self.audit_logger
-                    .log(agent_id, tool_name, "none", "listing sessions", "success", None)
+                    .log(
+                        agent_id,
+                        tool_name,
+                        "none",
+                        "listing sessions",
+                        "success",
+                        None,
+                    )
                     .await;
                 McpToolResult::success_text(json!({ "active_sessions": list }).to_string())
             }
 
             "fs_list_dir" => {
-                let path = arguments.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+                let path = arguments
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("/");
                 let conns = self.connections.read().await;
                 if let Some(vfs) = conns.get(conn_id) {
                     match vfs.list_dir(path).await {
@@ -151,20 +159,33 @@ impl McpServer {
                         }
                         Err(err) => {
                             self.audit_logger
-                                .log(agent_id, tool_name, conn_id, path, &format!("error: {}", err), None)
+                                .log(
+                                    agent_id,
+                                    tool_name,
+                                    conn_id,
+                                    path,
+                                    &format!("error: {}", err),
+                                    None,
+                                )
                                 .await;
                             McpToolResult::error_text(format!("Failed to list directory: {}", err))
                         }
                     }
                 } else {
-                    McpToolResult::error_text(format!("Connection '{}' not found or inactive", conn_id))
+                    McpToolResult::error_text(format!(
+                        "Connection '{}' not found or inactive",
+                        conn_id
+                    ))
                 }
             }
 
             "fs_read_file" => {
                 let path = arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
                 let offset = arguments.get("offset").and_then(|v| v.as_u64());
-                let length = arguments.get("length").and_then(|v| v.as_u64()).unwrap_or(65536);
+                let length = arguments
+                    .get("length")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(65536);
 
                 let conns = self.connections.read().await;
                 if let Some(vfs) = conns.get(conn_id) {
@@ -184,7 +205,14 @@ impl McpServer {
                         }
                         Err(err) => {
                             self.audit_logger
-                                .log(agent_id, tool_name, conn_id, path, &format!("error: {}", err), None)
+                                .log(
+                                    agent_id,
+                                    tool_name,
+                                    conn_id,
+                                    path,
+                                    &format!("error: {}", err),
+                                    None,
+                                )
                                 .await;
                             McpToolResult::error_text(format!("Failed to read file: {}", err))
                         }
@@ -196,11 +224,17 @@ impl McpServer {
 
             "fs_write_file" => {
                 let path = arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                let content = arguments.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let content = arguments
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
 
                 let conns = self.connections.read().await;
                 if let Some(vfs) = conns.get(conn_id) {
-                    match vfs.write_file(path, Bytes::from(content.as_bytes().to_vec())).await {
+                    match vfs
+                        .write_file(path, Bytes::from(content.as_bytes().to_vec()))
+                        .await
+                    {
                         Ok(_) => {
                             self.audit_logger
                                 .log(
@@ -212,11 +246,21 @@ impl McpServer {
                                     Some(format!("Wrote {} bytes", content.len())),
                                 )
                                 .await;
-                            McpToolResult::success_text(format!("File written successfully: {}", path))
+                            McpToolResult::success_text(format!(
+                                "File written successfully: {}",
+                                path
+                            ))
                         }
                         Err(err) => {
                             self.audit_logger
-                                .log(agent_id, tool_name, conn_id, path, &format!("error: {}", err), None)
+                                .log(
+                                    agent_id,
+                                    tool_name,
+                                    conn_id,
+                                    path,
+                                    &format!("error: {}", err),
+                                    None,
+                                )
                                 .await;
                             McpToolResult::error_text(format!("Failed to write file: {}", err))
                         }
@@ -227,8 +271,14 @@ impl McpServer {
             }
 
             "fs_search" => {
-                let pattern = arguments.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-                let root = arguments.get("root_path").and_then(|v| v.as_str()).unwrap_or("/");
+                let pattern = arguments
+                    .get("pattern")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let root = arguments
+                    .get("root_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("/");
 
                 let conns = self.connections.read().await;
                 if let Some(vfs) = conns.get(conn_id) {
@@ -239,9 +289,7 @@ impl McpServer {
                                 .await;
                             McpToolResult::success_text(json!({ "matches": results }).to_string())
                         }
-                        Err(err) => {
-                            McpToolResult::error_text(format!("Search failed: {}", err))
-                        }
+                        Err(err) => McpToolResult::error_text(format!("Search failed: {}", err)),
                     }
                 } else {
                     McpToolResult::error_text(format!("Connection '{}' not found", conn_id))
@@ -249,8 +297,14 @@ impl McpServer {
             }
 
             "exec_smart_action" => {
-                let action_id = arguments.get("action_id").and_then(|v| v.as_str()).unwrap_or("");
-                let current_dir = arguments.get("current_dir").and_then(|v| v.as_str()).unwrap_or("/");
+                let action_id = arguments
+                    .get("action_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let current_dir = arguments
+                    .get("current_dir")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("/");
                 let selected: Vec<String> = arguments
                     .get("selected_paths")
                     .and_then(|v| v.as_array())
@@ -287,18 +341,24 @@ impl McpServer {
                                     None,
                                 )
                                 .await;
-                            McpToolResult::success_text(json!({
-                                "action": act.name.en_us,
-                                "risk_level": act.risk_level,
-                                "rendered_command": rendered_cmd
-                            }).to_string())
+                            McpToolResult::success_text(
+                                json!({
+                                    "action": act.name.en_us,
+                                    "risk_level": act.risk_level,
+                                    "rendered_command": rendered_cmd
+                                })
+                                .to_string(),
+                            )
                         }
                         Err(err) => {
                             McpToolResult::error_text(format!("Action validation failed: {}", err))
                         }
                     }
                 } else {
-                    McpToolResult::error_text(format!("Action '{}' not found in catalog", action_id))
+                    McpToolResult::error_text(format!(
+                        "Action '{}' not found in catalog",
+                        action_id
+                    ))
                 }
             }
 

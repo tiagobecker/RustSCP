@@ -4,10 +4,16 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release Version Tag (e.g. v0.1.0)'
+        required: true
+        default: 'v0.1.0'
 
 jobs:
   build-tauri:
-    name: Build Tauri (${{ matrix.platform }})
+    name: Build Tauri (${{ matrix.platform }}${{ matrix.args != '' && format(' - {0}', matrix.args) || '' }})
     permissions:
       contents: write
     strategy:
@@ -16,6 +22,8 @@ jobs:
         include:
           - platform: 'macos-latest'
             args: '--target aarch64-apple-darwin'
+          - platform: 'macos-latest'
+            args: '--target x86_64-apple-darwin'
           - platform: 'ubuntu-22.04'
             args: ''
           - platform: 'windows-latest'
@@ -24,15 +32,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v3
-        with:
-          version: 9
+          node-version: 22
+          cache: 'pnpm'
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -56,9 +65,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'RustSCP ${{ github.ref_name }}'
-          releaseBody: 'See the changelog and release notes for details.'
+          projectPath: apps/rustscp-desktop
+          tagName: ${{ github.event.inputs.version || github.ref_name }}
+          releaseName: 'RustSCP ${{ github.event.inputs.version || github.ref_name }}'
+          releaseBody: 'RustSCP ${{ github.event.inputs.version || github.ref_name }} - Next-Gen Remote Workspace, SFTP/SCP/S3 Client & AI Gateway.'
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}

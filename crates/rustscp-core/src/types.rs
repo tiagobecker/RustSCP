@@ -303,4 +303,3 @@ pub struct RemoteTrashStatus {
     pub item_count: usize,
     pub total_size_bytes: u64,
 }
-

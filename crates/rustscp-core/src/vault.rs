@@ -74,9 +74,15 @@ pub fn derive_key(password: &str, salt: &[u8], iterations: u32) -> [u8; 32] {
 }
 
 /// Criptografa dados arbitrários (bytes) usando AES-256-GCM + PBKDF2
-pub fn encrypt_bytes(data: &[u8], password: &str, site_count: usize) -> Result<VaultEnvelope, VaultError> {
+pub fn encrypt_bytes(
+    data: &[u8],
+    password: &str,
+    site_count: usize,
+) -> Result<VaultEnvelope, VaultError> {
     if password.is_empty() {
-        return Err(VaultError::Other("A senha de criptografia não pode ser vazia".to_string()));
+        return Err(VaultError::Other(
+            "A senha de criptografia não pode ser vazia".to_string(),
+        ));
     }
 
     let mut salt = [0u8; SALT_LEN];
@@ -90,9 +96,9 @@ pub fn encrypt_bytes(data: &[u8], password: &str, site_count: usize) -> Result<V
         .map_err(|e| VaultError::Other(format!("Erro ao inicializar cifra AES-256-GCM: {e}")))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let ciphertext = cipher
-        .encrypt(nonce, data)
-        .map_err(|_| VaultError::Other("Falha ao criptografar dados com AES-256-GCM".to_string()))?;
+    let ciphertext = cipher.encrypt(nonce, data).map_err(|_| {
+        VaultError::Other("Falha ao criptografar dados com AES-256-GCM".to_string())
+    })?;
 
     Ok(VaultEnvelope {
         magic: VAULT_MAGIC.to_string(),
@@ -142,13 +148,19 @@ pub fn decrypt_bytes(envelope: &VaultEnvelope, password: &str) -> Result<Vec<u8>
 }
 
 /// Criptografa uma lista de conexões (credenciais, hosts, senhas, chaves) em um envelope seguro
-pub fn encrypt_sites(sites: &[ConnectionConfig], password: &str) -> Result<VaultEnvelope, VaultError> {
+pub fn encrypt_sites(
+    sites: &[ConnectionConfig],
+    password: &str,
+) -> Result<VaultEnvelope, VaultError> {
     let json_bytes = serde_json::to_vec(sites)?;
     encrypt_bytes(&json_bytes, password, sites.len())
 }
 
 /// Descriptografa um envelope seguro retornando a lista de conexões
-pub fn decrypt_sites(envelope: &VaultEnvelope, password: &str) -> Result<Vec<ConnectionConfig>, VaultError> {
+pub fn decrypt_sites(
+    envelope: &VaultEnvelope,
+    password: &str,
+) -> Result<Vec<ConnectionConfig>, VaultError> {
     let plaintext = decrypt_bytes(envelope, password)?;
     let sites: Vec<ConnectionConfig> = serde_json::from_slice(&plaintext)?;
     Ok(sites)
@@ -361,7 +373,11 @@ mod tests {
             panic!("Expected Password auth method");
         }
 
-        if let AuthMethod::PrivateKey { ref path, ref passphrase } = decrypted[2].auth {
+        if let AuthMethod::PrivateKey {
+            ref path,
+            ref passphrase,
+        } = decrypted[2].auth
+        {
             assert_eq!(path, "/home/user/.ssh/id_ed25519");
             assert_eq!(passphrase.as_deref(), Some("key-passphrase-xyz"));
         } else {
@@ -393,7 +409,10 @@ mod tests {
         envelope.ciphertext_hex = hex::encode(bytes);
 
         let result = decrypt_sites(&envelope, "CorrectPassword");
-        assert!(result.is_err(), "Deveria falhar com dados adulterados (Auth Tag mismatch)");
+        assert!(
+            result.is_err(),
+            "Deveria falhar com dados adulterados (Auth Tag mismatch)"
+        );
     }
 
     #[test]

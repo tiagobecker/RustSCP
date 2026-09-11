@@ -76,18 +76,19 @@ impl ActionCatalog {
                     "Extract tar.gz, tar.bz2, zip or tar archive",
                     "Extrai arquivos compactados no diretório atual ou selecionado",
                 ),
-                fields: vec![
-                    ActionField {
-                        id: "dest_dir".to_string(),
-                        field_type: FieldType::Text,
-                        label: LocalizedText::new("Extract to Directory", "Extrair para a Pasta"),
-                        description: Some(LocalizedText::new("Leave . for current folder", "Deixe . para pasta atual")),
-                        default_value: Some(".".to_string()),
-                        required: true,
-                        validation_regex: None,
-                        risk_warning: false,
-                    },
-                ],
+                fields: vec![ActionField {
+                    id: "dest_dir".to_string(),
+                    field_type: FieldType::Text,
+                    label: LocalizedText::new("Extract to Directory", "Extrair para a Pasta"),
+                    description: Some(LocalizedText::new(
+                        "Leave . for current folder",
+                        "Deixe . para pasta atual",
+                    )),
+                    default_value: Some(".".to_string()),
+                    required: true,
+                    validation_regex: None,
+                    risk_warning: false,
+                }],
                 template: "tar -xzf ${selected_files} -C {{dest_dir}}".to_string(),
             },
             // 3. Disk Usage
@@ -102,22 +103,20 @@ impl ActionCatalog {
                     "Show largest folders and files in current directory",
                     "Exibe as maiores pastas e arquivos no diretório atual",
                 ),
-                fields: vec![
-                    ActionField {
-                        id: "limit".to_string(),
-                        field_type: FieldType::Number {
-                            min: Some(5.0),
-                            max: Some(50.0),
-                            step: Some(5.0),
-                        },
-                        label: LocalizedText::new("Number of items", "Número de itens"),
-                        description: None,
-                        default_value: Some("15".to_string()),
-                        required: true,
-                        validation_regex: None,
-                        risk_warning: false,
+                fields: vec![ActionField {
+                    id: "limit".to_string(),
+                    field_type: FieldType::Number {
+                        min: Some(5.0),
+                        max: Some(50.0),
+                        step: Some(5.0),
                     },
-                ],
+                    label: LocalizedText::new("Number of items", "Número de itens"),
+                    description: None,
+                    default_value: Some("15".to_string()),
+                    required: true,
+                    validation_regex: None,
+                    risk_warning: false,
+                }],
                 template: "du -sh * 2>/dev/null | sort -hr | head -n {{limit}}".to_string(),
             },
             // 4. Find Files
@@ -132,18 +131,19 @@ impl ActionCatalog {
                     "Locate files by name, extension or pattern",
                     "Localiza arquivos por nome, extensão ou padrão",
                 ),
-                fields: vec![
-                    ActionField {
-                        id: "pattern".to_string(),
-                        field_type: FieldType::Text,
-                        label: LocalizedText::new("File Pattern (e.g. *.log, *.conf)", "Padrão de Nome (ex: *.log, *.conf)"),
-                        description: None,
-                        default_value: Some("*.*".to_string()),
-                        required: true,
-                        validation_regex: None,
-                        risk_warning: false,
-                    },
-                ],
+                fields: vec![ActionField {
+                    id: "pattern".to_string(),
+                    field_type: FieldType::Text,
+                    label: LocalizedText::new(
+                        "File Pattern (e.g. *.log, *.conf)",
+                        "Padrão de Nome (ex: *.log, *.conf)",
+                    ),
+                    description: None,
+                    default_value: Some("*.*".to_string()),
+                    required: true,
+                    validation_regex: None,
+                    risk_warning: false,
+                }],
                 template: "find . -name {{pattern}} -maxdepth 4".to_string(),
             },
             // 5. Visual Chmod
@@ -153,7 +153,10 @@ impl ActionCatalog {
                 icon: "shield".to_string(),
                 risk_level: RiskLevel::Warning,
                 scope: Scope::SelectedFiles,
-                name: LocalizedText::new("Change Permissions (chmod)", "Alterar Permissões (chmod)"),
+                name: LocalizedText::new(
+                    "Change Permissions (chmod)",
+                    "Alterar Permissões (chmod)",
+                ),
                 description: LocalizedText::new(
                     "Set numeric octal permissions on selected items",
                     "Aplica permissões numéricas nos itens selecionados",
@@ -165,22 +168,34 @@ impl ActionCatalog {
                             options: vec![
                                 SelectOption {
                                     value: "0644".to_string(),
-                                    label: LocalizedText::new("Standard File (0644 - rw-r--r--)", "Arquivo Padrão (0644 - rw-r--r--)"),
+                                    label: LocalizedText::new(
+                                        "Standard File (0644 - rw-r--r--)",
+                                        "Arquivo Padrão (0644 - rw-r--r--)",
+                                    ),
                                     is_default: true,
                                 },
                                 SelectOption {
                                     value: "0755".to_string(),
-                                    label: LocalizedText::new("Script / Folder (0755 - rwxr-xr-x)", "Script / Pasta (0755 - rwxr-xr-x)"),
+                                    label: LocalizedText::new(
+                                        "Script / Folder (0755 - rwxr-xr-x)",
+                                        "Script / Pasta (0755 - rwxr-xr-x)",
+                                    ),
                                     is_default: false,
                                 },
                                 SelectOption {
                                     value: "0600".to_string(),
-                                    label: LocalizedText::new("Private / Key (0600 - rw-------)", "Privado / Chave (0600 - rw-------)"),
+                                    label: LocalizedText::new(
+                                        "Private / Key (0600 - rw-------)",
+                                        "Privado / Chave (0600 - rw-------)",
+                                    ),
                                     is_default: false,
                                 },
                                 SelectOption {
                                     value: "0777".to_string(),
-                                    label: LocalizedText::new("Full Access (0777 - rwxrwxrwx)", "Acesso Total (0777 - rwxrwxrwx)"),
+                                    label: LocalizedText::new(
+                                        "Full Access (0777 - rwxrwxrwx)",
+                                        "Acesso Total (0777 - rwxrwxrwx)",
+                                    ),
                                     is_default: false,
                                 },
                             ],
@@ -195,7 +210,10 @@ impl ActionCatalog {
                     ActionField {
                         id: "recursive".to_string(),
                         field_type: FieldType::Checkbox,
-                        label: LocalizedText::new("Apply recursively to subfolders", "Aplicar recursivamente em subpastas"),
+                        label: LocalizedText::new(
+                            "Apply recursively to subfolders",
+                            "Aplicar recursivamente em subpastas",
+                        ),
                         description: None,
                         default_value: Some("false".to_string()),
                         required: false,
@@ -203,7 +221,9 @@ impl ActionCatalog {
                         risk_warning: true,
                     },
                 ],
-                template: "chmod {% if recursive == 'true' %}-R {% endif %}{{mode}} ${selected_files}".to_string(),
+                template:
+                    "chmod {% if recursive == 'true' %}-R {% endif %}{{mode}} ${selected_files}"
+                        .to_string(),
             },
             // 6. Systemd Service Management
             ActionDefinition {
@@ -212,7 +232,10 @@ impl ActionCatalog {
                 icon: "cpu".to_string(),
                 risk_level: RiskLevel::Warning,
                 scope: Scope::Global,
-                name: LocalizedText::new("Systemd Service Manager", "Gerenciador de Serviços (systemd)"),
+                name: LocalizedText::new(
+                    "Systemd Service Manager",
+                    "Gerenciador de Serviços (systemd)",
+                ),
                 description: LocalizedText::new(
                     "Check status, restart or inspect systemd units",
                     "Verifica status, reinicia ou inspeciona serviços systemd",
@@ -221,7 +244,10 @@ impl ActionCatalog {
                     ActionField {
                         id: "service".to_string(),
                         field_type: FieldType::Text,
-                        label: LocalizedText::new("Service Name (e.g. nginx, docker, redis)", "Nome do Serviço (ex: nginx, docker, redis)"),
+                        label: LocalizedText::new(
+                            "Service Name (e.g. nginx, docker, redis)",
+                            "Nome do Serviço (ex: nginx, docker, redis)",
+                        ),
                         description: None,
                         default_value: Some("nginx".to_string()),
                         required: true,
@@ -239,12 +265,18 @@ impl ActionCatalog {
                                 },
                                 SelectOption {
                                     value: "restart".to_string(),
-                                    label: LocalizedText::new("Restart Service", "Reiniciar Serviço"),
+                                    label: LocalizedText::new(
+                                        "Restart Service",
+                                        "Reiniciar Serviço",
+                                    ),
                                     is_default: false,
                                 },
                                 SelectOption {
                                     value: "reload".to_string(),
-                                    label: LocalizedText::new("Reload Config", "Recarregar Configuração"),
+                                    label: LocalizedText::new(
+                                        "Reload Config",
+                                        "Recarregar Configuração",
+                                    ),
                                     is_default: false,
                                 },
                             ],
@@ -272,7 +304,8 @@ impl ActionCatalog {
                     "Lista os containers em execução com status e portas",
                 ),
                 fields: vec![],
-                template: "docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'".to_string(),
+                template: "docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"
+                    .to_string(),
             },
         ]
     }

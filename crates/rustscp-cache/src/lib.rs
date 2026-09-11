@@ -16,7 +16,11 @@ pub struct ChunkKey {
 }
 
 impl ChunkKey {
-    pub fn new(connection_id: impl Into<String>, file_path: impl Into<String>, chunk_index: u64) -> Self {
+    pub fn new(
+        connection_id: impl Into<String>,
+        file_path: impl Into<String>,
+        chunk_index: u64,
+    ) -> Self {
         Self {
             connection_id: connection_id.into(),
             file_path: file_path.into(),

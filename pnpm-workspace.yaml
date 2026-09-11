@@ -1,0 +1,3 @@
+packages:
+  - 'apps/rustscp-desktop'
+  - 'apps/rustscp-desktop/ui'

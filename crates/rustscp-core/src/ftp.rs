@@ -28,7 +28,9 @@ pub struct FtpDriver {
 
 impl std::fmt::Debug for FtpDriver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FtpDriver").field("config", &self.config).finish()
+        f.debug_struct("FtpDriver")
+            .field("config", &self.config)
+            .finish()
     }
 }
 
@@ -45,7 +47,10 @@ impl FtpDriver {
         let stream = task::spawn_blocking(move || -> CoreResult<TcpStream> {
             let addr = format!("{}:{}", cfg.host, cfg.port);
             let socket_addrs = addr.to_socket_addrs().map_err(|e| {
-                CoreError::ConnectionFailed(format!("Falha ao resolver endereço FTP '{}:{}': {}", cfg.host, cfg.port, e))
+                CoreError::ConnectionFailed(format!(
+                    "Falha ao resolver endereço FTP '{}:{}': {}",
+                    cfg.host, cfg.port, e
+                ))
             })?;
 
             let timeout = std::time::Duration::from_secs(6);
@@ -71,7 +76,9 @@ impl FtpDriver {
                     "Falha ao conectar ao FTP '{}:{}' ({})",
                     cfg.host,
                     cfg.port,
-                    last_err.map(|e| e.to_string()).unwrap_or_else(|| "Tempo limite excedido".into())
+                    last_err
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "Tempo limite excedido".into())
                 ))
             })?;
 
@@ -165,12 +172,24 @@ impl VirtualFileSystem for FtpDriver {
         Ok(true)
     }
 
-    async fn search(&self, _root_path: &str, _pattern: &str, _max_results: usize) -> CoreResult<Vec<FileEntry>> {
+    async fn search(
+        &self,
+        _root_path: &str,
+        _pattern: &str,
+        _max_results: usize,
+    ) -> CoreResult<Vec<FileEntry>> {
         Ok(Vec::new())
     }
 
-    async fn create_symlink(&self, _target: &str, _link_path: &str, _is_symbolic: bool) -> CoreResult<()> {
-        Err(CoreError::General("FTP server does not support symlink creation".to_string()))
+    async fn create_symlink(
+        &self,
+        _target: &str,
+        _link_path: &str,
+        _is_symbolic: bool,
+    ) -> CoreResult<()> {
+        Err(CoreError::General(
+            "FTP server does not support symlink creation".to_string(),
+        ))
     }
 
     async fn get_filesystem_info(&self, path: &str) -> CoreResult<FileSystemInfo> {

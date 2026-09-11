@@ -143,7 +143,12 @@ impl VirtualFileSystem for S3Driver {
             self.sign_request("GET", uri, "", &mut headers, &empty_hash)?;
 
             let url = format!("{}/", self.config.endpoint);
-            let res = self.client.get(&url).headers(headers).send().await
+            let res = self
+                .client
+                .get(&url)
+                .headers(headers)
+                .send()
+                .await
                 .map_err(|e| CoreError::ConnectionFailed(e.to_string()))?;
 
             let text = res.text().await.unwrap_or_default();
@@ -177,14 +182,22 @@ impl VirtualFileSystem for S3Driver {
             format!("{}/", prefix)
         };
 
-        let query = format!("list-type=2&delimiter=%2F&prefix={}", urlencoding(&norm_prefix));
+        let query = format!(
+            "list-type=2&delimiter=%2F&prefix={}",
+            urlencoding(&norm_prefix)
+        );
         let uri = format!("/{}", bucket);
         let mut headers = HeaderMap::new();
         let empty_hash = hex_encode(Sha256::digest(b""));
         self.sign_request("GET", &uri, &query, &mut headers, &empty_hash)?;
 
         let url = format!("{}/{}?{}", self.config.endpoint, bucket, query);
-        let res = self.client.get(&url).headers(headers).send().await
+        let res = self
+            .client
+            .get(&url)
+            .headers(headers)
+            .send()
+            .await
             .map_err(|e| CoreError::ConnectionFailed(e.to_string()))?;
 
         let text = res.text().await.unwrap_or_default();
@@ -228,15 +241,25 @@ impl VirtualFileSystem for S3Driver {
                     let size = if let Some(s_start) = part.find("<Size>") {
                         if let Some(s_end) = part.find("</Size>") {
                             part[s_start + 6..s_end].parse::<u64>().unwrap_or(0)
-                        } else { 0 }
-                    } else { 0 };
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
 
                     let modified_at = if let Some(m_start) = part.find("<LastModified>") {
                         if let Some(m_end) = part.find("</LastModified>") {
                             let date_str = &part[m_start + 14..m_end];
-                            DateTime::parse_from_rfc3339(date_str).ok().map(|dt| dt.with_timezone(&Utc))
-                        } else { None }
-                    } else { None };
+                            DateTime::parse_from_rfc3339(date_str)
+                                .ok()
+                                .map(|dt| dt.with_timezone(&Utc))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
 
                     entries.push(FileEntry {
                         name: filename.to_string(),
@@ -270,7 +293,12 @@ impl VirtualFileSystem for S3Driver {
         self.sign_request("HEAD", &uri, "", &mut headers, &empty_hash)?;
 
         let url = format!("{}{}", self.config.endpoint, uri);
-        let res = self.client.head(&url).headers(headers).send().await
+        let res = self
+            .client
+            .head(&url)
+            .headers(headers)
+            .send()
+            .await
             .map_err(|e| CoreError::NotFound(e.to_string()))?;
 
         let size = res.content_length().unwrap_or(0);
@@ -296,10 +324,18 @@ impl VirtualFileSystem for S3Driver {
         self.sign_request("GET", &uri, "", &mut headers, &empty_hash)?;
 
         let url = format!("{}{}", self.config.endpoint, uri);
-        let res = self.client.get(&url).headers(headers).send().await
+        let res = self
+            .client
+            .get(&url)
+            .headers(headers)
+            .send()
+            .await
             .map_err(|e| CoreError::NotFound(e.to_string()))?;
 
-        let data = res.bytes().await.map_err(|e| CoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        let data = res
+            .bytes()
+            .await
+            .map_err(|e| CoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         Ok(data)
     }
 
@@ -308,16 +344,24 @@ impl VirtualFileSystem for S3Driver {
         let uri = format!("/{}/{}", bucket, key);
         let mut headers = HeaderMap::new();
         let empty_hash = hex_encode(Sha256::digest(b""));
-        
+
         let range_val = format!("bytes={}-{}", offset, offset + length - 1);
         headers.insert("range", HeaderValue::from_str(&range_val).unwrap());
         self.sign_request("GET", &uri, "", &mut headers, &empty_hash)?;
 
         let url = format!("{}{}", self.config.endpoint, uri);
-        let res = self.client.get(&url).headers(headers).send().await
+        let res = self
+            .client
+            .get(&url)
+            .headers(headers)
+            .send()
+            .await
             .map_err(|e| CoreError::NotFound(e.to_string()))?;
 
-        let data = res.bytes().await.map_err(|e| CoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        let data = res
+            .bytes()
+            .await
+            .map_err(|e| CoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         Ok(data)
     }
 
@@ -330,7 +374,13 @@ impl VirtualFileSystem for S3Driver {
         self.sign_request("PUT", &uri, "", &mut headers, &payload_hash)?;
 
         let url = format!("{}{}", self.config.endpoint, uri);
-        let _ = self.client.put(&url).headers(headers).body(data).send().await
+        let _ = self
+            .client
+            .put(&url)
+            .headers(headers)
+            .body(data)
+            .send()
+            .await
             .map_err(|e| CoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         Ok(())
@@ -338,7 +388,11 @@ impl VirtualFileSystem for S3Driver {
 
     async fn create_dir(&self, path: &str) -> CoreResult<()> {
         let (bucket, key) = self.split_path(path);
-        let dir_key = if key.ends_with('/') { key } else { format!("{}/", key) };
+        let dir_key = if key.ends_with('/') {
+            key
+        } else {
+            format!("{}/", key)
+        };
         let uri = format!("/{}/{}", bucket, dir_key);
         let mut headers = HeaderMap::new();
         let empty_hash = hex_encode(Sha256::digest(b""));
@@ -346,7 +400,12 @@ impl VirtualFileSystem for S3Driver {
         self.sign_request("PUT", &uri, "", &mut headers, &empty_hash)?;
 
         let url = format!("{}{}", self.config.endpoint, uri);
-        let _ = self.client.put(&url).headers(headers).send().await
+        let _ = self
+            .client
+            .put(&url)
+            .headers(headers)
+            .send()
+            .await
             .map_err(|e| CoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         Ok(())
@@ -360,7 +419,12 @@ impl VirtualFileSystem for S3Driver {
         self.sign_request("DELETE", &uri, "", &mut headers, &empty_hash)?;
 
         let url = format!("{}{}", self.config.endpoint, uri);
-        let _ = self.client.delete(&url).headers(headers).send().await
+        let _ = self
+            .client
+            .delete(&url)
+            .headers(headers)
+            .send()
+            .await
             .map_err(|e| CoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         Ok(())
@@ -387,14 +451,30 @@ impl VirtualFileSystem for S3Driver {
         Ok(self.metadata(path).await.is_ok())
     }
 
-    async fn search(&self, root_path: &str, pattern: &str, max_results: usize) -> CoreResult<Vec<FileEntry>> {
+    async fn search(
+        &self,
+        root_path: &str,
+        pattern: &str,
+        max_results: usize,
+    ) -> CoreResult<Vec<FileEntry>> {
         let files = self.list_dir(root_path).await?;
         let pat_lower = pattern.to_lowercase();
-        Ok(files.into_iter().filter(|f| f.name.to_lowercase().contains(&pat_lower)).take(max_results).collect())
+        Ok(files
+            .into_iter()
+            .filter(|f| f.name.to_lowercase().contains(&pat_lower))
+            .take(max_results)
+            .collect())
     }
 
-    async fn create_symlink(&self, _target: &str, _link_path: &str, _is_symbolic: bool) -> CoreResult<()> {
-        Err(CoreError::General("Object storage S3 does not support symbolic links".to_string()))
+    async fn create_symlink(
+        &self,
+        _target: &str,
+        _link_path: &str,
+        _is_symbolic: bool,
+    ) -> CoreResult<()> {
+        Err(CoreError::General(
+            "Object storage S3 does not support symbolic links".to_string(),
+        ))
     }
 
     async fn get_filesystem_info(&self, path: &str) -> CoreResult<FileSystemInfo> {

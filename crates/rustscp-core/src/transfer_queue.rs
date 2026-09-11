@@ -54,7 +54,11 @@ impl TransferQueueManager {
         sessions: Arc<RwLock<HashMap<String, Arc<dyn VirtualFileSystem>>>>,
     ) -> String {
         let id = format!("tr-{}", uuid::Uuid::new_v4());
-        let file_name = source_path.split('/').last().unwrap_or(&source_path).to_string();
+        let file_name = source_path
+            .split('/')
+            .last()
+            .unwrap_or(&source_path)
+            .to_string();
 
         let task = QueueTransferTask {
             id: id.clone(),
@@ -162,9 +166,17 @@ impl TransferQueueManager {
                 // If native shell commands are supported (SSH / SFTP or Local)
                 if src_vfs.supports_shell() {
                     let cmd = if is_move {
-                        format!("mv -f '{}' '{}'", source_path.replace('\'', "'\\''"), dest_path.replace('\'', "'\\''"))
+                        format!(
+                            "mv -f '{}' '{}'",
+                            source_path.replace('\'', "'\\''"),
+                            dest_path.replace('\'', "'\\''")
+                        )
                     } else {
-                        format!("cp -a -r '{}' '{}'", source_path.replace('\'', "'\\''"), dest_path.replace('\'', "'\\''"))
+                        format!(
+                            "cp -a -r '{}' '{}'",
+                            source_path.replace('\'', "'\\''"),
+                            dest_path.replace('\'', "'\\''")
+                        )
                     };
 
                     if let Ok((code, _out, _err)) = src_vfs.execute_command(&cmd).await {
@@ -299,6 +311,8 @@ impl TransferQueueManager {
 
     pub async fn clear_completed(&self) {
         let mut list = self.tasks.write().await;
-        list.retain(|x| x.status != TransferStatus::Completed && x.status != TransferStatus::Cancelled);
+        list.retain(|x| {
+            x.status != TransferStatus::Completed && x.status != TransferStatus::Cancelled
+        });
     }
 }

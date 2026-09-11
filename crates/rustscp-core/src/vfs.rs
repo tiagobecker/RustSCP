@@ -44,10 +44,20 @@ pub trait VirtualFileSystem: Send + Sync + Debug {
     async fn exists(&self, path: &str) -> CoreResult<bool>;
 
     /// Search files matching pattern inside root_path
-    async fn search(&self, root_path: &str, pattern: &str, max_results: usize) -> CoreResult<Vec<FileEntry>>;
+    async fn search(
+        &self,
+        root_path: &str,
+        pattern: &str,
+        max_results: usize,
+    ) -> CoreResult<Vec<FileEntry>>;
 
     /// Create symbolic link or hard link
-    async fn create_symlink(&self, target: &str, link_path: &str, is_symbolic: bool) -> CoreResult<()>;
+    async fn create_symlink(
+        &self,
+        target: &str,
+        link_path: &str,
+        is_symbolic: bool,
+    ) -> CoreResult<()>;
 
     /// Query disk space and filesystem info
     async fn get_filesystem_info(&self, path: &str) -> CoreResult<FileSystemInfo>;
@@ -86,5 +96,3 @@ pub trait VirtualFileSystem: Send + Sync + Debug {
         matches!(self.protocol(), Protocol::Local | Protocol::Sftp)
     }
 }
-
-

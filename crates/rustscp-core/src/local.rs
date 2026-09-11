@@ -101,21 +101,19 @@ impl LocalFsDriver {
             FileType::Other
         };
 
-        let modified_at = meta
-            .modified()
-            .ok()
-            .map(|st| DateTime::<Utc>::from(st));
+        let modified_at = meta.modified().ok().map(|st| DateTime::<Utc>::from(st));
 
-        let created_at = meta
-            .created()
-            .ok()
-            .map(|st| DateTime::<Utc>::from(st));
+        let created_at = meta.created().ok().map(|st| DateTime::<Utc>::from(st));
 
         #[cfg(unix)]
         let (mode, owner, group) = {
             use std::os::unix::fs::MetadataExt;
             let mode = meta.mode();
-            (mode, Some(meta.uid().to_string()), Some(meta.gid().to_string()))
+            (
+                mode,
+                Some(meta.uid().to_string()),
+                Some(meta.gid().to_string()),
+            )
         };
 
         #[cfg(not(unix))]
@@ -181,12 +179,10 @@ impl VirtualFileSystem for LocalFsDriver {
         }
 
         // Sort: directories first, then alphabetical case-insensitive
-        entries.sort_by(|a, b| {
-            match (a.is_dir(), b.is_dir()) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-            }
+        entries.sort_by(|a, b| match (a.is_dir(), b.is_dir()) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
         });
 
         Ok(entries)
@@ -280,7 +276,12 @@ impl VirtualFileSystem for LocalFsDriver {
         Ok(fs::try_exists(&target).await.unwrap_or(false))
     }
 
-    async fn search(&self, root_path: &str, pattern: &str, max_results: usize) -> CoreResult<Vec<FileEntry>> {
+    async fn search(
+        &self,
+        root_path: &str,
+        pattern: &str,
+        max_results: usize,
+    ) -> CoreResult<Vec<FileEntry>> {
         let target = self.resolve_path(root_path)?;
         let pat_lower = pattern.to_lowercase();
         let mut results = Vec::new();
@@ -316,7 +317,12 @@ impl VirtualFileSystem for LocalFsDriver {
         Ok(results)
     }
 
-    async fn create_symlink(&self, target: &str, link_path: &str, is_symbolic: bool) -> CoreResult<()> {
+    async fn create_symlink(
+        &self,
+        target: &str,
+        link_path: &str,
+        is_symbolic: bool,
+    ) -> CoreResult<()> {
         let link_dest = self.resolve_path(link_path)?;
         let target_path = Path::new(target);
 
@@ -458,7 +464,8 @@ impl VirtualFileSystem for LocalFsDriver {
                                                 let found = if query.case_sensitive {
                                                     line.contains(text)
                                                 } else {
-                                                    line.to_lowercase().contains(&text.to_lowercase())
+                                                    line.to_lowercase()
+                                                        .contains(&text.to_lowercase())
                                                 };
                                                 if found {
                                                     matched_lines.push(line.trim().to_string());
@@ -532,7 +539,6 @@ impl VirtualFileSystem for LocalFsDriver {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,7 +555,10 @@ mod tests {
 
         // Write file
         let content = Bytes::from_static(b"Hello RustSCP VFS!");
-        driver.write_file("test_dir/hello.txt", content.clone()).await.unwrap();
+        driver
+            .write_file("test_dir/hello.txt", content.clone())
+            .await
+            .unwrap();
         assert!(driver.exists("test_dir/hello.txt").await.unwrap());
 
         // Read file
@@ -567,7 +576,10 @@ mod tests {
         assert_eq!(items[0].size, content.len() as u64);
 
         // Rename
-        driver.rename("test_dir/hello.txt", "test_dir/renamed.txt").await.unwrap();
+        driver
+            .rename("test_dir/hello.txt", "test_dir/renamed.txt")
+            .await
+            .unwrap();
         assert!(!driver.exists("test_dir/hello.txt").await.unwrap());
         assert!(driver.exists("test_dir/renamed.txt").await.unwrap());
 

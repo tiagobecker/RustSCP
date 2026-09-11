@@ -1,11 +1,12 @@
 use rustscp_actions::{ActionCatalog, ActionContext, ActionDefinition, ActionExecutor};
 use rustscp_core::{
-    get_rustscp_config_dir, BookmarkItem, CacheStats, CodeGenerator, CodeTargetLanguage, ConnectionConfig,
-    DirectoryDiffItem, DirectoryDiffType, FileEntry, FileMaskFilter, FileSystemInfo, FindFileMatch,
-    FindFileQuery, FtpConfig, FtpDriver, LocalFsDriver, ManagedDiskCache, Protocol, QueueTransferTask,
-    RemoteSystemInfo, RemoteTrashItem, RemoteTrashStatus, S3Config, S3Driver, ScriptCommandOutput,
-    ScriptInterpreter, SftpDriver, SyncEngine, SyncItem, SyncOptions, TransferQueueManager,
-    VirtualDiskInfo, VirtualFileSystem, WebDavServer,
+    get_rustscp_config_dir, BookmarkItem, CacheStats, CodeGenerator, CodeTargetLanguage,
+    ConnectionConfig, DirectoryDiffItem, DirectoryDiffType, FileEntry, FileMaskFilter,
+    FileSystemInfo, FindFileMatch, FindFileQuery, FtpConfig, FtpDriver, LocalFsDriver,
+    ManagedDiskCache, Protocol, QueueTransferTask, RemoteSystemInfo, RemoteTrashItem,
+    RemoteTrashStatus, S3Config, S3Driver, ScriptCommandOutput, ScriptInterpreter, SftpDriver,
+    SyncEngine, SyncItem, SyncOptions, TransferQueueManager, VirtualDiskInfo, VirtualFileSystem,
+    WebDavServer,
 };
 use rustscp_mcp::{AuditEvent, AuditLogger, McpServer};
 use serde::{Deserialize, Serialize};
@@ -161,7 +162,10 @@ pub async fn connect_session(
     configs.insert(session_id.clone(), config);
 
     // Register with MCP Server so AI agents can safely browse this session
-    state.mcp_server.register_connection(session_id.clone(), vfs).await;
+    state
+        .mcp_server
+        .register_connection(session_id.clone(), vfs)
+        .await;
 
     Ok(session_id)
 }
@@ -186,7 +190,9 @@ pub async fn disconnect_session(
 }
 
 #[tauri::command]
-pub async fn get_saved_sites(state: tauri::State<'_, AppState>) -> Result<Vec<ConnectionConfig>, String> {
+pub async fn get_saved_sites(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<ConnectionConfig>, String> {
     let sites = state.saved_sites.read().await;
     Ok(sites.clone())
 }
@@ -207,10 +213,7 @@ pub async fn save_site(
 }
 
 #[tauri::command]
-pub async fn delete_site(
-    state: tauri::State<'_, AppState>,
-    id: String,
-) -> Result<(), String> {
+pub async fn delete_site(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
     let mut sites = state.saved_sites.write().await;
     sites.retain(|s| s.id != id);
     rustscp_core::save_local_vault(&sites).map_err(|e| e.to_string())?;
@@ -323,7 +326,10 @@ pub async fn list_directory(
     let entries = vfs.list_dir(&path).await.map_err(|e| e.to_string())?;
 
     // Cache the fresh entries in memory catalog for instant back/forward/up navigation
-    state.disk_cache.put_catalog(&session_id, &path, entries.clone()).await;
+    state
+        .disk_cache
+        .put_catalog(&session_id, &path, entries.clone())
+        .await;
 
     Ok(entries)
 }
@@ -372,7 +378,10 @@ pub async fn write_file_content(
         .await
         .map_err(|e| e.to_string())?;
 
-    state.disk_cache.invalidate_catalog(&session_id, &path).await;
+    state
+        .disk_cache
+        .invalidate_catalog(&session_id, &path)
+        .await;
     Ok(())
 }
 
@@ -389,7 +398,10 @@ pub async fn create_new_directory(
 
     vfs.create_dir(&path).await.map_err(|e| e.to_string())?;
 
-    state.disk_cache.invalidate_catalog(&session_id, &path).await;
+    state
+        .disk_cache
+        .invalidate_catalog(&session_id, &path)
+        .await;
     Ok(())
 }
 
@@ -431,7 +443,10 @@ pub async fn delete_items(
             match vfs.execute_command(&cmd).await {
                 Ok((exit_code, _stdout, stderr)) => {
                     if exit_code != 0 {
-                        eprintln!("Quick delete rm -rf failed (exit code {}): {}", exit_code, stderr);
+                        eprintln!(
+                            "Quick delete rm -rf failed (exit code {}): {}",
+                            exit_code, stderr
+                        );
                         quick_delete_success = false;
                         break;
                     }
@@ -463,11 +478,16 @@ pub async fn delete_items(
                 Err(_) => false,
             };
             if is_directory {
-                vfs.remove_dir(trimmed, true).await.map_err(|e| e.to_string())?;
+                vfs.remove_dir(trimmed, true)
+                    .await
+                    .map_err(|e| e.to_string())?;
             } else {
                 vfs.remove_file(trimmed).await.map_err(|e| e.to_string())?;
             }
-            state.disk_cache.invalidate_catalog(&session_id, trimmed).await;
+            state
+                .disk_cache
+                .invalidate_catalog(&session_id, trimmed)
+                .await;
         }
         return Ok(());
     }
@@ -478,7 +498,9 @@ pub async fn delete_items(
         match tokio::fs::symlink_metadata(p).await {
             Ok(meta) => {
                 if meta.is_dir() {
-                    tokio::fs::remove_dir_all(p).await.map_err(|e| e.to_string())?;
+                    tokio::fs::remove_dir_all(p)
+                        .await
+                        .map_err(|e| e.to_string())?;
                 } else {
                     tokio::fs::remove_file(p).await.map_err(|e| e.to_string())?;
                 }
@@ -521,7 +543,10 @@ pub async fn rename_item(
 
     vfs.rename(&from, &to).await.map_err(|e| e.to_string())?;
 
-    state.disk_cache.invalidate_catalog(&session_id, &from).await;
+    state
+        .disk_cache
+        .invalidate_catalog(&session_id, &from)
+        .await;
     state.disk_cache.invalidate_catalog(&session_id, &to).await;
     Ok(())
 }
@@ -538,9 +563,14 @@ pub async fn change_permissions(
         .get(&session_id)
         .ok_or_else(|| format!("Session '{}' not found", session_id))?;
 
-    vfs.set_permissions(&path, mode).await.map_err(|e| e.to_string())?;
+    vfs.set_permissions(&path, mode)
+        .await
+        .map_err(|e| e.to_string())?;
 
-    state.disk_cache.invalidate_catalog(&session_id, &path).await;
+    state
+        .disk_cache
+        .invalidate_catalog(&session_id, &path)
+        .await;
     Ok(())
 }
 
@@ -608,10 +638,19 @@ pub async fn transfer_file(
         .clone();
 
     // Stream read from source, write to destination
-    let data = src_vfs.read_file(&source_path).await.map_err(|e| e.to_string())?;
-    dst_vfs.write_file(&dest_path, data).await.map_err(|e| e.to_string())?;
+    let data = src_vfs
+        .read_file(&source_path)
+        .await
+        .map_err(|e| e.to_string())?;
+    dst_vfs
+        .write_file(&dest_path, data)
+        .await
+        .map_err(|e| e.to_string())?;
 
-    state.disk_cache.invalidate_catalog(&dest_session, &dest_path).await;
+    state
+        .disk_cache
+        .invalidate_catalog(&dest_session, &dest_path)
+        .await;
 
     Ok(())
 }
@@ -629,7 +668,10 @@ pub async fn execute_remote_command(
         .get(&session_id)
         .ok_or_else(|| format!("Session '{}' not found", session_id))?;
 
-    let (exit_code, stdout, stderr) = vfs.execute_command(&command).await.map_err(|e| e.to_string())?;
+    let (exit_code, stdout, stderr) = vfs
+        .execute_command(&command)
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(CommandExecutionResult {
         exit_code,
@@ -794,7 +836,12 @@ pub async fn generate_automation_code(
         _ => return Err(format!("Unsupported target language: {}", target_language)),
     };
 
-    Ok(CodeGenerator::generate(config, lang, &remote_path, &local_path))
+    Ok(CodeGenerator::generate(
+        config,
+        lang,
+        &remote_path,
+        &local_path,
+    ))
 }
 
 // ---------------------- ADVANCED SEARCH & FIND FILES (Shift+F7) ----------------------
@@ -826,7 +873,9 @@ pub async fn get_filesystem_info(
         .get(&session_id)
         .ok_or_else(|| format!("Session '{}' not found", session_id))?;
 
-    vfs.get_filesystem_info(&path).await.map_err(|e| e.to_string())
+    vfs.get_filesystem_info(&path)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -880,8 +929,14 @@ pub async fn compare_directories_fast(
         .get(&remote_session)
         .ok_or_else(|| format!("Remote session '{}' not found", remote_session))?;
 
-    let local_items = local_vfs.list_dir(&local_dir).await.map_err(|e| e.to_string())?;
-    let remote_items = remote_vfs.list_dir(&remote_dir).await.map_err(|e| e.to_string())?;
+    let local_items = local_vfs
+        .list_dir(&local_dir)
+        .await
+        .map_err(|e| e.to_string())?;
+    let remote_items = remote_vfs
+        .list_dir(&remote_dir)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let mut local_map: HashMap<String, FileEntry> = HashMap::new();
     for item in local_items {
@@ -935,7 +990,8 @@ pub async fn compare_directories_fast(
 
                 if check_size && l.size != r.size && l.is_file() && r.is_file() {
                     diff_type = DirectoryDiffType::DifferentSize;
-                } else if check_time && l.modified_at != r.modified_at && l.is_file() && r.is_file() {
+                } else if check_time && l.modified_at != r.modified_at && l.is_file() && r.is_file()
+                {
                     diff_type = DirectoryDiffType::DifferentTime;
                 }
 
@@ -1086,7 +1142,9 @@ pub async fn mount_virtual_disk(
     let mount_root = if !config_root.trim().is_empty() && config_root != "/" {
         config_root
     } else {
-        vfs.get_default_path().await.unwrap_or_else(|_| "/".to_string())
+        vfs.get_default_path()
+            .await
+            .unwrap_or_else(|_| "/".to_string())
     };
 
     let mut disks = state.virtual_disks.lock().await;
@@ -1140,9 +1198,12 @@ pub async fn open_virtual_disk_folder(
     session_id: String,
 ) -> Result<String, String> {
     let disks = state.virtual_disks.lock().await;
-    let server = disks
-        .get(&session_id)
-        .ok_or_else(|| format!("Disco virtual não encontrado para a conexão '{}'", session_id))?;
+    let server = disks.get(&session_id).ok_or_else(|| {
+        format!(
+            "Disco virtual não encontrado para a conexão '{}'",
+            session_id
+        )
+    })?;
 
     let mount_point = server
         .mount_point()
@@ -1174,7 +1235,10 @@ pub async fn open_virtual_disk_folder(
             .arg(&mount_point)
             .spawn()
             .map_err(|e| format!("Falha ao abrir no gerenciador de arquivos: {}", e))?;
-        return Ok(format!("Aberto no Gerenciador de Arquivos: {}", mount_point));
+        return Ok(format!(
+            "Aberto no Gerenciador de Arquivos: {}",
+            mount_point
+        ));
     }
 
     #[allow(unreachable_code)]
@@ -1269,9 +1333,7 @@ pub async fn pick_key_file() -> Result<Option<String>, String> {
 // ---------------------- LOCAL DISK & SHADOW CATALOG CACHE ----------------------
 
 #[tauri::command]
-pub async fn get_cache_stats(
-    state: tauri::State<'_, AppState>,
-) -> Result<CacheStats, String> {
+pub async fn get_cache_stats(state: tauri::State<'_, AppState>) -> Result<CacheStats, String> {
     let configs = state.session_configs.read().await;
     let mut session_names = HashMap::new();
     for (id, cfg) in configs.iter() {
@@ -1286,14 +1348,20 @@ pub async fn clear_site_cache(
     state: tauri::State<'_, AppState>,
     session_id: String,
 ) -> Result<(), String> {
-    state.disk_cache.clear_session(&session_id).await.map_err(|e| e.to_string())
+    state
+        .disk_cache
+        .clear_session(&session_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn clear_all_cache(
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    state.disk_cache.clear_all().await.map_err(|e| e.to_string())
+pub async fn clear_all_cache(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state
+        .disk_cache
+        .clear_all()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1372,7 +1440,11 @@ pub async fn compress_items(
     let items_escaped = items
         .iter()
         .map(|s| {
-            let base = s.split('/').next_back().or_else(|| s.split('\\').next_back()).unwrap_or(s);
+            let base = s
+                .split('/')
+                .next_back()
+                .or_else(|| s.split('\\').next_back())
+                .unwrap_or(s);
             format!("'{}'", base.replace('\'', "'\\''"))
         })
         .collect::<Vec<_>>()
@@ -1395,18 +1467,33 @@ pub async fn compress_items(
         {
             let win_cmd = match format.as_str() {
                 "zip" => {
-                    let items_list = items.iter().map(|s| format!("'{}'", s)).collect::<Vec<_>>().join(", ");
+                    let items_list = items
+                        .iter()
+                        .map(|s| format!("'{}'", s))
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     format!("powershell -NoProfile -Command \"Compress-Archive -Path {} -DestinationPath '{}' -Force\"", items_list, clean_output)
                 }
                 _ => {
-                    format!("tar -caf \"{}\" {}", clean_output, items_escaped.replace('\'', "\""))
+                    format!(
+                        "tar -caf \"{}\" {}",
+                        clean_output,
+                        items_escaped.replace('\'', "\"")
+                    )
                 }
             };
-            let (code, stdout, stderr) = vfs.execute_command(&win_cmd).await.map_err(|e| e.to_string())?;
+            let (code, stdout, stderr) = vfs
+                .execute_command(&win_cmd)
+                .await
+                .map_err(|e| e.to_string())?;
             if code != 0 && !stderr.trim().is_empty() {
                 return Err(format!("Compression failed: {}", stderr));
             }
-            return Ok(if stdout.is_empty() { format!("Archive '{}' created successfully", clean_output) } else { stdout });
+            return Ok(if stdout.is_empty() {
+                format!("Archive '{}' created successfully", clean_output)
+            } else {
+                stdout
+            });
         }
 
         #[cfg(not(target_os = "windows"))]
@@ -1424,11 +1511,16 @@ pub async fn compress_items(
                     current_dir.replace('\'', "'\\''"), items_escaped, clean_output, clean_output, items_escaped
                 ),
             };
-            let (code, stdout, stderr) = vfs.execute_command(&cmd).await.map_err(|e| e.to_string())?;
+            let (code, stdout, stderr) =
+                vfs.execute_command(&cmd).await.map_err(|e| e.to_string())?;
             if code != 0 && !stderr.trim().is_empty() {
                 return Err(format!("Compression failed: {}", stderr));
             }
-            return Ok(if stdout.is_empty() { format!("Archive '{}' created successfully", clean_output) } else { stdout });
+            return Ok(if stdout.is_empty() {
+                format!("Archive '{}' created successfully", clean_output)
+            } else {
+                stdout
+            });
         }
     }
 
@@ -1451,8 +1543,15 @@ pub async fn compress_items(
     if code != 0 && !stderr.trim().is_empty() {
         return Err(format!("Compression failed: {}", stderr));
     }
-    state.disk_cache.invalidate_catalog(&session_id, &current_dir).await;
-    Ok(if stdout.is_empty() { format!("Archive '{}' created successfully", clean_output) } else { stdout })
+    state
+        .disk_cache
+        .invalidate_catalog(&session_id, &current_dir)
+        .await;
+    Ok(if stdout.is_empty() {
+        format!("Archive '{}' created successfully", clean_output)
+    } else {
+        stdout
+    })
 }
 
 #[tauri::command]
@@ -1472,15 +1571,23 @@ pub async fn extract_archive(
         if sub.trim().is_empty() || sub == "." {
             current_dir.clone()
         } else {
-            format!("{}/{}", current_dir.trim_end_matches('/'), sub.trim().trim_matches('/'))
+            format!(
+                "{}/{}",
+                current_dir.trim_end_matches('/'),
+                sub.trim().trim_matches('/')
+            )
         }
     } else {
         current_dir.clone()
     };
 
     let is_zip = archive_path.ends_with(".zip");
-    let is_bz2 = archive_path.ends_with(".tar.bz2") || archive_path.ends_with(".tbz2") || archive_path.ends_with(".bz2");
-    let is_xz = archive_path.ends_with(".tar.xz") || archive_path.ends_with(".txz") || archive_path.ends_with(".xz");
+    let is_bz2 = archive_path.ends_with(".tar.bz2")
+        || archive_path.ends_with(".tbz2")
+        || archive_path.ends_with(".bz2");
+    let is_xz = archive_path.ends_with(".tar.xz")
+        || archive_path.ends_with(".txz")
+        || archive_path.ends_with(".xz");
     let is_tar = archive_path.ends_with(".tar");
 
     if vfs.protocol() == Protocol::Local {
@@ -1489,15 +1596,31 @@ pub async fn extract_archive(
             let win_cmd = if is_zip {
                 format!("powershell -NoProfile -Command \"Expand-Archive -Path '{}' -DestinationPath '{}' -Force\"", archive_path, target_dest)
             } else {
-                format!("mkdir \"{}\" 2>nul & tar -xvf \"{}\" -C \"{}\"", target_dest, archive_path, target_dest)
+                format!(
+                    "mkdir \"{}\" 2>nul & tar -xvf \"{}\" -C \"{}\"",
+                    target_dest, archive_path, target_dest
+                )
             };
-            let (code, stdout, stderr) = vfs.execute_command(&win_cmd).await.map_err(|e| e.to_string())?;
+            let (code, stdout, stderr) = vfs
+                .execute_command(&win_cmd)
+                .await
+                .map_err(|e| e.to_string())?;
             if code != 0 && !stderr.trim().is_empty() {
                 return Err(format!("Extraction failed: {}", stderr));
             }
-            state.disk_cache.invalidate_catalog(&session_id, &target_dest).await;
-            state.disk_cache.invalidate_catalog(&session_id, &current_dir).await;
-            return Ok(if stdout.is_empty() { "Extracted successfully".to_string() } else { stdout });
+            state
+                .disk_cache
+                .invalidate_catalog(&session_id, &target_dest)
+                .await;
+            state
+                .disk_cache
+                .invalidate_catalog(&session_id, &current_dir)
+                .await;
+            return Ok(if stdout.is_empty() {
+                "Extracted successfully".to_string()
+            } else {
+                stdout
+            });
         }
 
         #[cfg(not(target_os = "windows"))]
@@ -1509,11 +1632,28 @@ pub async fn extract_archive(
                     archive_path.replace('\'', "'\\''"), target_dest.replace('\'', "'\\'")
                 )
             } else if is_bz2 {
-                format!("mkdir -p '{}' && tar -xjf '{}' -C '{}'", target_dest.replace('\'', "'\\''"), archive_path.replace('\'', "'\\''"), target_dest.replace('\'', "'\\'"))
+                format!(
+                    "mkdir -p '{}' && tar -xjf '{}' -C '{}'",
+                    target_dest.replace('\'', "'\\''"),
+                    archive_path.replace('\'', "'\\''"),
+                    target_dest.replace('\'', "'\\'")
+                )
             } else if is_xz {
-                format!("mkdir -p '{}' && (tar -xJf '{}' -C '{}' || tar -xf '{}' -C '{}')", target_dest.replace('\'', "'\\''"), archive_path.replace('\'', "'\\''"), target_dest.replace('\'', "'\\'"), archive_path.replace('\'', "'\\''"), target_dest.replace('\'', "'\\'"))
+                format!(
+                    "mkdir -p '{}' && (tar -xJf '{}' -C '{}' || tar -xf '{}' -C '{}')",
+                    target_dest.replace('\'', "'\\''"),
+                    archive_path.replace('\'', "'\\''"),
+                    target_dest.replace('\'', "'\\'"),
+                    archive_path.replace('\'', "'\\''"),
+                    target_dest.replace('\'', "'\\'")
+                )
             } else if is_tar {
-                format!("mkdir -p '{}' && tar -xf '{}' -C '{}'", target_dest.replace('\'', "'\\''"), archive_path.replace('\'', "'\\''"), target_dest.replace('\'', "'\\'"))
+                format!(
+                    "mkdir -p '{}' && tar -xf '{}' -C '{}'",
+                    target_dest.replace('\'', "'\\''"),
+                    archive_path.replace('\'', "'\\''"),
+                    target_dest.replace('\'', "'\\'")
+                )
             } else {
                 format!(
                     "mkdir -p '{}' && (which pigz >/dev/null 2>&1 && pigz -dc '{}' | tar -xf - -C '{}' || tar -xzf '{}' -C '{}')",
@@ -1521,13 +1661,24 @@ pub async fn extract_archive(
                     archive_path.replace('\'', "'\\''"), target_dest.replace('\'', "'\\'")
                 )
             };
-            let (code, stdout, stderr) = vfs.execute_command(&cmd).await.map_err(|e| e.to_string())?;
+            let (code, stdout, stderr) =
+                vfs.execute_command(&cmd).await.map_err(|e| e.to_string())?;
             if code != 0 && !stderr.trim().is_empty() {
                 return Err(format!("Extraction failed: {}", stderr));
             }
-            state.disk_cache.invalidate_catalog(&session_id, &target_dest).await;
-            state.disk_cache.invalidate_catalog(&session_id, &current_dir).await;
-            return Ok(if stdout.is_empty() { "Extracted successfully".to_string() } else { stdout });
+            state
+                .disk_cache
+                .invalidate_catalog(&session_id, &target_dest)
+                .await;
+            state
+                .disk_cache
+                .invalidate_catalog(&session_id, &current_dir)
+                .await;
+            return Ok(if stdout.is_empty() {
+                "Extracted successfully".to_string()
+            } else {
+                stdout
+            });
         }
     }
 
@@ -1540,11 +1691,28 @@ pub async fn extract_archive(
             archive_path.replace('\'', "'\\''"), target_dest.replace('\'', "'\\'")
         )
     } else if is_bz2 {
-        format!("mkdir -p '{}' && tar -xjf '{}' -C '{}'", target_dest.replace('\'', "'\\''"), archive_path.replace('\'', "'\\''"), target_dest.replace('\'', "'\\'"))
+        format!(
+            "mkdir -p '{}' && tar -xjf '{}' -C '{}'",
+            target_dest.replace('\'', "'\\''"),
+            archive_path.replace('\'', "'\\''"),
+            target_dest.replace('\'', "'\\'")
+        )
     } else if is_xz {
-        format!("mkdir -p '{}' && (tar -xJf '{}' -C '{}' || tar -xf '{}' -C '{}')", target_dest.replace('\'', "'\\''"), archive_path.replace('\'', "'\\''"), target_dest.replace('\'', "'\\'"), archive_path.replace('\'', "'\\''"), target_dest.replace('\'', "'\\'"))
+        format!(
+            "mkdir -p '{}' && (tar -xJf '{}' -C '{}' || tar -xf '{}' -C '{}')",
+            target_dest.replace('\'', "'\\''"),
+            archive_path.replace('\'', "'\\''"),
+            target_dest.replace('\'', "'\\'"),
+            archive_path.replace('\'', "'\\''"),
+            target_dest.replace('\'', "'\\'")
+        )
     } else if is_tar {
-        format!("mkdir -p '{}' && tar -xf '{}' -C '{}'", target_dest.replace('\'', "'\\''"), archive_path.replace('\'', "'\\''"), target_dest.replace('\'', "'\\'"))
+        format!(
+            "mkdir -p '{}' && tar -xf '{}' -C '{}'",
+            target_dest.replace('\'', "'\\''"),
+            archive_path.replace('\'', "'\\''"),
+            target_dest.replace('\'', "'\\'")
+        )
     } else {
         format!(
             "mkdir -p '{}' && (which pigz >/dev/null 2>&1 && pigz -dc '{}' | tar -xf - -C '{}' || tar -xzf '{}' -C '{}')",
@@ -1557,9 +1725,19 @@ pub async fn extract_archive(
     if code != 0 && !stderr.trim().is_empty() {
         return Err(format!("Extraction failed: {}", stderr));
     }
-    state.disk_cache.invalidate_catalog(&session_id, &target_dest).await;
-    state.disk_cache.invalidate_catalog(&session_id, &current_dir).await;
-    Ok(if stdout.is_empty() { "Extracted successfully".to_string() } else { stdout })
+    state
+        .disk_cache
+        .invalidate_catalog(&session_id, &target_dest)
+        .await;
+    state
+        .disk_cache
+        .invalidate_catalog(&session_id, &current_dir)
+        .await;
+    Ok(if stdout.is_empty() {
+        "Extracted successfully".to_string()
+    } else {
+        stdout
+    })
 }
 
 #[tauri::command]
@@ -1583,15 +1761,27 @@ pub async fn duplicate_item(
     };
 
     if meta.is_dir() {
-        let cmd = format!("cp -r '{}' '{}'", path.replace('\'', "'\\''"), new_path.replace('\'', "'\\'"));
+        let cmd = format!(
+            "cp -r '{}' '{}'",
+            path.replace('\'', "'\\''"),
+            new_path.replace('\'', "'\\'")
+        );
         let _ = vfs.execute_command(&cmd).await.map_err(|e| e.to_string())?;
     } else {
         let data = vfs.read_file(&path).await.map_err(|e| e.to_string())?;
-        vfs.write_file(&new_path, data).await.map_err(|e| e.to_string())?;
+        vfs.write_file(&new_path, data)
+            .await
+            .map_err(|e| e.to_string())?;
     }
 
-    state.disk_cache.invalidate_catalog(&session_id, &path).await;
-    state.disk_cache.invalidate_catalog(&session_id, &new_path).await;
+    state
+        .disk_cache
+        .invalidate_catalog(&session_id, &path)
+        .await;
+    state
+        .disk_cache
+        .invalidate_catalog(&session_id, &new_path)
+        .await;
 
     Ok(new_path)
 }
@@ -1634,10 +1824,16 @@ pub async fn detect_remote_system(
     if let Some(cfg) = configs.get(&session_id) {
         let driver = SftpDriver::new(cfg.clone());
         driver.connect().await.map_err(|e| e.to_string())?;
-        return driver.detect_os_and_shell().await.map_err(|e| e.to_string());
+        return driver
+            .detect_os_and_shell()
+            .await
+            .map_err(|e| e.to_string());
     }
 
-    Err(format!("Could not inspect system for session '{}'", session_id))
+    Err(format!(
+        "Could not inspect system for session '{}'",
+        session_id
+    ))
 }
 
 #[tauri::command]
@@ -1652,7 +1848,11 @@ pub async fn open_native_terminal(
         .ok_or_else(|| format!("Session '{}' not found", session_id))?;
 
     let is_remote = vfs.protocol() == Protocol::Sftp;
-    let target_path = if path.trim().is_empty() { "~".to_string() } else { path };
+    let target_path = if path.trim().is_empty() {
+        "~".to_string()
+    } else {
+        path
+    };
 
     if !is_remote {
         #[cfg(target_os = "macos")]
@@ -1684,7 +1884,14 @@ pub async fn open_native_terminal(
 
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
-            for term in &["x-terminal-emulator", "gnome-terminal", "konsole", "alacritty", "kitty", "xfce4-terminal"] {
+            for term in &[
+                "x-terminal-emulator",
+                "gnome-terminal",
+                "konsole",
+                "alacritty",
+                "kitty",
+                "xfce4-terminal",
+            ] {
                 if tokio::process::Command::new(term)
                     .arg(format!("--working-directory={}", target_path))
                     .spawn()
@@ -1705,14 +1912,20 @@ pub async fn open_native_terminal(
 
     let port_arg = format!("-p {}", if cfg.port == 0 { 22 } else { cfg.port });
     let user_host = format!("{}@{}", cfg.username, cfg.host);
-    
+
     let key_arg = match &cfg.auth {
         rustscp_core::AuthMethod::PrivateKey { path, .. } => format!("-i \"{}\"", path),
         _ => String::new(),
     };
 
-    let remote_cd = format!("cd '{}' 2>/dev/null || cd; exec bash -l || exec sh -l", target_path.replace('\'', "'\\''"));
-    let ssh_full_cmd = format!("ssh {} {} {} -t \"{}\"", port_arg, key_arg, user_host, remote_cd);
+    let remote_cd = format!(
+        "cd '{}' 2>/dev/null || cd; exec bash -l || exec sh -l",
+        target_path.replace('\'', "'\\''")
+    );
+    let ssh_full_cmd = format!(
+        "ssh {} {} {} -t \"{}\"",
+        port_arg, key_arg, user_host, remote_cd
+    );
 
     #[cfg(target_os = "macos")]
     {
@@ -1747,7 +1960,14 @@ pub async fn open_native_terminal(
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        for term in &["x-terminal-emulator", "gnome-terminal", "konsole", "alacritty", "kitty", "xfce4-terminal"] {
+        for term in &[
+            "x-terminal-emulator",
+            "gnome-terminal",
+            "konsole",
+            "alacritty",
+            "kitty",
+            "xfce4-terminal",
+        ] {
             if tokio::process::Command::new(term)
                 .arg("-e")
                 .arg(&ssh_full_cmd)
@@ -1792,7 +2012,10 @@ mkdir -p ~/.local/share/Trash/files ~/.local/share/Trash/info 2>/dev/null
 chmod 700 ~/.local/share/Trash ~/.local/share/Trash/files ~/.local/share/Trash/info 2>/dev/null
 echo "READY"
 "#;
-            let (code, _, stderr) = vfs.execute_command(script).await.map_err(|e| e.to_string())?;
+            let (code, _, stderr) = vfs
+                .execute_command(script)
+                .await
+                .map_err(|e| e.to_string())?;
             if code != 0 {
                 return Err(format!("Setup failed: {}", stderr));
             }
@@ -1827,7 +2050,9 @@ echo "READY"
 
             for path in &paths_to_trash {
                 let filename = path.split('/').next_back().unwrap_or(path).to_string();
-                let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_else(|| chrono::Utc::now().timestamp() * 1_000_000_000);
+                let timestamp = chrono::Utc::now()
+                    .timestamp_nanos_opt()
+                    .unwrap_or_else(|| chrono::Utc::now().timestamp() * 1_000_000_000);
                 let trash_filename = format!("{}_{}", timestamp, filename);
                 let now_iso = chrono::Utc::now().to_rfc3339();
 
@@ -1849,9 +2074,15 @@ echo "OK"
                     now_iso
                 );
 
-                let (code, _, stderr) = vfs.execute_command(&script).await.map_err(|e| e.to_string())?;
+                let (code, _, stderr) = vfs
+                    .execute_command(&script)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 if code != 0 {
-                    return Err(format!("Falha ao mover '{}' para lixeira: {}", filename, stderr));
+                    return Err(format!(
+                        "Falha ao mover '{}' para lixeira: {}",
+                        filename, stderr
+                    ));
                 }
 
                 state.disk_cache.invalidate_catalog(&session_id, path).await;
@@ -1866,7 +2097,10 @@ echo "OK"
                     total_size_bytes: 0,
                 },
                 items: Vec::new(),
-                message: format!("{} item(ns) movido(s) para a lixeira remota", paths_to_trash.len()),
+                message: format!(
+                    "{} item(ns) movido(s) para a lixeira remota",
+                    paths_to_trash.len()
+                ),
             })
         }
         "list" | "status" => {
@@ -1892,7 +2126,10 @@ for info in ~/.local/share/Trash/info/*.trashinfo; do
     fi
 done
 "#;
-            let (_, stdout, _) = vfs.execute_command(script).await.map_err(|e| e.to_string())?;
+            let (_, stdout, _) = vfs
+                .execute_command(script)
+                .await
+                .map_err(|e| e.to_string())?;
             if stdout.contains("NOT_INITIALIZED") {
                 return Ok(RemoteTrashResponse {
                     status: RemoteTrashStatus {
@@ -1956,7 +2193,9 @@ done
             })
         }
         "restore" => {
-            let item_id = target_path.or(payload).ok_or_else(|| "Item id required for restore".to_string())?;
+            let item_id = target_path
+                .or(payload)
+                .ok_or_else(|| "Item id required for restore".to_string())?;
             let script = format!(
                 r#"
 info_file=~/.local/share/Trash/info/'{}'.trashinfo
@@ -1974,16 +2213,25 @@ echo "RESTORED:$orig"
                 item_id.replace('\'', "'\\''"),
                 item_id.replace('\'', "'\\''")
             );
-            let (code, stdout, stderr) = vfs.execute_command(&script).await.map_err(|e| e.to_string())?;
+            let (code, stdout, stderr) = vfs
+                .execute_command(&script)
+                .await
+                .map_err(|e| e.to_string())?;
             if code != 0 {
                 return Err(format!("Restore failed: {}", stderr));
             }
             for line in stdout.lines() {
                 if let Some(restored_path) = line.strip_prefix("RESTORED:") {
-                    state.disk_cache.invalidate_catalog(&session_id, restored_path.trim()).await;
+                    state
+                        .disk_cache
+                        .invalidate_catalog(&session_id, restored_path.trim())
+                        .await;
                 }
             }
-            state.disk_cache.invalidate_catalog(&session_id, "~/.local/share/Trash/files").await;
+            state
+                .disk_cache
+                .invalidate_catalog(&session_id, "~/.local/share/Trash/files")
+                .await;
             Ok(RemoteTrashResponse {
                 status: RemoteTrashStatus {
                     enabled: true,
@@ -2001,11 +2249,17 @@ echo "RESTORED:$orig"
 rm -rf ~/.local/share/Trash/files/* ~/.local/share/Trash/info/* 2>/dev/null
 echo "EMPTIED"
 "#;
-            let (code, _, stderr) = vfs.execute_command(script).await.map_err(|e| e.to_string())?;
+            let (code, _, stderr) = vfs
+                .execute_command(script)
+                .await
+                .map_err(|e| e.to_string())?;
             if code != 0 {
                 return Err(format!("Empty trash failed: {}", stderr));
             }
-            state.disk_cache.invalidate_catalog(&session_id, "~/.local/share/Trash/files").await;
+            state
+                .disk_cache
+                .invalidate_catalog(&session_id, "~/.local/share/Trash/files")
+                .await;
             Ok(RemoteTrashResponse {
                 status: RemoteTrashStatus {
                     enabled: true,
@@ -2050,7 +2304,10 @@ pub async fn install_marketplace_tool(
         other => return Err(format!("Ferramenta desconhecida '{}'", other)),
     };
 
-    let (exit_code, stdout, stderr) = vfs.execute_command(install_cmd).await.map_err(|e| e.to_string())?;
+    let (exit_code, stdout, stderr) = vfs
+        .execute_command(install_cmd)
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(CommandExecutionResult {
         exit_code,
@@ -2096,7 +2353,8 @@ pub async fn manage_custom_actions(
         }
         "save" => {
             if let Some(json_str) = action_json {
-                let new_action: ActionDefinition = serde_json::from_str(&json_str).map_err(|e| e.to_string())?;
+                let new_action: ActionDefinition =
+                    serde_json::from_str(&json_str).map_err(|e| e.to_string())?;
                 custom.retain(|a| a.id != new_action.id);
                 custom.push(new_action);
                 save_custom(&custom)?;
@@ -2126,10 +2384,8 @@ pub async fn open_in_external_editor(
     editor_cmd: Option<String>,
 ) -> Result<String, String> {
     let editor = editor_cmd.unwrap_or_else(|| "code".to_string());
-    
-    let res = tokio::process::Command::new(&editor)
-        .arg(&path)
-        .spawn();
+
+    let res = tokio::process::Command::new(&editor).arg(&path).spawn();
 
     match res {
         Ok(_) => Ok(format!("Opened '{}' in {}", path, editor)),
@@ -2137,13 +2393,20 @@ pub async fn open_in_external_editor(
             #[cfg(target_os = "macos")]
             let fallback = tokio::process::Command::new("open").arg(&path).spawn();
             #[cfg(target_os = "windows")]
-            let fallback = tokio::process::Command::new("cmd").arg("/C").arg("start").arg(&path).spawn();
+            let fallback = tokio::process::Command::new("cmd")
+                .arg("/C")
+                .arg("start")
+                .arg(&path)
+                .spawn();
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             let fallback = tokio::process::Command::new("xdg-open").arg(&path).spawn();
 
             match fallback {
                 Ok(_) => Ok(format!("Opened '{}' with default editor", path)),
-                Err(fe) => Err(format!("Failed to open editor '{}': {}. Fallback error: {}", editor, e, fe)),
+                Err(fe) => Err(format!(
+                    "Failed to open editor '{}': {}. Fallback error: {}",
+                    editor, e, fe
+                )),
             }
         }
     }
@@ -2160,9 +2423,11 @@ pub async fn invalidate_directory_cache(
     if let Some(p) = path {
         state.disk_cache.invalidate_catalog(&session_id, &p).await;
     } else {
-        state.disk_cache.clear_session(&session_id).await.map_err(|e| e.to_string())?;
+        state
+            .disk_cache
+            .clear_session(&session_id)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
-
-

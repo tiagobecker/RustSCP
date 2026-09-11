@@ -101,9 +101,15 @@ fn main() {
             }
             Err(e) => {
                 if dist_index.exists() {
-                    println!("cargo:warning=Could not execute frontend build ({}). Using existing dist.", e);
+                    println!(
+                        "cargo:warning=Could not execute frontend build ({}). Using existing dist.",
+                        e
+                    );
                 } else {
-                    panic!("Could not execute frontend build and dist/index.html does not exist: {}", e);
+                    panic!(
+                        "Could not execute frontend build and dist/index.html does not exist: {}",
+                        e
+                    );
                 }
             }
         }

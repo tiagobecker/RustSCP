@@ -1,0 +1,11 @@
+{
+  "name": "rustscp-desktop",
+  "private": true,
+  "scripts": {
+    "tauri": "tauri",
+    "build": "pnpm --dir ui build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4"
+  }
+}

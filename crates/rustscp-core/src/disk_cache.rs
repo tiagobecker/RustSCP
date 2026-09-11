@@ -103,7 +103,15 @@ impl ManagedDiskCache {
     /// Get cached directory listing if still fresh
     pub async fn get_catalog(&self, session_id: &str, path: &str) -> Option<Vec<FileEntry>> {
         let clean_path = path.trim_end_matches('/');
-        let key = format!("{}:{}", session_id, if clean_path.is_empty() { "/" } else { clean_path });
+        let key = format!(
+            "{}:{}",
+            session_id,
+            if clean_path.is_empty() {
+                "/"
+            } else {
+                clean_path
+            }
+        );
         let lock = self.catalog.read().await;
         if let Some(entry) = lock.get(&key) {
             if entry.cached_at.elapsed() < self.catalog_ttl() {
@@ -116,7 +124,11 @@ impl ManagedDiskCache {
     /// Store fresh directory listing in catalog cache and index all child entities
     pub async fn put_catalog(&self, session_id: &str, path: &str, entries: Vec<FileEntry>) {
         let clean_dir = path.trim_end_matches('/');
-        let key = format!("{}:{}", session_id, if clean_dir.is_empty() { "/" } else { clean_dir });
+        let key = format!(
+            "{}:{}",
+            session_id,
+            if clean_dir.is_empty() { "/" } else { clean_dir }
+        );
         let now = std::time::Instant::now();
 
         {
@@ -135,7 +147,15 @@ impl ManagedDiskCache {
             let mut entry_lock = self.entry_cache.write().await;
             for entry in entries {
                 let clean_entry_path = entry.path.trim_end_matches('/');
-                let entry_key = format!("{}:{}", session_id, if clean_entry_path.is_empty() { "/" } else { clean_entry_path });
+                let entry_key = format!(
+                    "{}:{}",
+                    session_id,
+                    if clean_entry_path.is_empty() {
+                        "/"
+                    } else {
+                        clean_entry_path
+                    }
+                );
                 entry_lock.insert(
                     entry_key,
                     CachedEntryMetadata {
@@ -150,7 +170,15 @@ impl ManagedDiskCache {
     /// Retrieve individual cached file/folder metadata if available and fresh
     pub async fn get_entry_metadata(&self, session_id: &str, path: &str) -> Option<FileEntry> {
         let clean_path = path.trim_end_matches('/');
-        let key = format!("{}:{}", session_id, if clean_path.is_empty() { "/" } else { clean_path });
+        let key = format!(
+            "{}:{}",
+            session_id,
+            if clean_path.is_empty() {
+                "/"
+            } else {
+                clean_path
+            }
+        );
         let lock = self.entry_cache.read().await;
         if let Some(cached) = lock.get(&key) {
             if cached.cached_at.elapsed() < self.catalog_ttl() {
@@ -163,7 +191,15 @@ impl ManagedDiskCache {
     /// Store individual entry metadata in cache
     pub async fn put_entry_metadata(&self, session_id: &str, entry: FileEntry) {
         let clean_path = entry.path.trim_end_matches('/');
-        let key = format!("{}:{}", session_id, if clean_path.is_empty() { "/" } else { clean_path });
+        let key = format!(
+            "{}:{}",
+            session_id,
+            if clean_path.is_empty() {
+                "/"
+            } else {
+                clean_path
+            }
+        );
         let mut lock = self.entry_cache.write().await;
         lock.insert(
             key,
@@ -178,9 +214,24 @@ impl ManagedDiskCache {
     pub async fn invalidate_catalog(&self, session_id: &str, path: &str) {
         let prefix = format!("{}:", session_id);
         let clean_path = path.trim_end_matches('/');
-        let parent = clean_path.rfind('/').map(|i| &clean_path[..i]).unwrap_or("/");
-        let exact_key = format!("{}:{}", session_id, if clean_path.is_empty() { "/" } else { clean_path });
-        let parent_key = format!("{}:{}", session_id, if parent.is_empty() { "/" } else { parent });
+        let parent = clean_path
+            .rfind('/')
+            .map(|i| &clean_path[..i])
+            .unwrap_or("/");
+        let exact_key = format!(
+            "{}:{}",
+            session_id,
+            if clean_path.is_empty() {
+                "/"
+            } else {
+                clean_path
+            }
+        );
+        let parent_key = format!(
+            "{}:{}",
+            session_id,
+            if parent.is_empty() { "/" } else { parent }
+        );
 
         {
             let mut lock = self.catalog.write().await;
@@ -210,7 +261,11 @@ impl ManagedDiskCache {
     }
 
     /// Read file content from local disk cache if available
-    pub async fn get_file_content(&self, session_id: &str, remote_path: &str) -> Option<bytes::Bytes> {
+    pub async fn get_file_content(
+        &self,
+        session_id: &str,
+        remote_path: &str,
+    ) -> Option<bytes::Bytes> {
         let local_path = self.get_local_file_path(session_id, remote_path);
         if tokio::fs::try_exists(&local_path).await.unwrap_or(false) {
             if let Ok(data) = tokio::fs::read(&local_path).await {
@@ -223,7 +278,12 @@ impl ManagedDiskCache {
     }
 
     /// Store downloaded file content into local disk cache with LRU enforcement
-    pub async fn put_file_content(&self, session_id: &str, remote_path: &str, data: &[u8]) -> CoreResult<()> {
+    pub async fn put_file_content(
+        &self,
+        session_id: &str,
+        remote_path: &str,
+        data: &[u8],
+    ) -> CoreResult<()> {
         let local_path = self.get_local_file_path(session_id, remote_path);
         if let Some(parent) = local_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
@@ -263,7 +323,10 @@ impl ManagedDiskCache {
                     } else {
                         let size = meta.len();
                         total_size += size;
-                        let accessed = meta.accessed().or_else(|_| meta.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                        let accessed = meta
+                            .accessed()
+                            .or_else(|_| meta.modified())
+                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
                         files.push((path, size, accessed));
                     }
                 }
@@ -440,61 +503,83 @@ mod tests {
 
     #[tokio::test]
     async fn test_catalog_cache_put_get_invalidate() {
-        let temp_dir = std::env::temp_dir().join(format!("rustscp_test_cache_{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("rustscp_test_cache_{}", uuid::Uuid::new_v4()));
         let cache = ManagedDiskCache::new(Some(temp_dir.clone()), 1024 * 1024);
 
-        let entries = vec![
-            FileEntry {
-                name: "index.html".to_string(),
-                path: "/home/user/public_html/index.html".to_string(),
-                file_type: FileType::File,
-                size: 1200,
-                modified_at: None,
-                created_at: None,
-                permissions: Default::default(),
-                is_hidden: false,
-            },
-        ];
+        let entries = vec![FileEntry {
+            name: "index.html".to_string(),
+            path: "/home/user/public_html/index.html".to_string(),
+            file_type: FileType::File,
+            size: 1200,
+            modified_at: None,
+            created_at: None,
+            permissions: Default::default(),
+            is_hidden: false,
+        }];
 
-        cache.put_catalog("sess1", "/home/user/public_html", entries.clone()).await;
+        cache
+            .put_catalog("sess1", "/home/user/public_html", entries.clone())
+            .await;
 
         let retrieved = cache.get_catalog("sess1", "/home/user/public_html").await;
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().len(), 1);
 
-        let entry_meta = cache.get_entry_metadata("sess1", "/home/user/public_html/index.html").await;
+        let entry_meta = cache
+            .get_entry_metadata("sess1", "/home/user/public_html/index.html")
+            .await;
         assert!(entry_meta.is_some());
         assert_eq!(entry_meta.unwrap().name, "index.html");
 
-        cache.invalidate_catalog("sess1", "/home/user/public_html").await;
-        assert!(cache.get_catalog("sess1", "/home/user/public_html").await.is_none());
-        assert!(cache.get_entry_metadata("sess1", "/home/user/public_html/index.html").await.is_none());
+        cache
+            .invalidate_catalog("sess1", "/home/user/public_html")
+            .await;
+        assert!(cache
+            .get_catalog("sess1", "/home/user/public_html")
+            .await
+            .is_none());
+        assert!(cache
+            .get_entry_metadata("sess1", "/home/user/public_html/index.html")
+            .await
+            .is_none());
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
     #[tokio::test]
     async fn test_content_cache_put_get_and_lru() {
-        let temp_dir = std::env::temp_dir().join(format!("rustscp_test_cache_{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("rustscp_test_cache_{}", uuid::Uuid::new_v4()));
         // Set small quota of 50 bytes
         let cache = ManagedDiskCache::new(Some(temp_dir.clone()), 50);
 
         let file1_content = b"123456789012345678901234567890"; // 30 bytes
         let file2_content = b"abcdefghijklmnopqrstuvwxyz1234"; // 30 bytes
 
-        cache.put_file_content("sess1", "/file1.txt", file1_content).await.unwrap();
+        cache
+            .put_file_content("sess1", "/file1.txt", file1_content)
+            .await
+            .unwrap();
         let read1 = cache.get_file_content("sess1", "/file1.txt").await;
         assert_eq!(read1.as_deref(), Some(&file1_content[..]));
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Writing file2 will exceed 50 bytes (30 + 30 = 60), triggering LRU eviction of file1
-        cache.put_file_content("sess1", "/file2.txt", file2_content).await.unwrap();
+        cache
+            .put_file_content("sess1", "/file2.txt", file2_content)
+            .await
+            .unwrap();
 
         let mut names = HashMap::new();
         names.insert("sess1".to_string(), "Site 1".to_string());
         let stats = cache.get_stats(&names).await;
-        assert!(stats.total_bytes <= 50, "Total bytes {} must be <= 50", stats.total_bytes);
+        assert!(
+            stats.total_bytes <= 50,
+            "Total bytes {} must be <= 50",
+            stats.total_bytes
+        );
 
         // Clear session
         cache.clear_session("sess1").await.unwrap();
@@ -506,48 +591,57 @@ mod tests {
 
     #[tokio::test]
     async fn test_catalog_cache_ttl_and_parent_invalidation() {
-        let temp_dir = std::env::temp_dir().join(format!("rustscp_test_cache_{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("rustscp_test_cache_{}", uuid::Uuid::new_v4()));
         let cache = ManagedDiskCache::new(Some(temp_dir.clone()), 1024 * 1024);
 
         // Check default TTL is 300s
         assert_eq!(cache.catalog_ttl().as_secs(), 300);
 
         // Put catalog for /var/www and /var/www/site
-        let entries_parent = vec![
-            FileEntry {
-                name: "site".to_string(),
-                path: "/var/www/site".to_string(),
-                file_type: FileType::Directory,
-                size: 4096,
-                modified_at: None,
-                created_at: None,
-                permissions: Default::default(),
-                is_hidden: false,
-            },
-        ];
-        cache.put_catalog("remote1", "/var/www", entries_parent).await;
+        let entries_parent = vec![FileEntry {
+            name: "site".to_string(),
+            path: "/var/www/site".to_string(),
+            file_type: FileType::Directory,
+            size: 4096,
+            modified_at: None,
+            created_at: None,
+            permissions: Default::default(),
+            is_hidden: false,
+        }];
+        cache
+            .put_catalog("remote1", "/var/www", entries_parent)
+            .await;
 
-        let entries_child = vec![
-            FileEntry {
-                name: "index.php".to_string(),
-                path: "/var/www/site/index.php".to_string(),
-                file_type: FileType::File,
-                size: 2048,
-                modified_at: None,
-                created_at: None,
-                permissions: Default::default(),
-                is_hidden: false,
-            },
-        ];
-        cache.put_catalog("remote1", "/var/www/site", entries_child).await;
+        let entries_child = vec![FileEntry {
+            name: "index.php".to_string(),
+            path: "/var/www/site/index.php".to_string(),
+            file_type: FileType::File,
+            size: 2048,
+            modified_at: None,
+            created_at: None,
+            permissions: Default::default(),
+            is_hidden: false,
+        }];
+        cache
+            .put_catalog("remote1", "/var/www/site", entries_child)
+            .await;
 
         // Both should be cached
         assert!(cache.get_catalog("remote1", "/var/www").await.is_some());
-        assert!(cache.get_catalog("remote1", "/var/www/site").await.is_some());
+        assert!(cache
+            .get_catalog("remote1", "/var/www/site")
+            .await
+            .is_some());
 
         // Invalidating a child file /var/www/site/index.php should invalidate /var/www/site
-        cache.invalidate_catalog("remote1", "/var/www/site/index.php").await;
-        assert!(cache.get_catalog("remote1", "/var/www/site").await.is_none());
+        cache
+            .invalidate_catalog("remote1", "/var/www/site/index.php")
+            .await;
+        assert!(cache
+            .get_catalog("remote1", "/var/www/site")
+            .await
+            .is_none());
         // Parent /var/www still intact
         assert!(cache.get_catalog("remote1", "/var/www").await.is_some());
 

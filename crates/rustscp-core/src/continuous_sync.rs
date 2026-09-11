@@ -1,7 +1,7 @@
 use crate::types::{CoreError, CoreResult};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::{PathBuf};
-use tokio::sync::{mpsc};
+use std::path::PathBuf;
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
 pub struct WatchEvent {
@@ -37,7 +37,10 @@ impl ContinuousSyncWatcher {
                             if let Ok(rel) = p.strip_prefix(&root) {
                                 let rel_str = rel.to_string_lossy().to_string();
                                 // Ignore common temp / git folders
-                                if rel_str.contains(".git") || rel_str.contains("node_modules") || rel_str.ends_with(".tmp") {
+                                if rel_str.contains(".git")
+                                    || rel_str.contains("node_modules")
+                                    || rel_str.ends_with(".tmp")
+                                {
                                     continue;
                                 }
                                 let is_dir = p.is_dir();
@@ -97,12 +100,13 @@ impl ContinuousSyncManager {
         if let Some(tx) = self.cancel_tx.take() {
             let _ = tx.send(());
         }
-        self.is_running.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.is_running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn set_active(&mut self, cancel_tx: tokio::sync::broadcast::Sender<()>) {
         self.cancel_tx = Some(cancel_tx);
-        self.is_running.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.is_running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
-

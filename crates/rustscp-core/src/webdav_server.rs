@@ -158,7 +158,9 @@ impl WebDavServer {
             self.start().await?;
         }
 
-        let clean_name = self.session_name.replace(|c: char| !c.is_alphanumeric() && c != '_' && c != '-', "_");
+        let clean_name = self
+            .session_name
+            .replace(|c: char| !c.is_alphanumeric() && c != '_' && c != '-', "_");
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap_or_else(|_| ".".to_string());
@@ -184,7 +186,9 @@ impl WebDavServer {
                 .args(["-v", &self.session_name, &mount_url, &mnt_str])
                 .output()
                 .await
-                .map_err(|e| CoreError::General(format!("Failed to execute mount_webdav: {}", e)))?;
+                .map_err(|e| {
+                    CoreError::General(format!("Failed to execute mount_webdav: {}", e))
+                })?;
 
             if !out.status.success() {
                 let stderr = String::from_utf8_lossy(&out.stderr);
@@ -271,7 +275,11 @@ impl WebDavServer {
                 .output()
                 .await;
 
-            let path = format!("/run/user/{}/gvfs/dav:host=127.0.0.1,port={}", whoami_uid(), self.port);
+            let path = format!(
+                "/run/user/{}/gvfs/dav:host=127.0.0.1,port={}",
+                whoami_uid(),
+                self.port
+            );
             self.mount_point = Some(path.clone());
 
             // Desktop shortcut on Linux
@@ -409,7 +417,11 @@ async fn handle_persistent_connection(
 
         let method = req_parts[0].to_uppercase();
         let raw_path = req_parts[1].to_string();
-        let http_version = if req_parts.len() >= 3 { req_parts[2].to_string() } else { "HTTP/1.1".to_string() };
+        let http_version = if req_parts.len() >= 3 {
+            req_parts[2].to_string()
+        } else {
+            "HTTP/1.1".to_string()
+        };
 
         let mut headers = HashMap::new();
         for line in lines {
@@ -622,7 +634,9 @@ async fn handle_single_request(
                 Some(cached) => cached,
                 None => match vfs.read_file(remote_path).await {
                     Ok(downloaded) => {
-                        let _ = cache.put_file_content(session_id, remote_path, &downloaded).await;
+                        let _ = cache
+                            .put_file_content(session_id, remote_path, &downloaded)
+                            .await;
                         read_bytes.fetch_add(downloaded.len() as u64, Ordering::Relaxed);
                         downloaded
                     }
@@ -998,7 +1012,9 @@ async fn build_propfind_multistatus(
     vfs: &Arc<dyn VirtualFileSystem>,
     cache: &Arc<ManagedDiskCache>,
 ) -> String {
-    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\">\n");
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\">\n",
+    );
 
     let root_href = to_webdav_href(remote_path, mount_root, root_meta.is_dir());
     xml.push_str(&entry_to_webdav_xml(&root_meta, &root_href));
@@ -1122,9 +1138,18 @@ mod tests {
     #[test]
     fn test_resolve_remote_path() {
         let mount_root = "/home/aquelelink.com.br";
-        assert_eq!(resolve_remote_path("/", mount_root), "/home/aquelelink.com.br");
-        assert_eq!(resolve_remote_path("/public_html", mount_root), "/home/aquelelink.com.br/public_html");
-        assert_eq!(resolve_remote_path("/public_html/index.php", mount_root), "/home/aquelelink.com.br/public_html/index.php");
+        assert_eq!(
+            resolve_remote_path("/", mount_root),
+            "/home/aquelelink.com.br"
+        );
+        assert_eq!(
+            resolve_remote_path("/public_html", mount_root),
+            "/home/aquelelink.com.br/public_html"
+        );
+        assert_eq!(
+            resolve_remote_path("/public_html/index.php", mount_root),
+            "/home/aquelelink.com.br/public_html/index.php"
+        );
 
         // Root mount
         assert_eq!(resolve_remote_path("/", "/"), "/");
@@ -1135,18 +1160,40 @@ mod tests {
     fn test_to_webdav_href() {
         let mount_root = "/home/aquelelink.com.br";
         // Root directory
-        assert_eq!(to_webdav_href("/home/aquelelink.com.br", mount_root, true), "/");
+        assert_eq!(
+            to_webdav_href("/home/aquelelink.com.br", mount_root, true),
+            "/"
+        );
         // Subdirectory
-        assert_eq!(to_webdav_href("/home/aquelelink.com.br/public_html", mount_root, true), "/public_html/");
+        assert_eq!(
+            to_webdav_href("/home/aquelelink.com.br/public_html", mount_root, true),
+            "/public_html/"
+        );
         // File
-        assert_eq!(to_webdav_href("/home/aquelelink.com.br/index.php", mount_root, false), "/index.php");
-        assert_eq!(to_webdav_href("/home/aquelelink.com.br/public_html/style.css", mount_root, false), "/public_html/style.css");
+        assert_eq!(
+            to_webdav_href("/home/aquelelink.com.br/index.php", mount_root, false),
+            "/index.php"
+        );
+        assert_eq!(
+            to_webdav_href(
+                "/home/aquelelink.com.br/public_html/style.css",
+                mount_root,
+                false
+            ),
+            "/public_html/style.css"
+        );
     }
 
     #[test]
     fn test_decode_url_path() {
-        assert_eq!(decode_url_path("/public%20html/test%231"), "/public html/test#1");
-        assert_eq!(decode_url_path("http://127.0.0.1:8080/my%20folder"), "/my folder");
+        assert_eq!(
+            decode_url_path("/public%20html/test%231"),
+            "/public html/test#1"
+        );
+        assert_eq!(
+            decode_url_path("http://127.0.0.1:8080/my%20folder"),
+            "/my folder"
+        );
         assert_eq!(decode_url_path("/folder?depth=1"), "/folder");
     }
 
@@ -1172,10 +1219,14 @@ mod tests {
     async fn test_webdav_server_live_requests() {
         use crate::local::LocalFsDriver;
 
-        let temp_dir = std::env::temp_dir().join(format!("rustscp_vfs_test_{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("rustscp_vfs_test_{}", uuid::Uuid::new_v4()));
         let _ = tokio::fs::create_dir_all(&temp_dir).await;
         let vfs = Arc::new(LocalFsDriver::new());
-        let cache = Arc::new(ManagedDiskCache::new(Some(temp_dir.join("cache")), 10 * 1024 * 1024));
+        let cache = Arc::new(ManagedDiskCache::new(
+            Some(temp_dir.join("cache")),
+            10 * 1024 * 1024,
+        ));
 
         let mut server = WebDavServer::new(
             "test_sess".to_string(),
@@ -1188,10 +1239,15 @@ mod tests {
         let port = server.start().await.unwrap();
         assert!(port > 0);
 
-        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
 
         // 1. Send OPTIONS
-        stream.write_all(b"OPTIONS / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await.unwrap();
+        stream
+            .write_all(b"OPTIONS / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
         let mut buf = [0u8; 1024];
         let n = stream.read(&mut buf).await.unwrap();
         let resp = String::from_utf8_lossy(&buf[..n]);
@@ -1200,16 +1256,32 @@ mod tests {
         assert!(resp.contains("keep-alive"));
 
         // 2. Send PROPFIND for .DS_Store (must return 404 immediately over same persistent stream)
-        stream.write_all(b"PROPFIND /.DS_Store HTTP/1.1\r\nHost: 127.0.0.1\r\nDepth: 0\r\n\r\n").await.unwrap();
+        stream
+            .write_all(b"PROPFIND /.DS_Store HTTP/1.1\r\nHost: 127.0.0.1\r\nDepth: 0\r\n\r\n")
+            .await
+            .unwrap();
         let n = stream.read(&mut buf).await.unwrap();
         let resp2 = String::from_utf8_lossy(&buf[..n]);
-        assert!(resp2.contains("404 Not Found"), "Response should be 404 for .DS_Store, got: {}", resp2);
+        assert!(
+            resp2.contains("404 Not Found"),
+            "Response should be 404 for .DS_Store, got: {}",
+            resp2
+        );
 
         // 3. Send PROPFIND for root / (must return 207 Multi-Status)
-        stream.write_all(b"PROPFIND / HTTP/1.1\r\nHost: 127.0.0.1\r\nDepth: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        stream
+            .write_all(
+                b"PROPFIND / HTTP/1.1\r\nHost: 127.0.0.1\r\nDepth: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
         let n = stream.read(&mut buf).await.unwrap();
         let resp3 = String::from_utf8_lossy(&buf[..n]);
-        assert!(resp3.contains("207 Multi-Status"), "Response should be 207 for root, got: {}", resp3);
+        assert!(
+            resp3.contains("207 Multi-Status"),
+            "Response should be 207 for root, got: {}",
+            resp3
+        );
         assert!(resp3.contains("<D:multistatus"));
 
         server.unmount_and_stop().await.unwrap();

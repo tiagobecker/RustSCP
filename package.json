@@ -16,6 +16,7 @@
     "desktop:dev": "pnpm run build && cargo run -p rustscp-desktop",
     "desktop:build": "pnpm run build && cargo build --release -p rustscp-desktop",
     "release": "pnpm run build && cargo build --release -p rustscp-desktop",
-    "bundle": "pnpm run build && (cd apps/rustscp-desktop && npx --prefix ui tauri build)"
+    "bundle": "pnpm --dir apps/rustscp-desktop tauri build",
+    "tauri": "pnpm --dir apps/rustscp-desktop tauri"
   }
 }

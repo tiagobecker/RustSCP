@@ -9,6 +9,10 @@
   },
   "bundle": {
     "active": true,
+    "targets": "all",
+    "shortDescription": "Next-Gen Remote Workspace, SFTP/SCP/S3 Client & AI Gateway",
+    "longDescription": "RustSCP is a modern remote workspace, SFTP, SCP, and S3 file manager with integrated AI Gateway (MCP) built with Rust and Tauri v2.",
+    "category": "DeveloperTool",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

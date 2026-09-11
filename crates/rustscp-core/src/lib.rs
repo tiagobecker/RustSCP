@@ -27,10 +27,9 @@ pub use sync::{SyncActionType, SyncDirection, SyncEngine, SyncItem, SyncOptions}
 pub use transfer_queue::{QueueTransferTask, TransferQueueManager};
 pub use types::*;
 pub use vault::{
-    decrypt_bytes, decrypt_sites, encrypt_bytes, encrypt_sites, get_local_vault_path, get_rustscp_config_dir,
-    load_local_vault, parse_vault_from_json, save_local_vault, serialize_vault_to_json, VaultEnvelope,
-    VaultError, VaultSecurityInfo,
+    decrypt_bytes, decrypt_sites, encrypt_bytes, encrypt_sites, get_local_vault_path,
+    get_rustscp_config_dir, load_local_vault, parse_vault_from_json, save_local_vault,
+    serialize_vault_to_json, VaultEnvelope, VaultError, VaultSecurityInfo,
 };
 pub use vfs::VirtualFileSystem;
 pub use webdav_server::{VirtualDiskInfo, WebDavServer};
-
