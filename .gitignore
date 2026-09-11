@@ -1,0 +1,44 @@
+# Rust build artifacts
+target/
+**/target/
+*.rs.bk
+*.pdb
+
+# Node & Web build dependencies
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+
+# Tauri build artifacts
+src-tauri/target/
+**/src-tauri/target/
+
+# OS generated files
+.DS_Store
+**/.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+Thumbs.db
+ehthumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment and local configs
+.env
+.env*.local
+*.local
+
+# IDE & Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.fleet/

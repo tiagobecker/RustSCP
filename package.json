@@ -1,0 +1,21 @@
+{
+  "name": "rustscp",
+  "version": "0.1.0",
+  "description": "Next-Gen Remote Workspace, SFTP/SCP/S3 Client & AI Gateway (MCP) built with Rust and Tauri v2",
+  "author": "Tiago Becker <tiagobecker@users.noreply.github.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tiagobecker/RustSCP.git"
+  },
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --dir apps/rustscp-desktop/ui dev",
+    "build": "pnpm --dir apps/rustscp-desktop/ui build",
+    "desktop:dev": "pnpm run build && cargo run -p rustscp-desktop",
+    "desktop:build": "pnpm run build && cargo build --release -p rustscp-desktop",
+    "release": "pnpm run build && cargo build --release -p rustscp-desktop",
+    "bundle": "pnpm run build && (cd apps/rustscp-desktop && npx --prefix ui tauri build)"
+  }
+}

@@ -1,0 +1,77 @@
+name: 🐛 Bug Report
+description: Report an issue or unexpected behavior in RustSCP
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this bug! Please ensure you are testing against the latest release.
+  - type: input
+    id: version
+    attributes:
+      label: RustSCP Version
+      description: What version of RustSCP are you running? (e.g. v0.1.0)
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      description: Which operating system are you using?
+      options:
+        - macOS (Apple Silicon - M1/M2/M3/M4)
+        - macOS (Intel x86_64)
+        - Windows 11
+        - Windows 10
+        - Linux (Ubuntu/Debian)
+        - Linux (Arch/Fedora)
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: protocol
+    attributes:
+      label: Protocol Involved
+      options:
+        - SFTP (SSH)
+        - SCP
+        - S3 (AWS / MinIO / R2)
+        - FTP / FTPS
+        - Local Filesystem
+        - MCP AI Gateway
+        - UI / Editor
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the Bug
+      description: A clear and concise description of what happened.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Step-by-step instructions to reproduce the issue.
+      placeholder: |
+        1. Connect to SFTP server '...'
+        2. Navigate to folder '...'
+        3. Right-click and choose '...'
+        4. Observe error
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or Console Output
+      description: Please paste any relevant logs or error dialogs (DO NOT INCLUDE PASSWORDS OR PRIVATE KEYS).
+      render: shell

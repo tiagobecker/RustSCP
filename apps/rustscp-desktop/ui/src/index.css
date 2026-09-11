@@ -1,0 +1,203 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* ==========================================================================
+     LIGHT MODE
+     Ultra-clean, high-contrast titanium & pearl surfaces with corten rust accents
+     WCAG AA calibrated text contrast
+     ========================================================================== */
+  --color-dark-950: 241 245 249; /* #f1f5f9 - lowest background base */
+  --color-dark-900: 248 250 252; /* #f8fafc - main window canvas */
+  --color-dark-850: 241 245 249; /* #f1f5f9 - subtle panel fill */
+  --color-dark-800: 255 255 255; /* #ffffff - headers, panels, modal dialogs */
+  --color-dark-750: 248 250 252; /* #f8fafc - modal titlebars / toolbars */
+  --color-dark-700: 241 245 249; /* #f1f5f9 - card backgrounds, dropdown items */
+  --color-dark-650: 226 232 240; /* #e2e8f0 - hovered dropdown items / button hover */
+  --color-dark-600: 203 213 225; /* #cbd5e1 - crisp structural borders */
+
+
+  /* Rust Corten Accent (Calibrated deep corten orange for light mode) */
+  --color-rust-400: 217 83 30;   /* #d9531e */
+  --color-rust-500: 194 65 12;   /* #c2410c - official corten */
+  --color-rust-600: 154 52 18;   /* #9a3412 - pressed/active */
+
+  /* AI Gateway MCP Luminescent Core */
+  --color-mcp-cyan: 2 132 199;   /* #0284c7 */
+  --color-mcp-amber: 217 119 6;  /* #d97706 */
+
+  /* Syntax Highlighting Tokens (Light) */
+  --token-keyword: #c2410c;
+  --token-function: #0369a1;
+  --token-string: #15803d;
+  --token-comment: #64748b;
+  --token-number: #b45309;
+  --token-variable: #6b21a8;
+  --token-operator: #0f172a;
+  --token-punctuation: #475569;
+
+  --scrollbar-track: #f1f5f9;
+  --scrollbar-thumb: #cbd5e1;
+  --scrollbar-hover: #c2410c;
+}
+
+.dark {
+  /* ==========================================================================
+     DARK MODE
+     Forged iron, dark titanium surfaces, vibrant glowing brand corten orange
+     ========================================================================== */
+  --color-dark-950: 8 11 16;     /* #080b10 - deepest base */
+  --color-dark-900: 12 16 23;    /* #0c1017 - app window canvas */
+  --color-dark-850: 15 20 28;    /* #0f141c - sub-panel background */
+  --color-dark-800: 19 25 35;    /* #131923 - headers, toolbars, dialogs */
+  --color-dark-750: 23 30 42;    /* #171e2a - titlebars */
+  --color-dark-700: 29 38 52;    /* #1d2634 - cards, elevated items */
+  --color-dark-650: 35 46 63;    /* #232e3f - hover states */
+  --color-dark-600: 42 55 75;    /* #2a374b - crisp borders and dividers */
+
+
+  /* Rust Corten Accent (Vibrant electric forged rust-orange) */
+  --color-rust-400: 249 115 22;  /* #f97316 */
+  --color-rust-500: 217 83 30;   /* #d9531e - official logo corten orange */
+  --color-rust-600: 184 62 16;   /* #b83e10 */
+
+  /* AI Gateway MCP Luminescent Core */
+  --color-mcp-cyan: 0 229 255;   /* #00e5ff - laser glowing cyan */
+  --color-mcp-amber: 245 158 11; /* #f59e0b - neon amber */
+
+  /* Syntax Highlighting Tokens (Dark) */
+  --token-keyword: #f97316;
+  --token-function: #38bdf8;
+  --token-string: #4ade80;
+  --token-comment: #94a3b8;
+  --token-number: #fbbf24;
+  --token-variable: #c084fc;
+  --token-operator: #f8fafc;
+  --token-punctuation: #cbd5e1;
+
+  --scrollbar-track: #0c1017;
+  --scrollbar-thumb: #232e3f;
+  --scrollbar-hover: #d9531e;
+}
+
+/* Custom modern scrollbars with subtle brand hover */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 3px;
+  transition: background 0.15s ease;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-hover);
+}
+
+/* Shimmer animation for shadow/skeleton loading */
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.animate-shimmer {
+  background: linear-gradient(
+    90deg,
+    rgba(var(--color-dark-700), 0.4) 25%,
+    rgba(var(--color-dark-650), 0.8) 50%,
+    rgba(var(--color-dark-700), 0.4) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite linear;
+}
+
+/* Prism syntax token highlighting rules */
+.token.comment, .token.prolog, .token.doctype, .token.cdata {
+  color: var(--token-comment);
+  font-style: italic;
+}
+.token.punctuation {
+  color: var(--token-punctuation);
+}
+.token.property, .token.tag, .token.boolean, .token.number, .token.constant, .token.symbol {
+  color: var(--token-number);
+}
+.token.selector, .token.attr-name, .token.string, .token.char, .token.builtin {
+  color: var(--token-string);
+}
+.token.operator, .token.entity, .token.url {
+  color: var(--token-operator);
+}
+.token.atrule, .token.attr-value, .token.keyword {
+  color: var(--token-keyword);
+  font-weight: 600;
+}
+.token.function, .token.class-name {
+  color: var(--token-function);
+}
+.token.regex, .token.important, .token.variable {
+  color: var(--token-variable);
+}
+
+/* Natural Transfer Wave Animations (GPU Accelerated 60fps) */
+@keyframes naturalWave1 {
+  0% {
+    transform: translate3d(0, 0, 0);
+  }
+  100% {
+    transform: translate3d(-50%, 0, 0);
+  }
+}
+
+@keyframes naturalWave2 {
+  0% {
+    transform: translate3d(-50%, 0, 0);
+  }
+  100% {
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes wavePulseGlow {
+  0%, 100% {
+    opacity: 0.4;
+  }
+  50% {
+    opacity: 0.85;
+  }
+}
+
+.animate-natural-wave-1 {
+  animation: naturalWave1 7s linear infinite;
+  will-change: transform;
+}
+
+.animate-natural-wave-2 {
+  animation: naturalWave2 11s linear infinite;
+  will-change: transform;
+}
+
+.animate-wave-glow {
+  animation: wavePulseGlow 2.5s ease-in-out infinite;
+}
+
+/* Global High-Contrast System Base */
+body {
+  color: #0f172a; /* text-slate-900 in Light Mode */
+}
+
+.dark body {
+  color: #f1f5f9; /* text-slate-100 in Dark Mode */
+}
+

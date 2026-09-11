@@ -1,0 +1,33 @@
+[package]
+name = "rustscp-desktop"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+rustscp-core = { path = "../../../crates/rustscp-core" }
+rustscp-actions = { path = "../../../crates/rustscp-actions" }
+rustscp-mcp = { path = "../../../crates/rustscp-mcp" }
+rustscp-cache = { path = "../../../crates/rustscp-cache" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+tauri = { version = "2.1", features = [] }
+md5 = "0.8.1"
+hex = "0.4.3"
+uuid.workspace = true
+sha2.workspace = true
+chrono.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSImage"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSData"] }
+
+[build-dependencies]
+tauri-build = { version = "2.1", features = [] }

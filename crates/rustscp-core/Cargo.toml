@@ -1,0 +1,31 @@
+[package]
+name = "rustscp-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+ssh2 = "0.9.6"
+reqwest = { version = "0.13.4", features = ["json", "stream"] }
+hmac = "0.12.1"
+sha2.workspace = true
+hex = "0.4.3"
+notify = "8.2.0"
+regex.workspace = true
+libc = "0.2"
+aes-gcm = "0.10"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = { workspace = true }
