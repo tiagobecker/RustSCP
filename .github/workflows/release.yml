@@ -44,7 +44,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin' || '' }}
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
@@ -73,6 +73,6 @@ jobs:
           tagName: ${{ github.event.inputs.version || github.ref_name }}
           releaseName: 'RustSCP ${{ github.event.inputs.version || github.ref_name }}'
           releaseBody: 'RustSCP ${{ github.event.inputs.version || github.ref_name }} - Next-Gen Remote Workspace, SFTP/SCP/S3 Client & AI Gateway.'
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
