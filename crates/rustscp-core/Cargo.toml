@@ -15,7 +15,7 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
-ssh2 = "0.9.6"
+ssh2 = { version = "0.9.6", features = ["vendored-openssl"] }
 reqwest = { version = "0.13.4", features = ["json", "stream"] }
 hmac = "0.12.1"
 sha2.workspace = true
