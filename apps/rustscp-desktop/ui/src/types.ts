@@ -34,6 +34,15 @@ export interface ConnectionConfig {
   username: string;
   auth: AuthMethod;
   remote_root: string;
+  group?: string;
+}
+
+export interface WinScpImportResult {
+  total_sessions: number;
+  decrypted_passwords: number;
+  key_auth_sessions: number;
+  folders: string[];
+  sites: ConnectionConfig[];
 }
 
 export type SyncDirection = 'local_to_remote' | 'remote_to_local' | 'both';

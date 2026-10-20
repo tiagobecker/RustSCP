@@ -74,7 +74,7 @@ export interface DualPaneProps {
   onFocusPane: (pane: 'left' | 'right') => void;
 
   // Actions & Modals
-  onEditFile?: (file: FileEntry) => void;
+  onEditFile?: (file: FileEntry, sessionId?: string) => void;
   onShowProperties?: (file: FileEntry) => void;
   onCalculateChecksum?: (file: FileEntry) => void;
   onCalculateSize?: (file: FileEntry) => void;
@@ -85,7 +85,7 @@ export interface DualPaneProps {
   // Transfers
   onTransferLeftToRight: () => void;
   onTransferRightToLeft: () => void;
-  onDropItems?: (sourceSessionId: string, paths: string[], destSessionId: string, destDir: string, isCopy: boolean) => void;
+  onDropItems?: (sourceSessionId: string, paths: string[], destSessionId: string, destDir: string, isCopy?: boolean) => void;
 
   // Clipboard & Context Menu Props
   clipboard?: ClipboardState | null;
@@ -103,6 +103,8 @@ export interface DualPaneProps {
   onMoveToTrash?: (sessionId: string, paths: string[]) => void;
   remoteTrashEnabled?: boolean;
   onExecuteSmartAction?: (action: ActionDefinition, targetPath: string) => void;
+  onRenameItem?: (sessionId: string, oldPath: string, newName: string) => Promise<void>;
+  externalDragPane?: 'left' | 'right' | null;
 }
 
 export const DualPane: React.FC<DualPaneProps> = (props) => {
@@ -228,6 +230,8 @@ export const DualPane: React.FC<DualPaneProps> = (props) => {
       onFocusPanel={() => props.onFocusPane('left')}
       isFocused={!fullWidth && props.focusedPane === 'left'}
       onDropTab={(sessId, srcPane) => props.onMoveTabBetweenPanes?.(sessId, srcPane, 'left')}
+      onRenameItem={props.onRenameItem}
+      isExternalDragOver={props.externalDragPane === 'left'}
     />
   );
 
@@ -285,6 +289,8 @@ export const DualPane: React.FC<DualPaneProps> = (props) => {
       onFocusPanel={() => props.onFocusPane('right')}
       isFocused={!fullWidth && props.focusedPane === 'right'}
       onDropTab={(sessId, srcPane) => props.onMoveTabBetweenPanes?.(sessId, srcPane, 'right')}
+      onRenameItem={props.onRenameItem}
+      isExternalDragOver={props.externalDragPane === 'right'}
     />
   );
 
@@ -297,6 +303,7 @@ export const DualPane: React.FC<DualPaneProps> = (props) => {
       >
         {/* Left Pane Column with its own dedicated Tab Bar directly above */}
         <div 
+          data-pane-id="left"
           style={{ width: `${splitRatio}%`, minWidth: '220px' }}
           className="flex flex-col min-w-0 transition-[width] duration-75"
         >
@@ -372,6 +379,7 @@ export const DualPane: React.FC<DualPaneProps> = (props) => {
 
         {/* Right Pane Column with its own dedicated Tab Bar directly above */}
         <div 
+          data-pane-id="right"
           style={{ width: `${100 - splitRatio}%`, minWidth: '220px' }}
           className="flex flex-col min-w-0 transition-[width] duration-75"
         >
@@ -512,7 +520,10 @@ export const DualPane: React.FC<DualPaneProps> = (props) => {
       </aside>
 
       {/* Main Single-Pane Workspace */}
-      <div className="flex-1 flex overflow-hidden">
+      <div 
+        data-pane-id={explorerSessionId === props.leftActiveSessionId ? 'left' : 'right'}
+        className="flex-1 flex overflow-hidden"
+      >
         {explorerSessionId === props.leftActiveSessionId ? renderLeftPanel(true) : renderRightPanel(true)}
       </div>
     </div>

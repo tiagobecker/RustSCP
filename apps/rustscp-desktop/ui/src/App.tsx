@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Header } from './components/Header.tsx';
 import { DualPane } from './components/DualPane.tsx';
@@ -26,6 +26,7 @@ import { SettingsModal } from './components/SettingsModal.tsx';
 import { AboutModal } from './components/AboutModal.tsx';
 import { ConfirmDialogModal } from './components/ConfirmDialogModal.tsx';
 import { InputDialogModal } from './components/InputDialogModal.tsx';
+import { DropActionModal } from './components/DropActionModal.tsx';
 import { 
   ActionDefinition, 
   AuditEvent, 
@@ -42,6 +43,7 @@ import {
 import { ThemeMode, getStoredTheme, saveTheme, applyTheme, initThemeWatcher } from './theme.ts';
 import { directoryCache } from './utils/directoryCache.ts';
 import { invoke, isTauri } from '@tauri-apps/api/core';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
 
 // Safe Tauri invocation helper (with web mode fallback)
 async function invokeTauri<T>(cmd: string, args?: Record<string, any>): Promise<T> {
@@ -241,6 +243,18 @@ export const App: React.FC = () => {
   const [syncBrowsing, setSyncBrowsing] = useState<boolean>(false);
   const [continuousSync, setContinuousSync] = useState<boolean>(false);
   const [diffMap, setDiffMap] = useState<Record<string, string>>({});
+  const [externalDragPane, setExternalDragPane] = useState<'left' | 'right' | null>(null);
+
+  const leftActiveSessionIdRef = useRef(leftActiveSessionId);
+  leftActiveSessionIdRef.current = leftActiveSessionId;
+  const rightActiveSessionIdRef = useRef(rightActiveSessionId);
+  rightActiveSessionIdRef.current = rightActiveSessionId;
+  const leftPathRef = useRef(leftPath);
+  leftPathRef.current = leftPath;
+  const rightPathRef = useRef(rightPath);
+  rightPathRef.current = rightPath;
+  const isDualPaneRef = useRef(isDualPane);
+  isDualPaneRef.current = isDualPane;
 
   // Modals State
   const [isSiteManagerOpen, setIsSiteManagerOpen] = useState<boolean>(false);
@@ -348,6 +362,16 @@ export const App: React.FC = () => {
     onConfirm: (val: string) => void | Promise<void>;
   } | null>(null);
 
+  const [dropActionModal, setDropActionModal] = useState<{
+    isOpen: boolean;
+    sourceSessionId: string;
+    sourceSessionName?: string;
+    sourcePaths: string[];
+    destSessionId: string;
+    destSessionName?: string;
+    destDir: string;
+  } | null>(null);
+
   // Compression Modal State
   const [compressionModalState, setCompressionModalState] = useState<{
     isOpen: boolean;
@@ -426,6 +450,133 @@ export const App: React.FC = () => {
       .catch(() => loadLocalFiles('/Users'));
   }, []);
 
+  // Native Host OS Drag & Drop Listener (macOS Finder, Windows Explorer, Linux File Managers)
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten: (() => void) | undefined;
+    let isMounted = true;
+    let springTimer: any = null;
+    let currentHoverTab: string | null = null;
+
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        if (!isMounted) return;
+        const payload = event.payload;
+        if (payload.type === 'over' || payload.type === 'enter') {
+          let logicalX = payload.position.x;
+          let logicalY = payload.position.y;
+          // In macOS Retina and High-DPI displays, normalize physical pixels to logical CSS points if needed
+          if (logicalX > window.innerWidth * 1.05) {
+            logicalX = logicalX / (window.devicePixelRatio || 1);
+            logicalY = logicalY / (window.devicePixelRatio || 1);
+          }
+
+          // Use elementFromPoint for dynamic and precise hit-testing against panels and tabs
+          const hoveredEl = document.elementFromPoint(logicalX, logicalY);
+          const paneEl = hoveredEl?.closest('[data-pane-id]') as HTMLElement;
+          let pane: 'left' | 'right' = 'left';
+          if (paneEl) {
+            const p = paneEl.getAttribute('data-pane-id');
+            if (p === 'left' || p === 'right') {
+              pane = p;
+            }
+          } else {
+            pane = !isDualPaneRef.current ? 'left' : (logicalX < window.innerWidth / 2 ? 'left' : 'right');
+          }
+          setExternalDragPane(pane);
+
+          // Spring-loaded tabs: hovering over tab headers opens the tab automatically after 400ms
+          const tabEl = hoveredEl?.closest('[data-session-id]') as HTMLElement;
+          if (tabEl) {
+            const tabSessionId = tabEl.getAttribute('data-session-id');
+            const tabPaneId = (tabEl.getAttribute('data-pane-id') || pane) as 'left' | 'right';
+            const activeSid = tabPaneId === 'left' ? leftActiveSessionIdRef.current : rightActiveSessionIdRef.current;
+            if (tabSessionId && tabSessionId !== activeSid) {
+              if (currentHoverTab !== tabSessionId) {
+                currentHoverTab = tabSessionId;
+                if (springTimer) clearTimeout(springTimer);
+                springTimer = setTimeout(() => {
+                  if (tabPaneId === 'left') {
+                    setLeftActiveSessionId(tabSessionId);
+                  } else {
+                    setRightActiveSessionId(tabSessionId);
+                  }
+                }, 400);
+              }
+            } else {
+              if (currentHoverTab) {
+                clearTimeout(springTimer);
+                springTimer = null;
+                currentHoverTab = null;
+              }
+            }
+          } else {
+            if (currentHoverTab) {
+              clearTimeout(springTimer);
+              springTimer = null;
+              currentHoverTab = null;
+            }
+          }
+        } else if (payload.type === 'leave') {
+          if (springTimer) {
+            clearTimeout(springTimer);
+            springTimer = null;
+            currentHoverTab = null;
+          }
+          setExternalDragPane(null);
+        } else if (payload.type === 'drop') {
+          if (springTimer) {
+            clearTimeout(springTimer);
+            springTimer = null;
+            currentHoverTab = null;
+          }
+          setExternalDragPane(null);
+
+          let logicalX = payload.position.x;
+          let logicalY = payload.position.y;
+          if (logicalX > window.innerWidth * 1.05) {
+            logicalX = logicalX / (window.devicePixelRatio || 1);
+            logicalY = logicalY / (window.devicePixelRatio || 1);
+          }
+
+          const hoveredEl = document.elementFromPoint(logicalX, logicalY);
+          const paneEl = hoveredEl?.closest('[data-pane-id]') as HTMLElement;
+          let targetPane: 'left' | 'right' = 'left';
+          if (paneEl) {
+            const p = paneEl.getAttribute('data-pane-id');
+            if (p === 'left' || p === 'right') {
+              targetPane = p;
+            }
+          } else {
+            targetPane = !isDualPaneRef.current ? 'left' : (logicalX < window.innerWidth / 2 ? 'left' : 'right');
+          }
+
+          const targetSessionId = targetPane === 'left' ? leftActiveSessionIdRef.current : rightActiveSessionIdRef.current;
+          const targetDir = targetPane === 'left' ? leftPathRef.current : rightPathRef.current;
+          if (payload.paths && payload.paths.length > 0) {
+            // Prompt the user to choose between Copy and Move to protect local files!
+            handleDropItems('local', payload.paths, targetSessionId, targetDir, undefined);
+          }
+        }
+      })
+      .then((fn) => {
+        if (!isMounted) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
+      })
+      .catch((err) => {
+        console.warn('[Native DragDrop] Error registering listener:', err);
+      });
+
+    return () => {
+      isMounted = false;
+      if (springTimer) clearTimeout(springTimer);
+      if (unlisten) unlisten();
+    };
+  }, []);
+
   // Poll Background Transfer Queue every 1000ms
   useEffect(() => {
     let prevActiveCount = 0;
@@ -437,8 +588,22 @@ export const App: React.FC = () => {
           const currentActive = tasks.filter((t) => t.status === 'in_progress').length;
           // Auto-refresh panes when transfers finish
           if (prevActiveCount > 0 && currentActive === 0) {
+            for (const t of tasks) {
+              if (t.source_path) {
+                const srcParent = t.source_path.split('/').slice(0, -1).join('/') || '/';
+                directoryCache.invalidate(t.source_session, srcParent);
+                invokeTauri('invalidate_directory_cache', { sessionId: t.source_session, path: srcParent }).catch(() => {});
+              }
+              if (t.dest_path) {
+                const dstParent = t.dest_path.split('/').slice(0, -1).join('/') || '/';
+                directoryCache.invalidate(t.dest_session, dstParent);
+                invokeTauri('invalidate_directory_cache', { sessionId: t.dest_session, path: dstParent }).catch(() => {});
+              }
+            }
             directoryCache.invalidate(leftActiveSessionId, leftPath);
             directoryCache.invalidate(rightActiveSessionId, rightPath);
+            invokeTauri('invalidate_directory_cache', { sessionId: leftActiveSessionId, path: leftPath }).catch(() => {});
+            invokeTauri('invalidate_directory_cache', { sessionId: rightActiveSessionId, path: rightPath }).catch(() => {});
             loadLeftFiles(leftPath, undefined, true);
             loadRightFiles(rightPath, undefined, true);
           }
@@ -647,6 +812,17 @@ export const App: React.FC = () => {
   // Backward-compatibility load delegates
   const loadLocalFiles = async (p: string, forceRefresh = false) => loadLeftFiles(p, 'local', forceRefresh);
   const loadRemoteFiles = async (p: string, forceRefresh = false) => loadRightFiles(p, rightActiveSessionId, forceRefresh);
+
+  const refreshSessionDir = (sessionId: string, dir: string) => {
+    directoryCache.invalidate(sessionId, dir);
+    invokeTauri('invalidate_directory_cache', { sessionId, path: dir }).catch(() => {});
+    if (leftActiveSessionId === sessionId) {
+      loadLeftFiles(leftPath, sessionId, true);
+    }
+    if (rightActiveSessionId === sessionId) {
+      loadRightFiles(rightPath, sessionId, true);
+    }
+  };
 
   // Synchronize Browsing Handler for Left Navigation
   const handleLeftNavigate = async (newPath: string) => {
@@ -1024,11 +1200,26 @@ export const App: React.FC = () => {
   };
 
   // --- Modern Code Studio (Editor) Operations ---
-  const handleEditFile = async (file: FileEntry) => {
+  const handleEditFile = async (file: FileEntry, overrideSessionId?: string) => {
     try {
       const isRemote = file.path.startsWith(remotePath) || (activeRemoteSessionId !== 'local' && selectedRemote.includes(file.path));
-      const session = isRemote ? activeRemoteSessionId : 'local';
+      const session = overrideSessionId || (isRemote ? activeRemoteSessionId : 'local');
 
+      // If user configured an external editor in settings, launch it:
+      if (externalEditorCmd && externalEditorCmd.trim() !== '') {
+        try {
+          await invokeTauri('open_in_external_editor', {
+            sessionId: session,
+            path: file.path,
+            editorCmd: externalEditorCmd.trim(),
+          });
+          return;
+        } catch (extErr: any) {
+          console.warn('[External Editor] Failed to open external editor, falling back to native editor:', extErr);
+        }
+      }
+
+      // If user did not configure an external editor (or external editor failed), open native RustSCP Editor:
       const content = await invokeTauri<string>('read_file_content', {
         sessionId: session,
         path: file.path,
@@ -1349,8 +1540,8 @@ export const App: React.FC = () => {
   };
 
 
-  // HTML5 Drag & Drop Transfer Handler
-  const handleDropItems = async (
+  // HTML5 & OS Drag & Drop Transfer Execution
+  const executeDropTransfer = async (
     sourceSessionId: string,
     paths: string[],
     destSessionId: string,
@@ -1358,8 +1549,31 @@ export const App: React.FC = () => {
     isCopy: boolean
   ) => {
     if (!paths || paths.length === 0) return;
+
+    // Fast in-session move if dragging within same session and not holding copy modifier
+    if (sourceSessionId === destSessionId && !isCopy) {
+      try {
+        await invokeTauri('move_items', {
+          sessionId: sourceSessionId,
+          sources: paths,
+          destDir,
+        });
+
+        // Invalidate source directories
+        for (const p of paths) {
+          const parent = p.split('/').slice(0, -1).join('/') || '/';
+          refreshSessionDir(sourceSessionId, parent);
+        }
+        // Invalidate dest directory
+        refreshSessionDir(destSessionId, destDir);
+        return;
+      } catch (e) {
+        console.error('In-session move drop failed, falling back to transfer queue:', e);
+      }
+    }
+
     for (const srcPath of paths) {
-      const fileName = srcPath.split('/').pop() || srcPath;
+      const fileName = srcPath.split('/').filter(Boolean).pop() || srcPath;
       const dstPath = `${destDir.replace(/\/$/, '')}/${fileName}`;
       try {
         await invokeTauri('enqueue_transfer', {
@@ -1376,6 +1590,35 @@ export const App: React.FC = () => {
     setIsTransferDrawerOpen(true);
   };
 
+  // Safe Drag & Drop Handler with User Orientation & Confirmation
+  const handleDropItems = (
+    sourceSessionId: string,
+    paths: string[],
+    destSessionId: string,
+    destDir: string,
+    isCopy?: boolean
+  ) => {
+    if (!paths || paths.length === 0) return;
+
+    if (isCopy !== undefined) {
+      executeDropTransfer(sourceSessionId, paths, destSessionId, destDir, isCopy);
+      return;
+    }
+
+    const srcSession = sessions.find((s) => s.id === sourceSessionId);
+    const dstSession = sessions.find((s) => s.id === destSessionId);
+
+    setDropActionModal({
+      isOpen: true,
+      sourceSessionId,
+      sourceSessionName: srcSession?.config.name,
+      sourcePaths: paths,
+      destSessionId,
+      destSessionName: dstSession?.config.name,
+      destDir,
+    });
+  };
+
   // Clipboard & Context Menu Operations
   const handleCopy = (sessionId: string, paths: string[]) => {
     setClipboard({ action: 'copy', sourceSession: sessionId, paths });
@@ -1388,6 +1631,33 @@ export const App: React.FC = () => {
   const handlePaste = async (destSessionId: string, destDir: string) => {
     if (!clipboard || clipboard.paths.length === 0) return;
 
+    const isCut = clipboard.action === 'cut';
+    const isSameSession = clipboard.sourceSession === destSessionId;
+
+    // Fast in-session move for Cut & Paste
+    if (isCut && isSameSession) {
+      try {
+        await invokeTauri('move_items', {
+          sessionId: destSessionId,
+          sources: clipboard.paths,
+          destDir,
+        });
+
+        // Invalidate source directories
+        for (const p of clipboard.paths) {
+          const parent = p.split('/').slice(0, -1).join('/') || '/';
+          refreshSessionDir(clipboard.sourceSession, parent);
+        }
+        // Invalidate dest directory
+        refreshSessionDir(destSessionId, destDir);
+
+        setClipboard(null);
+        return;
+      } catch (e) {
+        console.error('In-session move paste failed, falling back to transfer queue:', e);
+      }
+    }
+
     for (const path of clipboard.paths) {
       const fileName = path.split('/').pop() || path;
       const destPath = `${destDir.replace(/\/$/, '')}/${fileName}`;
@@ -1397,14 +1667,14 @@ export const App: React.FC = () => {
           sourcePath: path,
           destSession: destSessionId,
           destPath,
-          isMove: clipboard.action === 'cut',
+          isMove: isCut,
         });
       } catch (e) {
         console.error('Enqueue paste transfer error:', e);
       }
     }
 
-    if (clipboard.action === 'cut') {
+    if (isCut) {
       setClipboard(null);
     }
     setIsTransferDrawerOpen(true);
@@ -1413,12 +1683,9 @@ export const App: React.FC = () => {
   const handleDuplicate = async (sessionId: string, path: string) => {
     try {
       await invokeTauri('duplicate_item', { sessionId, path });
-      directoryCache.invalidate(sessionId, path);
-      if (sessionId === 'local') {
-        loadLocalFiles(localPath, true);
-      } else {
-        loadRemoteFiles(remotePath, true);
-      }
+      const parent = path.split('/').slice(0, -1).join('/') || '/';
+      refreshSessionDir(sessionId, parent);
+      refreshSessionDir(sessionId, path);
     } catch (e) {
       alert(`Erro ao duplicar item: ${e}`);
     }
@@ -1439,12 +1706,7 @@ export const App: React.FC = () => {
         format,
         outputName,
       });
-      directoryCache.invalidate(sessionId, currentDir);
-      if (sessionId === 'local') {
-        loadLocalFiles(localPath, true);
-      } else {
-        loadRemoteFiles(remotePath, true);
-      }
+      refreshSessionDir(sessionId, currentDir);
     } catch (e) {
       alert(`Erro ao compactar: ${e}`);
     }
@@ -1463,17 +1725,33 @@ export const App: React.FC = () => {
         archivePath,
         destSubfolder,
       });
-      directoryCache.invalidate(sessionId, currentDir);
-      if (destSubfolder) {
-        directoryCache.invalidate(sessionId, `${currentDir}/${destSubfolder}`);
-      }
-      if (sessionId === 'local') {
-        loadLocalFiles(localPath, true);
-      } else {
-        loadRemoteFiles(remotePath, true);
+      refreshSessionDir(sessionId, currentDir);
+      if (destSubfolder && destSubfolder !== '.') {
+        const fullSub = `${currentDir.replace(/\/$/, '')}/${destSubfolder.replace(/^\//, '')}`;
+        refreshSessionDir(sessionId, fullSub);
       }
     } catch (e) {
       alert(`Erro ao extrair arquivo: ${e}`);
+    }
+  };
+
+  const handleRenameItem = async (sessionId: string, oldPath: string, newName: string) => {
+    if (!newName || !newName.trim()) return;
+    const parentDir = oldPath.split('/').slice(0, -1).join('/') || '/';
+    const cleanParent = parentDir === '' ? '/' : parentDir;
+    const newPath = cleanParent === '/' ? `/${newName.trim()}` : `${cleanParent}/${newName.trim()}`;
+    if (oldPath === newPath) return;
+
+    try {
+      await invokeTauri('rename_item', {
+        sessionId,
+        from: oldPath,
+        to: newPath,
+      });
+      refreshSessionDir(sessionId, cleanParent);
+    } catch (e: any) {
+      console.error('Failed to rename item:', e);
+      alert(isPt ? `Erro ao renomear: ${e?.message || e}` : `Error renaming: ${e?.message || e}`);
     }
   };
 
@@ -1701,6 +1979,8 @@ export const App: React.FC = () => {
         onTransferLeftToRight={handleTransferLeftToRight}
         onTransferRightToLeft={handleTransferRightToLeft}
         onDropItems={handleDropItems}
+        onRenameItem={handleRenameItem}
+        externalDragPane={externalDragPane}
 
         clipboard={clipboard}
         actionsCatalog={actionsCatalog}
@@ -1857,6 +2137,31 @@ export const App: React.FC = () => {
           } else {
             await loadRemoteFiles(remotePath, true);
           }
+
+          // Register completed upload/save task in Transfer Queue drawer ("área de transferências")
+          const fileName = path.split('/').pop() || path;
+          const byteLength = new Blob([content]).size;
+          const saveTask: QueueTransferTask = {
+            id: `save-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+            name: fileName,
+            source_session: 'local',
+            source_path: path,
+            dest_session: sessionId,
+            dest_path: path,
+            is_move: false,
+            total_bytes: byteLength,
+            transferred_bytes: byteLength,
+            status: 'completed',
+            speed_bps: 0,
+          };
+          setQueueTasks((prev) => [saveTask, ...prev.filter((t) => t.id !== saveTask.id)]);
+
+          // Update internal clipboard with the saved file path
+          setClipboard({
+            action: 'copy',
+            sourceSession: sessionId,
+            paths: [path],
+          });
         }}
         onOpenExternal={async (path) => {
           const session = path.startsWith(remotePath) ? activeRemoteSessionId : 'local';
@@ -2100,6 +2405,24 @@ export const App: React.FC = () => {
         <InputDialogModal
           {...inputDialog}
           onClose={() => setInputDialog(null)}
+        />
+      )}
+
+      {/* Drop Action Selection Modal (Safe Copy vs Move) */}
+      {dropActionModal && (
+        <DropActionModal
+          {...dropActionModal}
+          onConfirm={(action) => {
+            executeDropTransfer(
+              dropActionModal.sourceSessionId,
+              dropActionModal.sourcePaths,
+              dropActionModal.destSessionId,
+              dropActionModal.destDir,
+              action === 'copy'
+            );
+            setDropActionModal(null);
+          }}
+          onClose={() => setDropActionModal(null)}
         />
       )}
     </div>

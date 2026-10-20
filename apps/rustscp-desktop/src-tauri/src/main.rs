@@ -40,6 +40,8 @@ fn main() {
             delete_site,
             export_sites_vault,
             import_sites_vault,
+            preview_winscp_ini,
+            import_winscp_ini,
             get_vault_security_info,
             list_directory,
             get_session_default_path,
@@ -49,6 +51,8 @@ fn main() {
             delete_item,
             delete_items,
             rename_item,
+            move_items,
+            invalidate_directory_cache,
             change_permissions,
             get_file_properties,
             calculate_checksum,
@@ -96,7 +100,6 @@ fn main() {
             install_marketplace_tool,
             manage_custom_actions,
             open_in_external_editor,
-            invalidate_directory_cache,
         ])
         .run(tauri::generate_context!())
         .expect("error while running RustSCP desktop application");

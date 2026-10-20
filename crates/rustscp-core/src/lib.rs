@@ -13,6 +13,7 @@ pub mod types;
 pub mod vault;
 pub mod vfs;
 pub mod webdav_server;
+pub mod winscp;
 
 pub use code_generator::{CodeGenerator, CodeTargetLanguage};
 pub use continuous_sync::{ContinuousSyncManager, ContinuousSyncWatcher, WatchEvent};
@@ -33,3 +34,8 @@ pub use vault::{
 };
 pub use vfs::VirtualFileSystem;
 pub use webdav_server::{VirtualDiskInfo, WebDavServer};
+pub use winscp::{
+    decrypt_winscp_password, normalize_key_path, parse_winscp_ini, parse_winscp_ini_file,
+    url_decode_winscp, WinScpImportResult,
+};
+

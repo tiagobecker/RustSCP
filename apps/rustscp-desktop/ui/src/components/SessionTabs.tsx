@@ -63,6 +63,8 @@ export const SessionTabs: React.FC<SessionTabsProps> = ({
   } | null>(null);
 
   // Register handlers and subscribe to drag manager updates
+  const springHoverTimerRef = useRef<{ timer: any; sessionId: string } | null>(null);
+
   useEffect(() => {
     if (onMoveTab) {
       tabDragManager.registerMoveHandler(onMoveTab);
@@ -70,10 +72,40 @@ export const SessionTabs: React.FC<SessionTabsProps> = ({
     if (onReorderTabs) {
       tabDragManager.registerReorderHandler(onReorderTabs);
     }
+    return () => {
+      if (springHoverTimerRef.current) {
+        clearTimeout(springHoverTimerRef.current.timer);
+      }
+    };
+  }, [onMoveTab, onReorderTabs]);
+
+  useEffect(() => {
     return tabDragManager.subscribe((state) => {
       setDragState(state);
     });
-  }, [onMoveTab, onReorderTabs]);
+  }, []);
+
+  const handleTabDragOver = (e: React.DragEvent, sessId: string) => {
+    e.preventDefault();
+    if (sessId !== activeSessionId) {
+      if (!springHoverTimerRef.current || springHoverTimerRef.current.sessionId !== sessId) {
+        if (springHoverTimerRef.current) {
+          clearTimeout(springHoverTimerRef.current.timer);
+        }
+        const timer = setTimeout(() => {
+          onSelectSession(sessId);
+        }, 400);
+        springHoverTimerRef.current = { timer, sessionId: sessId };
+      }
+    }
+  };
+
+  const handleTabDragLeave = (sessId: string) => {
+    if (springHoverTimerRef.current && springHoverTimerRef.current.sessionId === sessId) {
+      clearTimeout(springHoverTimerRef.current.timer);
+      springHoverTimerRef.current = null;
+    }
+  };
 
   // Calculate target insertion index based on mouse X coordinate
   const calculateInsertionIndex = (clientX: number): number => {
@@ -240,7 +272,11 @@ export const SessionTabs: React.FC<SessionTabsProps> = ({
                 <div
                   data-tab-index={idx}
                   data-tab-session-id={sess.id}
+                  data-session-id={sess.id}
+                  data-pane-id={paneId || 'left'}
                   onPointerDown={(e) => handleTabPointerDown(e, sess, idx)}
+                  onDragOver={(e) => handleTabDragOver(e, sess.id)}
+                  onDragLeave={() => handleTabDragLeave(sess.id)}
                   title={`${sess.config.name} — ${t('sessionTabs.dragTabTip', 'Arraste para reordenar ou mover para o outro painel')}`}
                   className={`group flex items-center space-x-1.5 px-2.5 py-1 rounded-t text-xs font-medium cursor-grab active:cursor-grabbing transition-all border-t-2 shrink-0 ${
                     isThisTabDragging
@@ -382,7 +418,11 @@ export const SessionTabs: React.FC<SessionTabsProps> = ({
               <div
                 data-tab-index={idx}
                 data-tab-session-id={sess.id}
+                data-session-id={sess.id}
+                data-pane-id={paneId || 'left'}
                 onPointerDown={(e) => handleTabPointerDown(e, sess, idx)}
+                onDragOver={(e) => handleTabDragOver(e, sess.id)}
+                onDragLeave={() => handleTabDragLeave(sess.id)}
                 className={`group flex items-center space-x-2 px-3 py-1.5 rounded-t text-xs font-medium cursor-grab active:cursor-grabbing transition-all border-t-2 ${
                   isActive
                     ? 'bg-white dark:bg-dark-800 text-slate-950 dark:text-slate-100 border-rust-500 shadow-sm font-semibold'

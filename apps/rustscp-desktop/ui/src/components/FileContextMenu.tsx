@@ -21,7 +21,8 @@ import {
   Hash, 
   Search, 
   Code, 
-  Trash2 
+  Trash2,
+  Pencil
 } from 'lucide-react';
 import { FileEntry, ActionDefinition, ClipboardState } from '../types.ts';
 
@@ -41,6 +42,7 @@ export interface FileContextMenuProps {
   onCut?: (paths: string[]) => void;
   onCopy?: (paths: string[]) => void;
   onPaste?: () => void;
+  onRename?: (path: string, currentName: string) => void;
   onDuplicate?: (path: string) => void;
   onGoHome?: () => void;
   onOpenAiAssistant?: () => void;
@@ -77,6 +79,7 @@ export const FileContextMenu: React.FC<FileContextMenuProps> = ({
   onCut,
   onCopy,
   onPaste,
+  onRename,
   onDuplicate,
   onGoHome,
   onOpenAiAssistant,
@@ -362,6 +365,22 @@ export const FileContextMenu: React.FC<FileContextMenuProps> = ({
                 <span>{isPt ? 'Duplicar Item' : 'Duplicate Item'}</span>
               </div>
               <span className="text-[10px] text-slate-500 font-mono">Shift+F5</span>
+            </button>
+          )}
+
+          {file && onRename && (
+            <button
+              onClick={() => {
+                onRename(file.path, file.name);
+                onClose();
+              }}
+              className="w-full text-left px-3 py-1.5 hover:bg-slate-100 dark:hover:bg-dark-700 flex items-center justify-between text-slate-800 dark:text-slate-200 hover:text-slate-950 dark:hover:text-white transition-colors"
+            >
+              <div className="flex items-center space-x-2">
+                <Pencil className="w-3.5 h-3.5 text-amber-500 dark:text-amber-400" />
+                <span>{isPt ? 'Renomear' : 'Rename'}</span>
+              </div>
+              <span className="text-[10px] text-slate-500 font-mono">F2</span>
             </button>
           )}
 

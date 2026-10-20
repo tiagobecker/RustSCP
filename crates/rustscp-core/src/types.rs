@@ -161,6 +161,8 @@ pub struct ConnectionConfig {
     pub username: String,
     pub auth: AuthMethod,
     pub remote_root: String,
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 impl ConnectionConfig {
@@ -174,6 +176,7 @@ impl ConnectionConfig {
             username: whoami(),
             auth: AuthMethod::None,
             remote_root: "/".to_string(),
+            group: None,
         }
     }
 }

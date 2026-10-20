@@ -15,29 +15,54 @@ import {
   WrapText, 
   Maximize2, 
   Minimize2,
-  Code
+  Code,
+  Hash,
+  Keyboard
 } from 'lucide-react';
 import Prism from 'prismjs';
+// Base languages & dependencies
+import 'prismjs/components/prism-clike';
+import 'prismjs/components/prism-markup';
+import 'prismjs/components/prism-markup-templating'; // CRITICAL for PHP highlighting
+// C-family & Compiled
+import 'prismjs/components/prism-c';
+import 'prismjs/components/prism-cpp';
+import 'prismjs/components/prism-csharp';
+import 'prismjs/components/prism-java';
 import 'prismjs/components/prism-rust';
-import 'prismjs/components/prism-python';
+import 'prismjs/components/prism-go';
+import 'prismjs/components/prism-kotlin';
+import 'prismjs/components/prism-swift';
+import 'prismjs/components/prism-dart';
+// Web & Scripting
 import 'prismjs/components/prism-javascript';
 import 'prismjs/components/prism-typescript';
 import 'prismjs/components/prism-jsx';
 import 'prismjs/components/prism-tsx';
+import 'prismjs/components/prism-php';
+import 'prismjs/components/prism-python';
+import 'prismjs/components/prism-ruby';
+import 'prismjs/components/prism-lua';
+import 'prismjs/components/prism-perl';
+// Styles & Markup
+import 'prismjs/components/prism-css';
+import 'prismjs/components/prism-scss';
+import 'prismjs/components/prism-sass';
+import 'prismjs/components/prism-less';
+import 'prismjs/components/prism-markdown';
+// Config, Shell & Data
 import 'prismjs/components/prism-json';
 import 'prismjs/components/prism-yaml';
 import 'prismjs/components/prism-toml';
-import 'prismjs/components/prism-bash';
-import 'prismjs/components/prism-sql';
-import 'prismjs/components/prism-markup';
-import 'prismjs/components/prism-css';
-import 'prismjs/components/prism-markdown';
-import 'prismjs/components/prism-docker';
 import 'prismjs/components/prism-ini';
-import 'prismjs/components/prism-c';
-import 'prismjs/components/prism-cpp';
-import 'prismjs/components/prism-go';
-import 'prismjs/components/prism-php';
+import 'prismjs/components/prism-sql';
+import 'prismjs/components/prism-bash';
+import 'prismjs/components/prism-powershell';
+import 'prismjs/components/prism-docker';
+import 'prismjs/components/prism-nginx';
+import 'prismjs/components/prism-apacheconf';
+import 'prismjs/components/prism-graphql';
+import 'prismjs/components/prism-diff';
 
 import { EditorTab } from '../types.ts';
 
@@ -55,71 +80,160 @@ interface RustScpEditorProps {
   onOpenExternal?: (path: string) => Promise<void>;
 }
 
+const isMac = typeof navigator !== 'undefined' && (
+  /Mac|iPod|iPhone|iPad/.test(navigator.platform || '') ||
+  /Macintosh|Mac OS X/.test(navigator.userAgent || '')
+);
+const saveShortcutLabel = isMac ? '⌘S' : 'Ctrl+S';
+const editorFontFamily = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+
 const EXT_TO_LANG: Record<string, string> = {
+  // PHP
+  php: 'php',
+  phtml: 'php',
+  php3: 'php',
+  php4: 'php',
+  php5: 'php',
+  php7: 'php',
+  php8: 'php',
+  phps: 'php',
+  inc: 'php',
+  // Rust & Go
   rs: 'rust',
+  go: 'go',
+  // Python
   py: 'python',
+  pyw: 'python',
+  // JavaScript & TypeScript
   js: 'javascript',
   mjs: 'javascript',
   cjs: 'javascript',
   jsx: 'jsx',
   ts: 'typescript',
+  mts: 'typescript',
+  cts: 'typescript',
   tsx: 'tsx',
-  json: 'json',
-  yaml: 'yaml',
-  yml: 'yaml',
-  toml: 'toml',
-  sh: 'bash',
-  bash: 'bash',
-  zsh: 'bash',
-  env: 'bash',
-  sql: 'sql',
-  html: 'markup',
-  htm: 'markup',
-  xml: 'markup',
-  svg: 'markup',
-  css: 'css',
-  scss: 'css',
-  md: 'markdown',
-  markdown: 'markdown',
-  dockerfile: 'docker',
-  conf: 'ini',
-  ini: 'ini',
-  cfg: 'ini',
+  // Java & JVM & Mobile
+  java: 'java',
+  kt: 'kotlin',
+  kts: 'kotlin',
+  swift: 'swift',
+  dart: 'dart',
+  cs: 'csharp',
+  csx: 'csharp',
+  // C / C++
   c: 'c',
   h: 'c',
   cpp: 'cpp',
   hpp: 'cpp',
-  go: 'go',
-  php: 'php',
+  cc: 'cpp',
+  cxx: 'cpp',
+  // Ruby, Lua, Perl
+  rb: 'ruby',
+  erb: 'ruby',
+  gemspec: 'ruby',
+  lua: 'lua',
+  pl: 'perl',
+  pm: 'perl',
+  // Data & Config
+  json: 'json',
+  yaml: 'yaml',
+  yml: 'yaml',
+  toml: 'toml',
+  conf: 'ini',
+  ini: 'ini',
+  cfg: 'ini',
+  properties: 'ini',
+  env: 'bash',
+  // Shell
+  sh: 'bash',
+  bash: 'bash',
+  zsh: 'bash',
+  ps1: 'powershell',
+  psm1: 'powershell',
+  psd1: 'powershell',
+  // Web Markup & Styling
+  html: 'markup',
+  htm: 'markup',
+  xml: 'markup',
+  svg: 'markup',
+  vue: 'markup',
+  svelte: 'markup',
+  css: 'css',
+  scss: 'scss',
+  sass: 'sass',
+  less: 'less',
+  // Docs & Database
+  md: 'markdown',
+  markdown: 'markdown',
+  sql: 'sql',
+  // Infrastructure & Servers
+  dockerfile: 'docker',
+  nginx: 'nginx',
+  apacheconf: 'apacheconf',
+  graphql: 'graphql',
+  gql: 'graphql',
+  diff: 'diff',
+  patch: 'diff',
 };
 
 const SUPPORTED_LANGUAGES = [
   { id: 'plain', name: 'Plain Text' },
-  { id: 'rust', name: 'Rust' },
-  { id: 'python', name: 'Python' },
+  { id: 'php', name: 'PHP' },
   { id: 'javascript', name: 'JavaScript' },
   { id: 'typescript', name: 'TypeScript' },
+  { id: 'jsx', name: 'React JSX' },
+  { id: 'tsx', name: 'React TSX' },
+  { id: 'markup', name: 'HTML / XML' },
+  { id: 'css', name: 'CSS' },
+  { id: 'scss', name: 'SCSS' },
+  { id: 'sass', name: 'Sass' },
+  { id: 'less', name: 'Less' },
+  { id: 'python', name: 'Python' },
+  { id: 'rust', name: 'Rust' },
+  { id: 'go', name: 'Go' },
+  { id: 'c', name: 'C' },
+  { id: 'cpp', name: 'C++' },
+  { id: 'csharp', name: 'C#' },
+  { id: 'java', name: 'Java' },
+  { id: 'kotlin', name: 'Kotlin' },
+  { id: 'swift', name: 'Swift' },
+  { id: 'ruby', name: 'Ruby' },
+  { id: 'sql', name: 'SQL' },
+  { id: 'bash', name: 'Bash / Shell' },
+  { id: 'powershell', name: 'PowerShell' },
   { id: 'json', name: 'JSON' },
   { id: 'yaml', name: 'YAML' },
   { id: 'toml', name: 'TOML' },
-  { id: 'bash', name: 'Bash / Shell' },
-  { id: 'sql', name: 'SQL' },
-  { id: 'markup', name: 'HTML / XML' },
-  { id: 'css', name: 'CSS' },
-  { id: 'markdown', name: 'Markdown' },
+  { id: 'ini', name: 'INI / Config' },
   { id: 'docker', name: 'Dockerfile' },
-  { id: 'ini', name: 'Config / INI' },
-  { id: 'c', name: 'C' },
-  { id: 'cpp', name: 'C++' },
-  { id: 'go', name: 'Go' },
-  { id: 'php', name: 'PHP' },
+  { id: 'nginx', name: 'Nginx' },
+  { id: 'apacheconf', name: 'Apache Config' },
+  { id: 'markdown', name: 'Markdown' },
+  { id: 'graphql', name: 'GraphQL' },
+  { id: 'lua', name: 'Lua' },
+  { id: 'dart', name: 'Dart' },
+  { id: 'perl', name: 'Perl' },
+  { id: 'diff', name: 'Diff / Patch' },
 ];
 
 function detectLanguage(fileName: string): string {
   const lower = fileName.toLowerCase();
   if (lower === 'dockerfile' || lower.startsWith('dockerfile.')) return 'docker';
+  if (lower === 'nginx.conf' || lower.endsWith('.nginx') || lower.includes('nginx')) return 'nginx';
+  if (lower === '.htaccess' || lower.includes('apache')) return 'apacheconf';
+  if (lower === '.env' || lower.startsWith('.env.')) return 'bash';
   const ext = lower.split('.').pop() || '';
   return EXT_TO_LANG[ext] || 'plain';
+}
+
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
 }
 
 export const RustScpEditor: React.FC<RustScpEditorProps> = ({
@@ -156,7 +270,15 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({
   // References
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const preRef = useRef<HTMLPreElement>(null);
+  const activeLineRef = useRef<HTMLDivElement>(null);
   const lineNumbersRef = useRef<HTMLDivElement>(null);
+
+  // Go to Line state
+  const [showGoToLine, setShowGoToLine] = useState<boolean>(false);
+  const [targetLineInput, setTargetLineInput] = useState<string>('');
+
+  // Keyboard Shortcuts modal state
+  const [showShortcutsModal, setShowShortcutsModal] = useState<boolean>(false);
 
   // Initialize or add tab when initialFile changes
   useEffect(() => {
@@ -166,6 +288,18 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({
       const existing = prev.find((t) => t.path === initialFile.path && t.sessionId === initialFile.sessionId);
       if (existing) {
         setActiveTabId(existing.id);
+        if (!existing.isDirty) {
+          return prev.map((t) =>
+            t.id === existing.id
+              ? {
+                  ...t,
+                  content: initialFile.content,
+                  initialContent: initialFile.content,
+                  language: detectLanguage(initialFile.name),
+                }
+              : t
+          );
+        }
         return prev;
       }
       const newTab: EditorTab = {
@@ -190,12 +324,16 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({
     return tabs.find((t) => t.id === activeTabId) || tabs[0] || null;
   }, [tabs, activeTabId]);
 
-  // Synchronized scrolling between textarea, highlighted mirror, and line numbers
+  // Synchronized scrolling between textarea, highlighted mirror, active line marker, and line numbers
   const handleScroll = (e: React.UIEvent<HTMLTextAreaElement>) => {
     const target = e.currentTarget;
     if (preRef.current) {
       preRef.current.scrollTop = target.scrollTop;
       preRef.current.scrollLeft = target.scrollLeft;
+    }
+    if (activeLineRef.current) {
+      activeLineRef.current.scrollTop = target.scrollTop;
+      activeLineRef.current.scrollLeft = target.scrollLeft;
     }
     if (lineNumbersRef.current) {
       lineNumbersRef.current.scrollTop = target.scrollTop;
@@ -231,8 +369,154 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({
     );
   };
 
-  // Tab key indentation support
+  // Go to line jump
+  const handleJumpToLine = (targetLine: number) => {
+    if (!textareaRef.current || !activeTab) return;
+    const lines = (activeTab.content || '').split('\n');
+    const clampedLine = Math.max(1, Math.min(targetLine, lines.length));
+    let charPos = 0;
+    for (let i = 0; i < clampedLine - 1; i++) {
+      charPos += lines[i].length + 1;
+    }
+    textareaRef.current.focus();
+    textareaRef.current.setSelectionRange(charPos, charPos);
+    const lineHeight = Math.round(fontSize * 1.55);
+    textareaRef.current.scrollTop = Math.max(0, (clampedLine - 5) * lineHeight);
+    updateCursorPosition();
+    setShowGoToLine(false);
+  };
+
+  // Toggle Comment (language-aware)
+  const handleToggleComment = () => {
+    if (!textareaRef.current || !activeTab) return;
+    const textarea = textareaRef.current;
+    const start = textarea.selectionStart;
+    const end = textarea.selectionEnd;
+    const content = activeTab.content;
+    const lang = activeTab.language;
+
+    let prefix = '// ';
+    if (['python', 'bash', 'powershell', 'ruby', 'perl', 'yaml', 'toml', 'ini', 'docker', 'nginx', 'apacheconf'].includes(lang)) {
+      prefix = '# ';
+    } else if (['sql', 'lua'].includes(lang)) {
+      prefix = '-- ';
+    }
+
+    const lines = content.split('\n');
+    const lineStartIdx = content.substring(0, start).split('\n').length - 1;
+    const lineEndIdx = content.substring(0, end).split('\n').length - 1;
+
+    const areAllCommented = lines
+      .slice(lineStartIdx, lineEndIdx + 1)
+      .filter((l) => l.trim().length > 0)
+      .every((l) => l.trimStart().startsWith(prefix.trim()));
+
+    let delta = 0;
+    for (let i = lineStartIdx; i <= lineEndIdx; i++) {
+      if (areAllCommented) {
+        const trimmed = lines[i].trimStart();
+        const leadingSpaces = lines[i].substring(0, lines[i].length - trimmed.length);
+        if (trimmed.startsWith(prefix)) {
+          lines[i] = leadingSpaces + trimmed.substring(prefix.length);
+          delta -= prefix.length;
+        } else if (trimmed.startsWith(prefix.trim())) {
+          lines[i] = leadingSpaces + trimmed.substring(prefix.trim().length);
+          delta -= prefix.trim().length;
+        }
+      } else {
+        lines[i] = prefix + lines[i];
+        delta += prefix.length;
+      }
+    }
+
+    const updated = lines.join('\n');
+    handleContentChange(updated);
+    setTimeout(() => {
+      textarea.selectionStart = start;
+      textarea.selectionEnd = Math.max(start, end + delta);
+    }, 0);
+  };
+
+  // Duplicate line or selection
+  const handleDuplicateLine = () => {
+    if (!textareaRef.current || !activeTab) return;
+    const textarea = textareaRef.current;
+    const start = textarea.selectionStart;
+    const end = textarea.selectionEnd;
+    const content = activeTab.content;
+    const lines = content.split('\n');
+    const lineStartIdx = content.substring(0, start).split('\n').length - 1;
+    const lineEndIdx = content.substring(0, end).split('\n').length - 1;
+
+    const targetBlock = lines.slice(lineStartIdx, lineEndIdx + 1).join('\n');
+    lines.splice(lineEndIdx + 1, 0, targetBlock);
+
+    const updated = lines.join('\n');
+    handleContentChange(updated);
+    setTimeout(() => {
+      const newStart = start + targetBlock.length + 1;
+      textarea.selectionStart = newStart;
+      textarea.selectionEnd = newStart + (end - start);
+    }, 0);
+  };
+
+  // Delete line
+  const handleDeleteLine = () => {
+    if (!textareaRef.current || !activeTab) return;
+    const textarea = textareaRef.current;
+    const start = textarea.selectionStart;
+    const end = textarea.selectionEnd;
+    const content = activeTab.content;
+    const lines = content.split('\n');
+    const lineStartIdx = content.substring(0, start).split('\n').length - 1;
+    const lineEndIdx = content.substring(0, end).split('\n').length - 1;
+
+    lines.splice(lineStartIdx, lineEndIdx - lineStartIdx + 1);
+    const updated = lines.join('\n');
+    handleContentChange(updated);
+    setTimeout(() => {
+      const charPos = lines.slice(0, lineStartIdx).join('\n').length + (lineStartIdx > 0 ? 1 : 0);
+      textarea.selectionStart = textarea.selectionEnd = Math.min(charPos, updated.length);
+    }, 0);
+  };
+
+  // Move line up or down
+  const handleMoveLine = (direction: 'up' | 'down') => {
+    if (!textareaRef.current || !activeTab) return;
+    const textarea = textareaRef.current;
+    const start = textarea.selectionStart;
+    const end = textarea.selectionEnd;
+    const content = activeTab.content;
+    const lines = content.split('\n');
+    const lineStartIdx = content.substring(0, start).split('\n').length - 1;
+    const lineEndIdx = content.substring(0, end).split('\n').length - 1;
+
+    if (direction === 'up' && lineStartIdx > 0) {
+      const prevLine = lines[lineStartIdx - 1];
+      lines.splice(lineStartIdx - 1, 1);
+      lines.splice(lineEndIdx, 0, prevLine);
+      const updated = lines.join('\n');
+      handleContentChange(updated);
+      setTimeout(() => {
+        textarea.selectionStart = Math.max(0, start - prevLine.length - 1);
+        textarea.selectionEnd = Math.max(0, end - prevLine.length - 1);
+      }, 0);
+    } else if (direction === 'down' && lineEndIdx < lines.length - 1) {
+      const nextLine = lines[lineEndIdx + 1];
+      lines.splice(lineEndIdx + 1, 1);
+      lines.splice(lineStartIdx, 0, nextLine);
+      const updated = lines.join('\n');
+      handleContentChange(updated);
+      setTimeout(() => {
+        textarea.selectionStart = start + nextLine.length + 1;
+        textarea.selectionEnd = end + nextLine.length + 1;
+      }, 0);
+    }
+  };
+
+  // Keyboard handlers on textarea (Tab indentation, comments, duplicates, navigation)
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // Multi-line and single-line Tab Indentation
     if (e.key === 'Tab') {
       e.preventDefault();
       const textarea = e.currentTarget;
@@ -240,33 +524,115 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({
       const end = textarea.selectionEnd;
       const val = activeTab?.content || '';
 
+      if (start !== end) {
+        const startLineIdx = val.substring(0, start).split('\n').length - 1;
+        const endLineIdx = val.substring(0, end).split('\n').length - 1;
+        const lines = val.split('\n');
+        let charsChangedBeforeStart = 0;
+        let totalCharsChanged = 0;
+
+        for (let i = startLineIdx; i <= endLineIdx; i++) {
+          if (e.shiftKey) {
+            if (lines[i].startsWith('  ')) {
+              lines[i] = lines[i].substring(2);
+              totalCharsChanged -= 2;
+              if (i === startLineIdx) charsChangedBeforeStart -= 2;
+            } else if (lines[i].startsWith(' ')) {
+              lines[i] = lines[i].substring(1);
+              totalCharsChanged -= 1;
+              if (i === startLineIdx) charsChangedBeforeStart -= 1;
+            }
+          } else {
+            lines[i] = '  ' + lines[i];
+            totalCharsChanged += 2;
+            if (i === startLineIdx) charsChangedBeforeStart += 2;
+          }
+        }
+        const updated = lines.join('\n');
+        handleContentChange(updated);
+        setTimeout(() => {
+          textarea.selectionStart = Math.max(0, start + charsChangedBeforeStart);
+          textarea.selectionEnd = Math.max(0, end + totalCharsChanged);
+        }, 0);
+        return;
+      }
+
       if (e.shiftKey) {
-        // Dedent 2 spaces if possible
         if (val.substring(start - 2, start) === '  ') {
           const updated = val.substring(0, start - 2) + val.substring(start);
           handleContentChange(updated);
           setTimeout(() => {
-            textarea.selectionStart = textarea.selectionEnd = start - 2;
+            textarea.selectionStart = textarea.selectionEnd = Math.max(0, start - 2);
           }, 0);
         }
       } else {
-        // Insert 2 spaces
         const updated = val.substring(0, start) + '  ' + val.substring(end);
         handleContentChange(updated);
         setTimeout(() => {
           textarea.selectionStart = textarea.selectionEnd = start + 2;
         }, 0);
       }
+      return;
     }
 
-    if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+    // Toggle Comment (Cmd+/ or Ctrl+/)
+    if ((e.ctrlKey || e.metaKey) && (e.key === '/' || e.key === ';')) {
       e.preventDefault();
+      e.stopPropagation();
+      handleToggleComment();
+      return;
+    }
+
+    // Duplicate line (Cmd+Shift+D or Ctrl+Shift+D)
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key.toLowerCase() === 'd')) {
+      e.preventDefault();
+      e.stopPropagation();
+      handleDuplicateLine();
+      return;
+    }
+
+    // Delete line (Cmd+Shift+K or Ctrl+Shift+K)
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key.toLowerCase() === 'k')) {
+      e.preventDefault();
+      e.stopPropagation();
+      handleDeleteLine();
+      return;
+    }
+
+    // Move line (Alt+Up or Alt+Down)
+    if (e.altKey && e.key === 'ArrowUp') {
+      e.preventDefault();
+      e.stopPropagation();
+      handleMoveLine('up');
+      return;
+    }
+    if (e.altKey && e.key === 'ArrowDown') {
+      e.preventDefault();
+      e.stopPropagation();
+      handleMoveLine('down');
+      return;
+    }
+
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+      e.preventDefault();
+      e.stopPropagation();
       handleSaveActive();
+      return;
     }
 
-    if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
       e.preventDefault();
+      e.stopPropagation();
       setShowSearch(true);
+      return;
+    }
+
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'g') {
+      e.preventDefault();
+      e.stopPropagation();
+      setShowGoToLine(true);
+      setTargetLineInput(String(activeTab?.cursorLine || 1));
+      return;
     }
   };
 
@@ -274,18 +640,79 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({
     if (!activeTab || isSaving) return;
     setIsSaving(true);
     try {
+      // 1. Save to remote or local environment
       await onSave(activeTab.path, activeTab.content, activeTab.sessionId);
+
+      // 2. Also send content to system clipboard ("área de transferência")
+      try {
+        if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(activeTab.content);
+        }
+      } catch (clipErr) {
+        console.warn('[RustScpEditor] System clipboard write skipped:', clipErr);
+      }
+
       setTabs((prev) =>
         prev.map((t) => (t.id === activeTab.id ? { ...t, initialContent: t.content, isDirty: false } : t))
       );
       setSaveSuccess(true);
-      setTimeout(() => setSaveSuccess(false), 2000);
+      setTimeout(() => setSaveSuccess(false), 2500);
     } catch (err) {
       alert(`Erro ao salvar: ${err}`);
     } finally {
       setIsSaving(false);
     }
   };
+
+  // Global shortcut handling (Command+S on macOS, Ctrl+S on Windows/Linux, Zoom, Go to line, etc.)
+  useEffect(() => {
+    if (!isOpen) return;
+
+    const handleGlobalKeyDown = (e: KeyboardEvent) => {
+      const isCmdOrCtrl = e.metaKey || e.ctrlKey;
+      const key = e.key.toLowerCase();
+
+      if (isCmdOrCtrl && key === 's') {
+        e.preventDefault();
+        e.stopPropagation();
+        handleSaveActive();
+      } else if (isCmdOrCtrl && key === 'f') {
+        e.preventDefault();
+        e.stopPropagation();
+        setShowSearch(true);
+      } else if (isCmdOrCtrl && key === 'g') {
+        e.preventDefault();
+        e.stopPropagation();
+        setShowGoToLine(true);
+        setTargetLineInput(String(activeTab?.cursorLine || 1));
+      } else if (isCmdOrCtrl && (e.key === '=' || e.key === '+')) {
+        e.preventDefault();
+        setFontSize((s) => Math.min(24, s + 1));
+      } else if (isCmdOrCtrl && (e.key === '-' || e.key === '_')) {
+        e.preventDefault();
+        setFontSize((s) => Math.max(10, s - 1));
+      } else if (isCmdOrCtrl && e.key === '0') {
+        e.preventDefault();
+        setFontSize(13);
+      } else if (e.altKey && key === 'z') {
+        e.preventDefault();
+        setWordWrap((w) => !w);
+      } else if (e.key === 'Escape') {
+        if (showGoToLine) {
+          setShowGoToLine(false);
+        } else if (showSearch) {
+          setShowSearch(false);
+        } else if (showShortcutsModal) {
+          setShowShortcutsModal(false);
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleGlobalKeyDown, true);
+    return () => {
+      window.removeEventListener('keydown', handleGlobalKeyDown, true);
+    };
+  }, [isOpen, activeTab, isSaving, showSearch, showGoToLine, showShortcutsModal]);
 
   const forceCloseTab = (id: string) => {
     const remaining = tabs.filter((t) => t.id !== id);
@@ -365,14 +792,15 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({
     if (!activeTab) return '';
     const code = activeTab.content;
     const lang = activeTab.language;
-    if (lang && Prism.languages[lang]) {
+    if (lang && lang !== 'plain' && Prism.languages[lang]) {
       try {
         return Prism.highlight(code, Prism.languages[lang], lang);
       } catch (_e) {
-        return code;
+        console.warn(`[RustScpEditor] Highlighting failed for language ${lang}:`, _e);
+        return escapeHtml(code);
       }
     }
-    return code;
+    return escapeHtml(code);
   }, [activeTab?.content, activeTab?.language]);
 
   if (!isOpen || !activeTab) return null;
@@ -496,7 +924,7 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({
             {/* Search Toggle */}
             <button
               onClick={() => setShowSearch(!showSearch)}
-              title={isPt ? 'Localizar e Substituir (Ctrl+F)' : 'Find & Replace (Ctrl+F)'}
+              title={isPt ? `Localizar e Substituir (${isMac ? '⌘F' : 'Ctrl+F'})` : `Find & Replace (${isMac ? '⌘F' : 'Ctrl+F'})`}
               className={`p-1.5 rounded border transition-colors ${
                 showSearch
                   ? 'bg-sky-500/20 border-sky-500/40 text-sky-700 dark:text-sky-300'
@@ -506,10 +934,26 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({
               <Search className="w-3.5 h-3.5" />
             </button>
 
+            {/* Go to Line */}
+            <button
+              onClick={() => {
+                setShowGoToLine(!showGoToLine);
+                setTargetLineInput(String(activeTab.cursorLine));
+              }}
+              title={isPt ? `Ir para a Linha (${isMac ? '⌘G' : 'Ctrl+G'})` : `Go to Line (${isMac ? '⌘G' : 'Ctrl+G'})`}
+              className={`p-1.5 rounded border transition-colors ${
+                showGoToLine
+                  ? 'bg-amber-500/20 border-amber-500/40 text-amber-700 dark:text-amber-300'
+                  : 'bg-white dark:bg-dark-700/60 border-slate-300 dark:border-dark-600 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+              }`}
+            >
+              <Hash className="w-3.5 h-3.5" />
+            </button>
+
             {/* Word Wrap Toggle */}
             <button
               onClick={() => setWordWrap(!wordWrap)}
-              title={isPt ? 'Quebra de Linha Suave (Word Wrap)' : 'Toggle Word Wrap'}
+              title={isPt ? `Quebra de Linha Suave (${isMac ? '⌥Z' : 'Alt+Z'})` : `Toggle Word Wrap (${isMac ? '⌥Z' : 'Alt+Z'})`}
               className={`p-1.5 rounded border transition-colors ${
                 wordWrap
                   ? 'bg-rust-500/20 border-rust-500/40 text-rust-700 dark:text-rust-400'
@@ -517,6 +961,15 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({
               }`}
             >
               <WrapText className="w-3.5 h-3.5" />
+            </button>
+
+            {/* Keyboard Shortcuts Cheatsheet */}
+            <button
+              onClick={() => setShowShortcutsModal(true)}
+              title={isPt ? 'Atalhos de Teclado do Editor' : 'Editor Keyboard Shortcuts'}
+              className="p-1.5 rounded border transition-colors bg-white dark:bg-dark-700/60 border-slate-300 dark:border-dark-600 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200"
+            >
+              <Keyboard className="w-3.5 h-3.5" />
             </button>
 
             {/* Font Size Zoom Controls */}
@@ -562,6 +1015,7 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({
             <button
               onClick={handleSaveActive}
               disabled={isSaving || !activeTab.isDirty}
+              title={isPt ? `Salvar arquivo (${saveShortcutLabel}) e enviar para área de transferência` : `Save file (${saveShortcutLabel}) and copy to clipboard`}
               className="flex items-center space-x-1.5 px-3 py-1 rounded bg-rust-600 hover:bg-rust-500 disabled:opacity-40 text-white font-semibold transition-all shadow-sm border border-rust-500/40"
             >
               {saveSuccess ? (
@@ -569,10 +1023,59 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({
               ) : (
                 <Save className="w-3.5 h-3.5" />
               )}
-              <span>{saveSuccess ? (isPt ? 'Salvo!' : 'Saved!') : isSaving ? (isPt ? 'Salvando...' : 'Saving...') : (isPt ? 'Salvar (Ctrl+S)' : 'Save (Ctrl+S)')}</span>
+              <span>
+                {saveSuccess
+                  ? (isPt ? 'Salvo no Remoto e Copiado!' : 'Saved to Remote & Copied!')
+                  : isSaving
+                  ? (isPt ? 'Salvando...' : 'Saving...')
+                  : (isPt ? `Salvar (${saveShortcutLabel})` : `Save (${saveShortcutLabel})`)}
+              </span>
             </button>
           </div>
         </div>
+
+        {/* Go to Line Bar */}
+        {showGoToLine && (
+          <div className="bg-slate-100 dark:bg-dark-750 border-b border-slate-200 dark:border-dark-600 px-4 py-2 flex items-center space-x-2 text-xs shrink-0 animate-in slide-in-from-top-1 duration-150">
+            <span className="font-semibold text-slate-700 dark:text-slate-300 flex items-center gap-1">
+              <Hash className="w-3.5 h-3.5 text-rust-500" />
+              {isPt ? 'Ir para a linha:' : 'Go to line:'}
+            </span>
+            <input
+              type="number"
+              min={1}
+              max={lineCount}
+              autoFocus
+              value={targetLineInput}
+              onChange={(e) => setTargetLineInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  const num = parseInt(targetLineInput, 10);
+                  if (!isNaN(num)) handleJumpToLine(num);
+                } else if (e.key === 'Escape') {
+                  setShowGoToLine(false);
+                }
+              }}
+              placeholder={`1 - ${lineCount}`}
+              className="bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-600 rounded px-2 py-0.5 w-28 text-slate-900 dark:text-slate-100 focus:outline-none focus:border-rust-500"
+            />
+            <button
+              onClick={() => {
+                const num = parseInt(targetLineInput, 10);
+                if (!isNaN(num)) handleJumpToLine(num);
+              }}
+              className="px-2.5 py-0.5 rounded bg-rust-600 hover:bg-rust-500 text-white font-medium text-xs shadow-sm"
+            >
+              {isPt ? 'Navegar' : 'Jump'}
+            </button>
+            <button
+              onClick={() => setShowGoToLine(false)}
+              className="p-1 rounded hover:bg-slate-200 dark:hover:bg-dark-600 text-slate-500"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
 
         {/* Find & Replace Bar */}
         {showSearch && (
@@ -651,12 +1154,21 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({
           <div
             ref={lineNumbersRef}
             style={{ fontSize: `${fontSize}px`, lineHeight: `${Math.round(fontSize * 1.55)}px` }}
-            className="w-14 bg-slate-950/80 dark:bg-dark-900 text-slate-400 dark:text-slate-500 text-right pr-3 pt-3 select-none border-r border-slate-800 dark:border-dark-700/80 font-mono overflow-hidden shrink-0"
+            className="w-14 bg-slate-950/80 dark:bg-dark-900 text-slate-400 dark:text-slate-500 text-right pr-2 pt-3 select-none border-r border-slate-800 dark:border-dark-700/80 font-mono overflow-hidden shrink-0"
           >
             {lines.map((_, i) => {
               const isCurrent = activeTab.cursorLine === i + 1;
               return (
-                <div key={i} className={isCurrent ? 'text-rust-400 font-bold' : ''}>
+                <div
+                  key={i}
+                  onClick={() => handleJumpToLine(i + 1)}
+                  className={`cursor-pointer transition-colors px-1 ${
+                    isCurrent
+                      ? 'text-rust-400 dark:text-rust-300 font-bold bg-slate-800/80 dark:bg-slate-700/60 rounded-sm'
+                      : 'hover:text-slate-200 hover:bg-slate-800/30'
+                  }`}
+                  title={isPt ? `Linha ${i + 1} (Clique para ir)` : `Line ${i + 1} (Click to jump)`}
+                >
                   {i + 1}
                 </div>
               );
@@ -665,6 +1177,20 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({
 
           {/* Editor Container with Overlaid Highlighted Pre and Input Textarea */}
           <div className="flex-1 relative overflow-hidden">
+            {/* Active Line Position Marker Overlay */}
+            <div
+              ref={activeLineRef}
+              className="absolute inset-0 overflow-hidden pointer-events-none z-0 select-none"
+            >
+              <div
+                style={{
+                  top: `${12 + (activeTab.cursorLine - 1) * Math.round(fontSize * 1.55)}px`,
+                  height: `${Math.round(fontSize * 1.55)}px`,
+                }}
+                className="absolute inset-x-0 bg-slate-800/40 dark:bg-slate-700/25 border-y border-slate-700/40 dark:border-slate-600/30 transition-all duration-75"
+              />
+            </div>
+
             {/* Syntax Highlighted Mirror Layer */}
             <pre
               ref={preRef}
@@ -673,13 +1199,19 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({
                 lineHeight: `${Math.round(fontSize * 1.55)}px`,
                 whiteSpace: wordWrap ? 'pre-wrap' : 'pre',
                 wordBreak: wordWrap ? 'break-word' : 'normal',
+                fontFamily: editorFontFamily,
+                tabSize: 2,
+                MozTabSize: 2,
+                padding: '12px',
+                border: 0,
+                outline: 'none',
               }}
-              className="absolute inset-0 p-3 m-0 overflow-hidden pointer-events-none font-mono text-slate-100 dark:text-slate-200 bg-transparent select-none z-0"
+              className="absolute inset-0 m-0 overflow-hidden pointer-events-none text-slate-100 dark:text-slate-200 bg-transparent select-none z-0"
               aria-hidden="true"
               dangerouslySetInnerHTML={{ __html: highlightedCode + '\n' }}
             />
 
-            {/* Editable Textarea Layer */}
+            {/* Editable Textarea Layer with High-Visibility Caret & Text Cursor */}
             <textarea
               ref={textareaRef}
               value={activeTab.content}
@@ -689,24 +1221,44 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({
               onKeyUp={updateCursorPosition}
               onKeyDown={handleKeyDown}
               spellCheck={false}
+              role="textbox"
+              aria-multiline="true"
+              aria-label={isPt ? `Editor de código para ${activeTab.name}` : `Code editor for ${activeTab.name}`}
+              aria-describedby="editor-status-bar"
               style={{
                 fontSize: `${fontSize}px`,
                 lineHeight: `${Math.round(fontSize * 1.55)}px`,
                 whiteSpace: wordWrap ? 'pre-wrap' : 'pre',
                 wordBreak: wordWrap ? 'break-word' : 'normal',
-                caretColor: 'var(--color-rust-400)',
+                fontFamily: editorFontFamily,
+                tabSize: 2,
+                MozTabSize: 2,
+                padding: '12px',
+                border: 0,
+                outline: 'none',
+                caretColor: '#f97316',
+                cursor: 'text',
               }}
-              className="absolute inset-0 p-3 m-0 w-full h-full resize-none bg-transparent text-transparent focus:outline-none overflow-auto font-mono z-10 selection:bg-rust-500/30 selection:text-transparent"
+              className="absolute inset-0 m-0 w-full h-full resize-none bg-transparent text-transparent focus:outline-none overflow-auto z-10 selection:bg-rust-500/40 selection:text-white dark:selection:bg-rust-500/50 cursor-text"
             />
           </div>
         </div>
 
         {/* Status Bar */}
-        <div className="h-6 bg-slate-100 dark:bg-dark-900 border-t border-slate-200 dark:border-dark-600 px-3 flex items-center justify-between text-[11px] text-slate-600 dark:text-slate-400 font-mono select-none shrink-0">
+        <div id="editor-status-bar" className="h-6 bg-slate-100 dark:bg-dark-900 border-t border-slate-200 dark:border-dark-600 px-3 flex items-center justify-between text-[11px] text-slate-600 dark:text-slate-400 font-mono select-none shrink-0">
           <div className="flex items-center space-x-4">
-            <span>
-              {isPt ? 'Linha' : 'Ln'} {activeTab.cursorLine}, {isPt ? 'Coluna' : 'Col'} {activeTab.cursorCol}
-            </span>
+            <button
+              onClick={() => {
+                setShowGoToLine(true);
+                setTargetLineInput(String(activeTab.cursorLine));
+              }}
+              title={isPt ? `Ir para a Linha (${isMac ? '⌘G' : 'Ctrl+G'})` : `Go to Line (${isMac ? '⌘G' : 'Ctrl+G'})`}
+              className="hover:underline flex items-center space-x-1 cursor-pointer hover:text-rust-500 dark:hover:text-rust-400 transition-colors"
+            >
+              <span>
+                {isPt ? 'Linha' : 'Ln'} {activeTab.cursorLine}, {isPt ? 'Coluna' : 'Col'} {activeTab.cursorCol}
+              </span>
+            </button>
             <span>{lineCount} {isPt ? 'linhas' : 'lines'}</span>
             <span>{activeTab.content.length.toLocaleString()} bytes</span>
             <span>UTF-8</span>
@@ -721,6 +1273,80 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({
             <span className="text-[10px] text-slate-500 dark:text-slate-500">RustSCP Editor v1.0</span>
           </div>
         </div>
+
+        {/* Keyboard Shortcuts Cheatsheet Modal */}
+        {showShortcutsModal && (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-xs z-60 flex items-center justify-center p-4 animate-in fade-in duration-100">
+            <div className="bg-white dark:bg-dark-800 border border-slate-300 dark:border-dark-600 rounded-xl shadow-2xl p-5 max-w-lg w-full text-slate-900 dark:text-slate-100 select-none animate-in zoom-in-95 duration-150">
+              <div className="flex items-center justify-between border-b border-slate-200 dark:border-dark-700 pb-3 mb-4">
+                <div className="flex items-center space-x-2">
+                  <Keyboard className="w-4 h-4 text-rust-500" />
+                  <h3 className="font-bold text-sm">
+                    {isPt ? 'Atalhos de Teclado do RustSCP Editor' : 'RustSCP Editor Keyboard Shortcuts'}
+                  </h3>
+                </div>
+                <button
+                  onClick={() => setShowShortcutsModal(false)}
+                  className="p-1 rounded hover:bg-slate-100 dark:hover:bg-dark-700 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                <div className="flex items-center justify-between p-2 rounded bg-slate-50 dark:bg-dark-750 border border-slate-200 dark:border-dark-700">
+                  <span className="text-slate-600 dark:text-slate-400">{isPt ? 'Salvar Remoto & Clipboard' : 'Save Remote & Clipboard'}</span>
+                  <kbd className="px-1.5 py-0.5 rounded bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-600 font-mono font-semibold">{isMac ? '⌘S' : 'Ctrl+S'}</kbd>
+                </div>
+                <div className="flex items-center justify-between p-2 rounded bg-slate-50 dark:bg-dark-750 border border-slate-200 dark:border-dark-700">
+                  <span className="text-slate-600 dark:text-slate-400">{isPt ? 'Localizar e Substituir' : 'Find and Replace'}</span>
+                  <kbd className="px-1.5 py-0.5 rounded bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-600 font-mono font-semibold">{isMac ? '⌘F' : 'Ctrl+F'}</kbd>
+                </div>
+                <div className="flex items-center justify-between p-2 rounded bg-slate-50 dark:bg-dark-750 border border-slate-200 dark:border-dark-700">
+                  <span className="text-slate-600 dark:text-slate-400">{isPt ? 'Ir para a Linha' : 'Go to Line'}</span>
+                  <kbd className="px-1.5 py-0.5 rounded bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-600 font-mono font-semibold">{isMac ? '⌘G' : 'Ctrl+G'}</kbd>
+                </div>
+                <div className="flex items-center justify-between p-2 rounded bg-slate-50 dark:bg-dark-750 border border-slate-200 dark:border-dark-700">
+                  <span className="text-slate-600 dark:text-slate-400">{isPt ? 'Comentar Linha' : 'Toggle Comment'}</span>
+                  <kbd className="px-1.5 py-0.5 rounded bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-600 font-mono font-semibold">{isMac ? '⌘/' : 'Ctrl+/'}</kbd>
+                </div>
+                <div className="flex items-center justify-between p-2 rounded bg-slate-50 dark:bg-dark-750 border border-slate-200 dark:border-dark-700">
+                  <span className="text-slate-600 dark:text-slate-400">{isPt ? 'Duplicar Linha' : 'Duplicate Line'}</span>
+                  <kbd className="px-1.5 py-0.5 rounded bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-600 font-mono font-semibold">{isMac ? '⌘⇧D' : 'Ctrl+Shift+D'}</kbd>
+                </div>
+                <div className="flex items-center justify-between p-2 rounded bg-slate-50 dark:bg-dark-750 border border-slate-200 dark:border-dark-700">
+                  <span className="text-slate-600 dark:text-slate-400">{isPt ? 'Excluir Linha' : 'Delete Line'}</span>
+                  <kbd className="px-1.5 py-0.5 rounded bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-600 font-mono font-semibold">{isMac ? '⌘⇧K' : 'Ctrl+Shift+K'}</kbd>
+                </div>
+                <div className="flex items-center justify-between p-2 rounded bg-slate-50 dark:bg-dark-750 border border-slate-200 dark:border-dark-700">
+                  <span className="text-slate-600 dark:text-slate-400">{isPt ? 'Mover Linha Acima/Abaixo' : 'Move Line Up/Down'}</span>
+                  <kbd className="px-1.5 py-0.5 rounded bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-600 font-mono font-semibold">{isMac ? '⌥↑ / ⌥↓' : 'Alt+↑ / Alt+↓'}</kbd>
+                </div>
+                <div className="flex items-center justify-between p-2 rounded bg-slate-50 dark:bg-dark-750 border border-slate-200 dark:border-dark-700">
+                  <span className="text-slate-600 dark:text-slate-400">{isPt ? 'Indentar / Desindentar' : 'Indent / Dedent'}</span>
+                  <kbd className="px-1.5 py-0.5 rounded bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-600 font-mono font-semibold">Tab / ⇧Tab</kbd>
+                </div>
+                <div className="flex items-center justify-between p-2 rounded bg-slate-50 dark:bg-dark-750 border border-slate-200 dark:border-dark-700">
+                  <span className="text-slate-600 dark:text-slate-400">{isPt ? 'Ajustar Quebra de Linha' : 'Toggle Word Wrap'}</span>
+                  <kbd className="px-1.5 py-0.5 rounded bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-600 font-mono font-semibold">{isMac ? '⌥Z' : 'Alt+Z'}</kbd>
+                </div>
+                <div className="flex items-center justify-between p-2 rounded bg-slate-50 dark:bg-dark-750 border border-slate-200 dark:border-dark-700">
+                  <span className="text-slate-600 dark:text-slate-400">{isPt ? 'Zoom da Fonte (+/-)' : 'Font Zoom (+/-)'}</span>
+                  <kbd className="px-1.5 py-0.5 rounded bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-600 font-mono font-semibold">{isMac ? '⌘+ / ⌘-' : 'Ctrl+ / Ctrl-'}</kbd>
+                </div>
+              </div>
+
+              <div className="mt-4 pt-3 border-t border-slate-200 dark:border-dark-700 flex justify-end">
+                <button
+                  onClick={() => setShowShortcutsModal(false)}
+                  className="px-4 py-1.5 rounded bg-rust-600 hover:bg-rust-500 text-white font-medium text-xs shadow-sm"
+                >
+                  {isPt ? 'Entendido' : 'Close'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

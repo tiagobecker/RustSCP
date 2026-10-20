@@ -149,6 +149,28 @@
 .token.regex, .token.important, .token.variable {
   color: var(--token-variable);
 }
+.token.delimiter {
+  color: var(--token-keyword);
+  font-weight: 700;
+}
+.token.package {
+  color: var(--token-function);
+}
+.token.type-casting {
+  color: var(--token-keyword);
+  font-style: italic;
+}
+.token.function-definition {
+  color: var(--token-function);
+  font-weight: 600;
+}
+.token.class-name-definition {
+  color: var(--token-function);
+  font-weight: 600;
+}
+.token.parameter {
+  color: var(--token-variable);
+}
 
 /* Natural Transfer Wave Animations (GPU Accelerated 60fps) */
 @keyframes naturalWave1 {

@@ -6,7 +6,7 @@ use rustscp_core::{
     ManagedDiskCache, Protocol, QueueTransferTask, RemoteSystemInfo, RemoteTrashItem,
     RemoteTrashStatus, S3Config, S3Driver, ScriptCommandOutput, ScriptInterpreter, SftpDriver,
     SyncEngine, SyncItem, SyncOptions, TransferQueueManager, VirtualDiskInfo, VirtualFileSystem,
-    WebDavServer,
+    WebDavServer, WinScpImportResult,
 };
 use rustscp_mcp::{AuditEvent, AuditLogger, McpServer};
 use serde::{Deserialize, Serialize};
@@ -270,6 +270,72 @@ pub async fn import_sites_vault(
                 continue;
             }
             if let Some(pos) = sites.iter().position(|existing| existing.id == s.id) {
+                sites[pos] = s;
+            } else {
+                sites.push(s);
+            }
+        }
+    }
+
+    rustscp_core::save_local_vault(&sites).map_err(|e| e.to_string())?;
+    Ok(sites.clone())
+}
+
+#[tauri::command]
+pub async fn preview_winscp_ini(
+    path_or_content: String,
+    is_path: bool,
+) -> Result<WinScpImportResult, String> {
+    if is_path {
+        let p = std::path::Path::new(path_or_content.trim());
+        rustscp_core::parse_winscp_ini_file(p).map_err(|e| e.to_string())
+    } else {
+        Ok(rustscp_core::parse_winscp_ini(&path_or_content))
+    }
+}
+
+#[tauri::command]
+pub async fn import_winscp_ini(
+    state: tauri::State<'_, AppState>,
+    path_or_content: String,
+    is_path: bool,
+    merge_mode: String,
+) -> Result<Vec<ConnectionConfig>, String> {
+    let result = if is_path {
+        let p = std::path::Path::new(path_or_content.trim());
+        rustscp_core::parse_winscp_ini_file(p).map_err(|e| e.to_string())?
+    } else {
+        rustscp_core::parse_winscp_ini(&path_or_content)
+    };
+
+    if result.sites.is_empty() {
+        return Err("Nenhuma sessão válida de conexão encontrada no arquivo do WinSCP.".to_string());
+    }
+
+    let mut sites = state.saved_sites.write().await;
+    let local_cfg = ConnectionConfig::local();
+
+    if merge_mode == "replace" {
+        let mut new_list = vec![local_cfg];
+        for s in result.sites {
+            if s.id != "local" {
+                new_list.push(s);
+            }
+        }
+        *sites = new_list;
+    } else {
+        // Merge: adiciona ou atualiza por id ou (host + username + group + name)
+        for s in result.sites {
+            if s.id == "local" {
+                continue;
+            }
+            if let Some(pos) = sites.iter().position(|existing| {
+                existing.id == s.id
+                    || (existing.host == s.host
+                        && existing.username == s.username
+                        && existing.group == s.group
+                        && existing.name == s.name)
+            }) {
                 sites[pos] = s;
             } else {
                 sites.push(s);
@@ -548,7 +614,50 @@ pub async fn rename_item(
         .invalidate_catalog(&session_id, &from)
         .await;
     state.disk_cache.invalidate_catalog(&session_id, &to).await;
+    if let Some(parent) = std::path::Path::new(&from).parent().and_then(|p| p.to_str()) {
+        state.disk_cache.invalidate_catalog(&session_id, parent).await;
+    }
+    if let Some(parent) = std::path::Path::new(&to).parent().and_then(|p| p.to_str()) {
+        state.disk_cache.invalidate_catalog(&session_id, parent).await;
+    }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn move_items(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    sources: Vec<String>,
+    dest_dir: String,
+) -> Result<Vec<String>, String> {
+    let sessions = state.active_sessions.read().await;
+    let vfs = sessions
+        .get(&session_id)
+        .ok_or_else(|| format!("Session '{}' not found", session_id))?;
+
+    let mut moved = Vec::new();
+    let clean_dest = dest_dir.trim_end_matches('/');
+
+    for src in sources {
+        let name = src.rsplit('/').next().unwrap_or(&src);
+        let dst = format!("{}/{}", clean_dest, name);
+        if src == dst {
+            continue;
+        }
+
+        vfs.rename(&src, &dst).await.map_err(|e| e.to_string())?;
+
+        state.disk_cache.invalidate_catalog(&session_id, &src).await;
+        state.disk_cache.invalidate_catalog(&session_id, &dst).await;
+        if let Some(parent) = std::path::Path::new(&src).parent().and_then(|p| p.to_str()) {
+            state.disk_cache.invalidate_catalog(&session_id, parent).await;
+        }
+        moved.push(dst);
+    }
+
+    state.disk_cache.invalidate_catalog(&session_id, &dest_dir).await;
+    state.disk_cache.invalidate_catalog(&session_id, clean_dest).await;
+    Ok(moved)
 }
 
 #[tauri::command]
@@ -2380,29 +2489,61 @@ pub async fn manage_custom_actions(
 
 #[tauri::command]
 pub async fn open_in_external_editor(
+    state: tauri::State<'_, AppState>,
+    session_id: Option<String>,
     path: String,
     editor_cmd: Option<String>,
 ) -> Result<String, String> {
     let editor = editor_cmd.unwrap_or_else(|| "code".to_string());
 
-    let res = tokio::process::Command::new(&editor).arg(&path).spawn();
+    let target_local_path = if let Some(sid) = session_id.as_deref() {
+        if sid != "local" {
+            let sessions = state.active_sessions.read().await;
+            let vfs = sessions
+                .get(sid)
+                .ok_or_else(|| format!("Session '{}' not found", sid))?;
+            let bytes = vfs.read_file(&path).await.map_err(|e| e.to_string())?;
+
+            let file_name = std::path::Path::new(&path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file");
+
+            let temp_dir = std::env::temp_dir().join("rustscp_external_editor").join(sid);
+            tokio::fs::create_dir_all(&temp_dir)
+                .await
+                .map_err(|e| e.to_string())?;
+            let temp_file_path = temp_dir.join(file_name);
+            tokio::fs::write(&temp_file_path, bytes)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            temp_file_path.to_string_lossy().to_string()
+        } else {
+            path.clone()
+        }
+    } else {
+        path.clone()
+    };
+
+    let res = tokio::process::Command::new(&editor).arg(&target_local_path).spawn();
 
     match res {
-        Ok(_) => Ok(format!("Opened '{}' in {}", path, editor)),
+        Ok(_) => Ok(format!("Opened '{}' in {}", target_local_path, editor)),
         Err(e) => {
             #[cfg(target_os = "macos")]
-            let fallback = tokio::process::Command::new("open").arg(&path).spawn();
+            let fallback = tokio::process::Command::new("open").arg(&target_local_path).spawn();
             #[cfg(target_os = "windows")]
             let fallback = tokio::process::Command::new("cmd")
                 .arg("/C")
                 .arg("start")
-                .arg(&path)
+                .arg(&target_local_path)
                 .spawn();
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-            let fallback = tokio::process::Command::new("xdg-open").arg(&path).spawn();
+            let fallback = tokio::process::Command::new("xdg-open").arg(&target_local_path).spawn();
 
             match fallback {
-                Ok(_) => Ok(format!("Opened '{}' with default editor", path)),
+                Ok(_) => Ok(format!("Opened '{}' with default editor", target_local_path)),
                 Err(fe) => Err(format!(
                     "Failed to open editor '{}': {}. Fallback error: {}",
                     editor, e, fe

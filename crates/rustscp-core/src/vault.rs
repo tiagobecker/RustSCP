@@ -323,6 +323,7 @@ mod tests {
                 username: "deployer".to_string(),
                 auth: AuthMethod::Password("SuperSecretP@ss123!".to_string()),
                 remote_root: "/var/www/html".to_string(),
+                group: Some("Production/Web".to_string()),
             },
             ConnectionConfig {
                 id: "site-2".to_string(),
@@ -333,6 +334,7 @@ mod tests {
                 username: "AKIAIOSFODNN7EXAMPLE".to_string(),
                 auth: AuthMethod::Password("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
                 remote_root: "prod-bucket".to_string(),
+                group: Some("Cloud/Storage".to_string()),
             },
             ConnectionConfig {
                 id: "site-3".to_string(),
@@ -346,6 +348,7 @@ mod tests {
                     passphrase: Some("key-passphrase-xyz".to_string()),
                 },
                 remote_root: "/root".to_string(),
+                group: None,
             },
         ]
     }

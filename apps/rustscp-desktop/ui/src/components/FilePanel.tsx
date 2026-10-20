@@ -27,13 +27,14 @@ import {
   X,
   CheckSquare,
   Square,
-  Plus
+  Plus,
+  Download
 } from 'lucide-react';
 import { FileEntry, ActionDefinition, ClipboardState } from '../types.ts';
 import { tabDragManager } from '../utils/tabDragManager.ts';
 import { FileContextMenu } from './FileContextMenu.tsx';
 
-interface FilePanelProps {
+export interface FilePanelProps {
   title: string;
   isRemote: boolean;
   sessionId: string;
@@ -45,13 +46,14 @@ interface FilePanelProps {
   clipboard?: ClipboardState | null;
   actionsCatalog?: ActionDefinition[];
   remoteTrashEnabled?: boolean;
+  isFocused?: boolean;
 
   onNavigate: (newPath: string) => void;
   onRefresh: () => void;
   onSelectFile: (path: string, multi: boolean) => void;
   onNewFolder: () => void;
   onDelete: (paths?: string[], forcePermanent?: boolean) => void;
-  onEditFile?: (file: FileEntry) => void;
+  onEditFile?: (file: FileEntry, sessionId?: string) => void;
   onShowProperties?: (file: FileEntry) => void;
   onCalculateChecksum?: (file: FileEntry) => void;
   onCalculateSize?: (file: FileEntry) => void;
@@ -74,14 +76,15 @@ interface FilePanelProps {
   onGoHome?: () => void;
   onOpenAiAssistant?: () => void;
   externalFilterText?: string;
-  onDropItems?: (sourceSessionId: string, paths: string[], destSessionId: string, destDir: string, isCopy: boolean) => void;
+  onDropItems?: (sourceSessionId: string, paths: string[], destSessionId: string, destDir: string, isCopy?: boolean) => void;
   onTransferToOtherPane?: () => void;
   onMoveToOtherPane?: () => void;
   onFocusPanel?: () => void;
-  isFocused?: boolean;
   onDropTab?: (sessionId: string, sourcePane: 'left' | 'right') => void;
   paneId?: 'left' | 'right';
   onNewSession?: () => void;
+  onRenameItem?: (sessionId: string, oldPath: string, newName: string) => Promise<void>;
+  isExternalDragOver?: boolean;
 }
 
 export const FilePanel: React.FC<FilePanelProps> = ({
@@ -131,6 +134,8 @@ export const FilePanel: React.FC<FilePanelProps> = ({
   onDropTab,
   paneId,
   onNewSession,
+  onRenameItem,
+  isExternalDragOver = false,
 }) => {
   const { t, i18n } = useTranslation();
   const isPt = i18n.language.startsWith('pt');
@@ -166,8 +171,56 @@ export const FilePanel: React.FC<FilePanelProps> = ({
     }
   }, [isEditingPath]);
 
+  // Inline rename state
+  const [renamingPath, setRenamingPath] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState<string>('');
+  const renameInputRef = useRef<HTMLInputElement>(null);
+  const lastClickedPathRef = useRef<{ path: string; time: number } | null>(null);
+  const holdTimerRef = useRef<any>(null);
+
+  const startRenaming = (path: string, currentName: string) => {
+    setRenamingPath(path);
+    setRenameValue(currentName);
+  };
+
+  useEffect(() => {
+    if (renamingPath && renameInputRef.current) {
+      renameInputRef.current.focus();
+      const lastDot = renameValue.lastIndexOf('.');
+      if (lastDot > 0) {
+        renameInputRef.current.setSelectionRange(0, lastDot);
+      } else {
+        renameInputRef.current.select();
+      }
+    }
+  }, [renamingPath]);
+
+  const handleCommitRename = async () => {
+    if (!renamingPath) return;
+    const path = renamingPath;
+    const newName = renameValue.trim();
+    setRenamingPath(null);
+
+    const oldName = path.split('/').pop()?.split('\\').pop() || '';
+    if (!newName || newName === oldName) {
+      return;
+    }
+
+    if (onRenameItem) {
+      await onRenameItem(sessionId, path, newName);
+    }
+  };
+
+  const handleCancelRename = () => {
+    setRenamingPath(null);
+  };
+
   // Drag & Drop Handlers
   const handleDragStart = (e: React.DragEvent, file: FileEntry) => {
+    if (holdTimerRef.current) {
+      clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+    }
     const paths = selectedFiles.includes(file.path) ? selectedFiles : [file.path];
     e.dataTransfer.setData(
       'application/rustscp-drag',
@@ -269,7 +322,8 @@ export const FilePanel: React.FC<FilePanelProps> = ({
       try {
         const parsed = JSON.parse(customData);
         if (onDropItems && parsed.paths && parsed.paths.length > 0) {
-          onDropItems(parsed.sourceSessionId, parsed.paths, sessionId, destDir, e.altKey);
+          const isCopyExplicit = e.altKey ? true : undefined;
+          onDropItems(parsed.sourceSessionId, parsed.paths, sessionId, destDir, isCopyExplicit);
           return;
         }
       } catch (err) {
@@ -286,7 +340,7 @@ export const FilePanel: React.FC<FilePanelProps> = ({
         if (filePath) localPaths.push(filePath);
       }
       if (onDropItems && localPaths.length > 0) {
-        onDropItems('local', localPaths, sessionId, destDir, true);
+        onDropItems('local', localPaths, sessionId, destDir, undefined);
       }
     }
   };
@@ -376,11 +430,32 @@ export const FilePanel: React.FC<FilePanelProps> = ({
         e.preventDefault();
         onMoveToOtherPane();
       }
+    } else if (e.key === 'F2') {
+      if (selectedFiles.length === 1) {
+        e.preventDefault();
+        const file = files.find((f) => f.path === selectedFiles[0]);
+        if (file) {
+          startRenaming(file.path, file.name);
+        }
+      }
+    } else if (e.key === 'Enter') {
+      if (selectedFiles.length === 1) {
+        const file = files.find((f) => f.path === selectedFiles[0]);
+        if (file) {
+          e.preventDefault();
+          if (file.file_type === 'directory') {
+            onNavigate(file.path);
+            setPathInput(file.path);
+          } else if (onEditFile) {
+            onEditFile(file, sessionId);
+          }
+        }
+      }
     } else if (e.key === 'F4') {
       if (selectedFiles.length > 0 && onEditFile) {
         e.preventDefault();
         const file = files.find((f) => f.path === selectedFiles[0]);
-        if (file && file.file_type !== 'directory') onEditFile(file);
+        if (file && file.file_type !== 'directory') onEditFile(file, sessionId);
       }
     } else if (e.key === 'F7') {
       e.preventDefault();
@@ -433,9 +508,10 @@ export const FilePanel: React.FC<FilePanelProps> = ({
     );
   };
 
+  // Helper icon renderer
   const getFileIcon = (file: FileEntry) => {
     if (file.file_type === 'directory') {
-      return <Folder className="w-4 h-4 text-amber-600 dark:text-amber-400 fill-amber-500/20 flex-shrink-0" />;
+      return <Folder className="w-4 h-4 text-amber-600 dark:text-amber-400 flex-shrink-0" />;
     }
     if (isArchiveFile(file.name)) {
       return <FileArchive className="w-4 h-4 text-purple-700 dark:text-purple-400 flex-shrink-0" />;
@@ -449,9 +525,40 @@ export const FilePanel: React.FC<FilePanelProps> = ({
 
   const handleRowClick = (e: React.MouseEvent, file: FileEntry) => {
     setContextMenu(null);
+    const now = Date.now();
+    const isAlreadySelected = selectedFiles.length === 1 && selectedFiles[0] === file.path;
+    const isSecondaryClick = !e.metaKey && !e.ctrlKey && !e.shiftKey && isAlreadySelected;
+
+    if (isSecondaryClick && lastClickedPathRef.current?.path === file.path) {
+      const elapsed = now - lastClickedPathRef.current.time;
+      if (elapsed >= 500 && elapsed <= 3000) {
+        startRenaming(file.path, file.name);
+        lastClickedPathRef.current = null;
+        return;
+      }
+    }
+
+    lastClickedPathRef.current = { path: file.path, time: now };
     onSelectFile(file.path, e.metaKey || e.ctrlKey);
     if (onFocusPanel) onFocusPanel();
     panelRef.current?.focus({ preventScroll: true });
+  };
+
+  const handleRowMouseDown = (e: React.MouseEvent, file: FileEntry) => {
+    if (e.button !== 0) return;
+    if (selectedFiles.length === 1 && selectedFiles[0] === file.path) {
+      if (holdTimerRef.current) clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = setTimeout(() => {
+        startRenaming(file.path, file.name);
+      }, 600);
+    }
+  };
+
+  const handleRowMouseUpOrLeave = () => {
+    if (holdTimerRef.current) {
+      clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+    }
   };
 
   const handleRowDoubleClick = (file: FileEntry) => {
@@ -459,7 +566,7 @@ export const FilePanel: React.FC<FilePanelProps> = ({
       onNavigate(file.path);
       setPathInput(file.path);
     } else if (onEditFile) {
-      onEditFile(file);
+      onEditFile(file, sessionId);
     }
   };
 
@@ -658,6 +765,7 @@ export const FilePanel: React.FC<FilePanelProps> = ({
   return (
     <div 
       ref={panelRef}
+      data-pane-id={paneId}
       tabIndex={0}
       onKeyDown={handleKeyDown}
       onFocus={onFocusPanel}
@@ -1006,14 +1114,29 @@ export const FilePanel: React.FC<FilePanelProps> = ({
 
       {/* File Table / Grid View */}
       <div 
-        className={`flex-1 overflow-auto transition-colors ${
-          isDragOverContainer ? 'ring-2 ring-sky-500 ring-inset bg-sky-500/5' : ''
+        className={`flex-1 overflow-auto transition-colors relative ${
+          isDragOverContainer || isExternalDragOver ? 'ring-2 ring-sky-500 ring-inset bg-sky-500/10' : ''
         }`}
         onContextMenu={handleContainerContextMenu}
         onDragOver={handleContainerDragOver}
         onDragLeave={handleContainerDragLeave}
         onDrop={handleContainerDrop}
       >
+        {isExternalDragOver && (
+          <div className="absolute inset-0 z-30 bg-sky-600/15 backdrop-blur-[2px] border-2 border-dashed border-sky-500 rounded-xl flex flex-col items-center justify-center pointer-events-none animate-in fade-in duration-150 m-2">
+            <div className="p-3.5 bg-white dark:bg-slate-900 rounded-2xl shadow-2xl border border-sky-500/40 flex items-center gap-3">
+              <Download className="w-6 h-6 text-sky-500 animate-bounce shrink-0" />
+              <div>
+                <div className="text-xs font-bold text-slate-900 dark:text-slate-100">
+                  {isPt ? 'Solte os arquivos para transferir' : 'Drop files to transfer'}
+                </div>
+                <div className="text-[10px] text-slate-500 font-mono truncate max-w-xs">
+                  {isPt ? `Enviar para: ${currentPath}` : `Upload to: ${currentPath}`}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
         {!sessionId ? (
           <div className="h-full flex flex-col items-center justify-center p-8 text-center select-none min-h-[300px]">
             <div className="w-14 h-14 rounded-2xl bg-slate-100 dark:bg-dark-850 flex items-center justify-center mb-3 border border-slate-200 dark:border-dark-700/60 shadow-xs">
@@ -1130,6 +1253,9 @@ export const FilePanel: React.FC<FilePanelProps> = ({
                           }
                         }}
                         onClick={(e) => handleRowClick(e, file)}
+                        onMouseDown={(e) => handleRowMouseDown(e, file)}
+                        onMouseUp={handleRowMouseUpOrLeave}
+                        onMouseLeave={handleRowMouseUpOrLeave}
                         onDoubleClick={() => handleRowDoubleClick(file)}
                         onContextMenu={(e) => handleRowContextMenu(e, file)}
                         className={`group p-3 rounded-xl border flex flex-col items-center text-center cursor-pointer transition-all ${
@@ -1158,9 +1284,31 @@ export const FilePanel: React.FC<FilePanelProps> = ({
                             </span>
                           )}
                         </div>
-                        <span className="text-xs text-slate-900 dark:text-slate-100 font-medium truncate w-full" title={file.name}>
-                          {file.name}
-                        </span>
+                        {renamingPath === file.path ? (
+                          <input
+                            ref={renameInputRef}
+                            type="text"
+                            value={renameValue}
+                            onClick={(e) => e.stopPropagation()}
+                            onDoubleClick={(e) => e.stopPropagation()}
+                            onChange={(e) => setRenameValue(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                e.stopPropagation();
+                                handleCommitRename();
+                              } else if (e.key === 'Escape') {
+                                e.stopPropagation();
+                                handleCancelRename();
+                              }
+                            }}
+                            onBlur={handleCommitRename}
+                            className="bg-white dark:bg-dark-900 text-slate-900 dark:text-slate-100 border border-sky-500 rounded px-1 py-0.5 text-xs font-medium outline-none shadow-sm ring-1 ring-sky-500 w-full text-center"
+                          />
+                        ) : (
+                          <span className="text-xs text-slate-900 dark:text-slate-100 font-medium truncate w-full" title={file.name}>
+                            {file.name}
+                          </span>
+                        )}
                         <span className="text-[10px] text-slate-600 dark:text-slate-400 font-mono mt-0.5">
                           {file.file_type === 'directory' ? (isPt ? 'Pasta' : 'Folder') : formatSize(file.size)}
                         </span>
@@ -1339,6 +1487,9 @@ export const FilePanel: React.FC<FilePanelProps> = ({
                         }
                       }}
                       onClick={(e) => handleRowClick(e, file)}
+                      onMouseDown={(e) => handleRowMouseDown(e, file)}
+                      onMouseUp={handleRowMouseUpOrLeave}
+                      onMouseLeave={handleRowMouseUpOrLeave}
                       onDoubleClick={() => handleRowDoubleClick(file)}
                       onContextMenu={(e) => handleRowContextMenu(e, file)}
                       className={`cursor-pointer transition-colors ${
@@ -1363,7 +1514,29 @@ export const FilePanel: React.FC<FilePanelProps> = ({
                             return (
                               <td key="name" className="py-1 px-3 flex items-center space-x-2 truncate max-w-xs">
                                 {getFileIcon(file)}
-                                <span className="truncate text-slate-900 dark:text-slate-100 font-medium">{file.name}</span>
+                                {renamingPath === file.path ? (
+                                  <input
+                                    ref={renameInputRef}
+                                    type="text"
+                                    value={renameValue}
+                                    onClick={(e) => e.stopPropagation()}
+                                    onDoubleClick={(e) => e.stopPropagation()}
+                                    onChange={(e) => setRenameValue(e.target.value)}
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'Enter') {
+                                        e.stopPropagation();
+                                        handleCommitRename();
+                                      } else if (e.key === 'Escape') {
+                                        e.stopPropagation();
+                                        handleCancelRename();
+                                      }
+                                    }}
+                                    onBlur={handleCommitRename}
+                                    className="bg-white dark:bg-dark-900 text-slate-900 dark:text-slate-100 border border-sky-500 rounded px-1.5 py-0.5 text-xs font-medium outline-none shadow-sm ring-1 ring-sky-500 w-full"
+                                  />
+                                ) : (
+                                  <span className="truncate text-slate-900 dark:text-slate-100 font-medium">{file.name}</span>
+                                )}
                                 {diffType && (
                                   <span className={`text-[9px] px-1 py-0.2 rounded font-mono font-bold uppercase shrink-0 ${
                                     diffType === 'different_size'
@@ -1452,6 +1625,7 @@ export const FilePanel: React.FC<FilePanelProps> = ({
           onCut={onCut}
           onCopy={onCopy}
           onPaste={onPaste}
+          onRename={(path, name) => startRenaming(path, name)}
           onDuplicate={onDuplicate}
           onGoHome={onGoHome}
           onOpenAiAssistant={onOpenAiAssistant}
@@ -1462,7 +1636,7 @@ export const FilePanel: React.FC<FilePanelProps> = ({
           onExecuteSmartAction={onExecuteSmartAction}
           onOpenTerminalHere={onOpenTerminalHere}
           onOpenNativeTerminalHere={onOpenNativeTerminalHere}
-          onEditFile={onEditFile}
+          onEditFile={(f) => onEditFile && onEditFile(f, sessionId)}
           onCalculateSize={onCalculateSize}
           onOpenSymlink={onOpenSymlink}
           onShowProperties={onShowProperties}
