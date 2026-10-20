@@ -94,7 +94,10 @@ impl FileMaskFilter {
 
         // If there are include rules, at least one must match
         if self.has_include {
-            return self.include_patterns.iter().any(|inc| inc.is_match(filename));
+            return self
+                .include_patterns
+                .iter()
+                .any(|inc| inc.is_match(filename));
         }
 
         true

@@ -199,7 +199,9 @@ impl S3Driver {
 
         let (cfg_bucket, cfg_prefix) = match config.bucket.as_deref().map(|b| b.trim_matches('/')) {
             Some(b) if !b.is_empty() => match b.split_once('/') {
-                Some((bucket, rest)) => (Some(bucket.to_string()), rest.trim_matches('/').to_string()),
+                Some((bucket, rest)) => {
+                    (Some(bucket.to_string()), rest.trim_matches('/').to_string())
+                }
                 None => (Some(b.to_string()), String::new()),
             },
             _ => (None, String::new()),
@@ -343,10 +345,17 @@ impl S3Driver {
     }
 
     /// Returns (scheme, authority, canonical URI path) for a request.
-    fn target(&self, bucket: &str, key: &str, region: &str) -> CoreResult<(String, String, String)> {
+    fn target(
+        &self,
+        bucket: &str,
+        key: &str,
+        region: &str,
+    ) -> CoreResult<(String, String, String)> {
         let ep = self.endpoint()?;
         if bucket.contains('/') || bucket == "." || bucket == ".." {
-            return Err(CoreError::InvalidPath(format!("invalid S3 bucket name '{bucket}'")));
+            return Err(CoreError::InvalidPath(format!(
+                "invalid S3 bucket name '{bucket}'"
+            )));
         }
         if key.split('/').any(|seg| seg == "." || seg == "..") {
             return Err(CoreError::InvalidPath(format!(
@@ -434,7 +443,10 @@ impl S3Driver {
                 );
             }
 
-            let mut builder = self.client.request(req.method.clone(), url).headers(headers);
+            let mut builder = self
+                .client
+                .request(req.method.clone(), url)
+                .headers(headers);
             if has_body {
                 builder = builder.body(req.body.clone());
             }
@@ -545,11 +557,17 @@ impl S3Driver {
 
     /// True when at least one object exists under `key/`.
     async fn prefix_exists(&self, bucket: &str, key: &str) -> CoreResult<bool> {
-        let page = self.list_page(bucket, &dir_prefix(key), false, None, 1).await?;
+        let page = self
+            .list_page(bucket, &dir_prefix(key), false, None, 1)
+            .await?;
         Ok(!page.objects.is_empty() || !page.prefixes.is_empty())
     }
 
-    async fn head_object(&self, bucket: &str, key: &str) -> CoreResult<(u64, Option<DateTime<Utc>>)> {
+    async fn head_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> CoreResult<(u64, Option<DateTime<Utc>>)> {
         let req = S3Request::new(Method::HEAD, bucket, key);
         let res = self.send_raw(&req).await?;
         let status = res.status();
@@ -573,7 +591,8 @@ impl S3Driver {
     }
 
     async fn delete_object(&self, bucket: &str, key: &str) -> CoreResult<()> {
-        self.send(S3Request::new(Method::DELETE, bucket, key)).await?;
+        self.send(S3Request::new(Method::DELETE, bucket, key))
+            .await?;
         Ok(())
     }
 
@@ -670,7 +689,10 @@ impl S3Driver {
                     .query("partNumber", part_number.to_string())
                     .query("uploadId", upload_id)
                     .header("x-amz-copy-source", copy_source)
-                    .header("x-amz-copy-source-range", format!("bytes={}-{}", range.0, range.1)),
+                    .header(
+                        "x-amz-copy-source-range",
+                        format!("bytes={}-{}", range.0, range.1),
+                    ),
             )
             .await?;
         let text = res.text().await.map_err(map_reqwest_error)?;
@@ -679,7 +701,9 @@ impl S3Driver {
             .map(|e| e.trim().to_string())
             .filter(|e| !e.is_empty())
             .ok_or_else(|| {
-                CoreError::Protocol(format!("S3 did not return an ETag for copied part {part_number}"))
+                CoreError::Protocol(format!(
+                    "S3 did not return an ETag for copied part {part_number}"
+                ))
             })
     }
 
@@ -724,8 +748,14 @@ impl S3Driver {
     async fn multipart_upload(&self, bucket: &str, key: &str, data: Bytes) -> CoreResult<()> {
         let part_size = part_size_for(data.len());
         let upload_id = self.create_multipart(bucket, key).await?;
-        let result = match self.upload_parts(bucket, key, &upload_id, &data, part_size).await {
-            Ok(parts) => self.complete_multipart(bucket, key, &upload_id, &parts).await,
+        let result = match self
+            .upload_parts(bucket, key, &upload_id, &data, part_size)
+            .await
+        {
+            Ok(parts) => {
+                self.complete_multipart(bucket, key, &upload_id, &parts)
+                    .await
+            }
             Err(e) => Err(e),
         };
         if result.is_err() {
@@ -759,7 +789,10 @@ impl S3Driver {
                     part_number,
                 );
                 set.spawn(async move {
-                    driver.upload_part(&b, &k, &u, n, chunk).await.map(|etag| (n, etag))
+                    driver
+                        .upload_part(&b, &k, &u, n, chunk)
+                        .await
+                        .map(|etag| (n, etag))
                 });
                 offset = end;
                 part_number += 1;
@@ -795,10 +828,17 @@ impl S3Driver {
         dst_key: &str,
         size: u64,
     ) -> CoreResult<()> {
-        let source = format!("/{}/{}", uri_encode(src_bucket, true), uri_encode(src_key, false));
+        let source = format!(
+            "/{}/{}",
+            uri_encode(src_bucket, true),
+            uri_encode(src_key, false)
+        );
         if size <= MAX_SINGLE_COPY {
             let res = self
-                .send(S3Request::new(Method::PUT, dst_bucket, dst_key).header("x-amz-copy-source", source))
+                .send(
+                    S3Request::new(Method::PUT, dst_bucket, dst_key)
+                        .header("x-amz-copy-source", source),
+                )
                 .await?;
             // CopyObject can fail after sending 200 OK.
             let text = res.text().await.map_err(map_reqwest_error)?;
@@ -814,7 +854,14 @@ impl S3Driver {
         while start < size {
             let end = (start + part_size).min(size) - 1;
             match self
-                .upload_part_copy(dst_bucket, dst_key, &upload_id, number, &source, (start, end))
+                .upload_part_copy(
+                    dst_bucket,
+                    dst_key,
+                    &upload_id,
+                    number,
+                    &source,
+                    (start, end),
+                )
                 .await
             {
                 Ok(etag) => parts.push((number, etag)),
@@ -827,7 +874,9 @@ impl S3Driver {
             number += 1;
         }
         if result.is_ok() {
-            result = self.complete_multipart(dst_bucket, dst_key, &upload_id, &parts).await;
+            result = self
+                .complete_multipart(dst_bucket, dst_key, &upload_id, &parts)
+                .await;
         }
         if result.is_err() {
             self.abort_multipart(dst_bucket, dst_key, &upload_id).await;
@@ -839,7 +888,9 @@ impl S3Driver {
         let mut total = 0u64;
         let mut token: Option<String> = None;
         loop {
-            let page = self.list_page(bucket, prefix, false, token.as_deref(), 1000).await?;
+            let page = self
+                .list_page(bucket, prefix, false, token.as_deref(), 1000)
+                .await?;
             total = page
                 .objects
                 .iter()
@@ -990,7 +1041,10 @@ impl VirtualFileSystem for S3Driver {
             if name.is_empty() || name.contains('/') {
                 continue;
             }
-            entries.push(dir_entry(name, entry_path(&bucket, p.trim_end_matches('/'))));
+            entries.push(dir_entry(
+                name,
+                entry_path(&bucket, p.trim_end_matches('/')),
+            ));
         }
 
         for obj in &listing.objects {
@@ -1067,7 +1121,9 @@ impl VirtualFileSystem for S3Driver {
     async fn read_file(&self, path: &str) -> CoreResult<Bytes> {
         let (bucket, key) = self.split_path(path);
         require_object(&bucket, &key, path)?;
-        let res = self.send(S3Request::new(Method::GET, &bucket, &key)).await?;
+        let res = self
+            .send(S3Request::new(Method::GET, &bucket, &key))
+            .await?;
         res.bytes().await.map_err(map_reqwest_error)
     }
 
@@ -1080,7 +1136,8 @@ impl VirtualFileSystem for S3Driver {
         let end = offset
             .checked_add(length - 1)
             .ok_or_else(|| CoreError::InvalidPath(format!("invalid range {offset}+{length}")))?;
-        let req = S3Request::new(Method::GET, &bucket, &key).header("range", format!("bytes={offset}-{end}"));
+        let req = S3Request::new(Method::GET, &bucket, &key)
+            .header("range", format!("bytes={offset}-{end}"));
         let res = self.send_raw(&req).await?;
         match res.status().as_u16() {
             206 => {
@@ -1140,7 +1197,8 @@ impl VirtualFileSystem for S3Driver {
         }
         // Parents are implicit in S3: only the marker object is needed.
         let marker = dir_prefix(&key);
-        self.send(S3Request::new(Method::PUT, &bucket, &marker)).await?;
+        self.send(S3Request::new(Method::PUT, &bucket, &marker))
+            .await?;
         Ok(())
     }
 
@@ -1351,9 +1409,12 @@ impl VirtualFileSystem for S3Driver {
         let needle = query.contains_text.as_deref().filter(|t| !t.is_empty());
         let Some(needle) = needle else {
             return Ok(self
-                .walk_matching(&query.base_path, query.max_depth, query.max_results, |n, d| {
-                    mask.matches(n, d)
-                })
+                .walk_matching(
+                    &query.base_path,
+                    query.max_depth,
+                    query.max_results,
+                    |n, d| mask.matches(n, d),
+                )
                 .await?
                 .into_iter()
                 .map(|entry| FindFileMatch {
@@ -1610,9 +1671,11 @@ fn is_virtual_host_suffix(rest: &str) -> bool {
 fn looks_like_region(s: &str) -> bool {
     let parts: Vec<&str> = s.split('-').collect();
     parts.len() >= 3
-        && parts
-            .iter()
-            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        })
         && parts[0].len() == 2
         && parts[0].bytes().all(|b| b.is_ascii_lowercase())
         && parts
@@ -1671,7 +1734,9 @@ fn uri_encode(input: &str, encode_slash: bool) -> String {
     let mut out = String::with_capacity(input.len() * 3 / 2);
     for &b in input.as_bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             b'/' if !encode_slash => out.push('/'),
             _ => {
                 let _ = write!(out, "%{b:02X}");
@@ -1727,7 +1792,10 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
 }
 
 fn signing_key(secret_key: &str, date_stamp: &str, region: &str, service: &str) -> Vec<u8> {
-    let k_date = hmac_sha256(format!("AWS4{secret_key}").as_bytes(), date_stamp.as_bytes());
+    let k_date = hmac_sha256(
+        format!("AWS4{secret_key}").as_bytes(),
+        date_stamp.as_bytes(),
+    );
     let k_region = hmac_sha256(&k_date, region.as_bytes());
     let k_service = hmac_sha256(&k_region, service.as_bytes());
     hmac_sha256(&k_service, b"aws4_request")
@@ -1754,8 +1822,13 @@ fn sigv4_authorization(
         "{date_stamp}/{}/{}/aws4_request",
         params.region, params.service
     );
-    let (creq, signed_headers) =
-        canonical_request(method, canonical_uri, canonical_query, headers, payload_hash);
+    let (creq, signed_headers) = canonical_request(
+        method,
+        canonical_uri,
+        canonical_query,
+        headers,
+        payload_hash,
+    );
     let sts = string_to_sign(params.amz_date, &scope, &creq);
     let key = signing_key(params.secret_key, date_stamp, params.region, params.service);
     let signature = hex_encode(hmac_sha256(&key, sts.as_bytes()));
@@ -1845,10 +1918,17 @@ fn s3_error(status: StatusCode, body: &str, context: &str) -> CoreError {
     let _ = write!(detail, " ({context})");
 
     match code.as_deref() {
-        Some("NoSuchKey" | "NoSuchBucket" | "NoSuchUpload" | "NotFound") => CoreError::NotFound(detail),
+        Some("NoSuchKey" | "NoSuchBucket" | "NoSuchUpload" | "NotFound") => {
+            CoreError::NotFound(detail)
+        }
         Some(
-            "InvalidAccessKeyId" | "SignatureDoesNotMatch" | "AuthorizationHeaderMalformed"
-            | "ExpiredToken" | "InvalidToken" | "TokenRefreshRequired" | "InvalidSecurity",
+            "InvalidAccessKeyId"
+            | "SignatureDoesNotMatch"
+            | "AuthorizationHeaderMalformed"
+            | "ExpiredToken"
+            | "InvalidToken"
+            | "TokenRefreshRequired"
+            | "InvalidSecurity",
         ) => CoreError::AuthFailed(detail),
         Some("AccessDenied" | "AllAccessDisabled" | "AccountProblem") => {
             CoreError::PermissionDenied(detail)
@@ -1950,7 +2030,10 @@ fn xml_unescape(s: &str) -> String {
                 "quot" => Some('"'),
                 "apos" => Some('\''),
                 _ => {
-                    if let Some(hex) = entity.strip_prefix("#x").or_else(|| entity.strip_prefix("#X")) {
+                    if let Some(hex) = entity
+                        .strip_prefix("#x")
+                        .or_else(|| entity.strip_prefix("#X"))
+                    {
                         u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
                     } else if let Some(dec) = entity.strip_prefix('#') {
                         dec.parse::<u32>().ok().and_then(char::from_u32)
@@ -2263,17 +2346,36 @@ mod tests {
 
     #[test]
     fn region_is_derived_from_endpoint() {
-        let region = |endpoint: &str| derive_region("us-east-1", &parse_endpoint(endpoint).unwrap());
+        let region =
+            |endpoint: &str| derive_region("us-east-1", &parse_endpoint(endpoint).unwrap());
         assert_eq!(region("https://s3.eu-west-1.amazonaws.com"), "eu-west-1");
-        assert_eq!(region("https://my-bucket.s3.ap-southeast-2.amazonaws.com"), "ap-southeast-2");
-        assert_eq!(region("https://my.dotted.bucket.s3.us-west-2.amazonaws.com"), "us-west-2");
+        assert_eq!(
+            region("https://my-bucket.s3.ap-southeast-2.amazonaws.com"),
+            "ap-southeast-2"
+        );
+        assert_eq!(
+            region("https://my.dotted.bucket.s3.us-west-2.amazonaws.com"),
+            "us-west-2"
+        );
         assert_eq!(region("https://s3-us-west-1.amazonaws.com"), "us-west-1");
-        assert_eq!(region("https://s3.dualstack.eu-central-1.amazonaws.com"), "eu-central-1");
-        assert_eq!(region("https://s3.cn-north-1.amazonaws.com.cn"), "cn-north-1");
+        assert_eq!(
+            region("https://s3.dualstack.eu-central-1.amazonaws.com"),
+            "eu-central-1"
+        );
+        assert_eq!(
+            region("https://s3.cn-north-1.amazonaws.com.cn"),
+            "cn-north-1"
+        );
         assert_eq!(region("https://s3.amazonaws.com"), "us-east-1");
         assert_eq!(region("https://abc123.r2.cloudflarestorage.com"), "auto");
-        assert_eq!(region("https://s3.eu-central-1.wasabisys.com"), "eu-central-1");
-        assert_eq!(region("https://s3.us-west-004.backblazeb2.com"), "us-west-004");
+        assert_eq!(
+            region("https://s3.eu-central-1.wasabisys.com"),
+            "eu-central-1"
+        );
+        assert_eq!(
+            region("https://s3.us-west-004.backblazeb2.com"),
+            "us-west-004"
+        );
         assert_eq!(region("http://127.0.0.1:9000"), "us-east-1");
         assert_eq!(region("https://minio.example.com"), "us-east-1");
         // An explicit non-default region wins.
@@ -2373,9 +2475,15 @@ mod tests {
         assert_eq!(d.split_path(&folder), ("my-bucket".into(), "photos".into()));
         assert_eq!(dir_prefix(&d.split_path(&folder).1), "photos/");
         let file = entry_path("my-bucket", "photos/2024/a.jpg");
-        assert_eq!(d.split_path(&file), ("my-bucket".into(), "photos/2024/a.jpg".into()));
+        assert_eq!(
+            d.split_path(&file),
+            ("my-bucket".into(), "photos/2024/a.jpg".into())
+        );
         // A path without the bucket prefix is relative to the bucket.
-        assert_eq!(d.split_path("/docs/x"), ("my-bucket".into(), "docs/x".into()));
+        assert_eq!(
+            d.split_path("/docs/x"),
+            ("my-bucket".into(), "docs/x".into())
+        );
     }
 
     #[test]
@@ -2387,7 +2495,10 @@ mod tests {
             .block_on(d.get_default_path())
             .unwrap();
         assert_eq!(default_path, "/data/projects/2024");
-        assert_eq!(d.split_path(&default_path), ("data".into(), "projects/2024".into()));
+        assert_eq!(
+            d.split_path(&default_path),
+            ("data".into(), "projects/2024".into())
+        );
     }
 
     #[test]
@@ -2477,19 +2588,36 @@ mod tests {
             CoreError::NotFound(_)
         ));
         assert!(matches!(
-            s3_error(StatusCode::INTERNAL_SERVER_ERROR, "<html>oops</html>", "GET"),
+            s3_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "<html>oops</html>",
+                "GET"
+            ),
             CoreError::Protocol(_)
         ));
         assert!(check_embedded_error(denied, "CopyObject").is_err());
-        assert!(check_embedded_error("<CopyObjectResult><ETag>x</ETag></CopyObjectResult>", "CopyObject").is_ok());
+        assert!(check_embedded_error(
+            "<CopyObjectResult><ETag>x</ETag></CopyObjectResult>",
+            "CopyObject"
+        )
+        .is_ok());
     }
 
     #[test]
     fn xml_helpers() {
-        assert_eq!(xml_unescape("&lt;a&gt; &amp; &#38; &#x26; &quot;&apos; &bogus; &"), "<a> & & & \"' &bogus; &");
+        assert_eq!(
+            xml_unescape("&lt;a&gt; &amp; &#38; &#x26; &quot;&apos; &bogus; &"),
+            "<a> & & & \"' &bogus; &"
+        );
         assert_eq!(xml_escape("<a&\"b\">"), "&lt;a&amp;&quot;b&quot;&gt;");
-        assert_eq!(xml_first("<KeyCount>2</KeyCount><Key>k</Key>", "Key").as_deref(), Some("k"));
-        assert_eq!(xml_blocks("<Prefix/><Prefix>x</Prefix>", "Prefix"), vec!["", "x"]);
+        assert_eq!(
+            xml_first("<KeyCount>2</KeyCount><Key>k</Key>", "Key").as_deref(),
+            Some("k")
+        );
+        assert_eq!(
+            xml_blocks("<Prefix/><Prefix>x</Prefix>", "Prefix"),
+            vec!["", "x"]
+        );
         assert_eq!(url_decode_plus("a+b%2Bc%zz%C3%A9"), "a b+c%zzé");
     }
 
@@ -2506,7 +2634,10 @@ mod tests {
     fn grep_content_formats_lines_and_skips_binary() {
         let lines = grep_content(b"alpha\nBeta gamma\nbeta\n", "beta", false);
         assert_eq!(lines, vec!["Line 2: Beta gamma", "Line 3: beta"]);
-        assert_eq!(grep_content(b"alpha\nBeta\n", "beta", true), Vec::<String>::new());
+        assert_eq!(
+            grep_content(b"alpha\nBeta\n", "beta", true),
+            Vec::<String>::new()
+        );
         assert!(grep_content(b"beta\0binary", "beta", false).is_empty());
     }
 

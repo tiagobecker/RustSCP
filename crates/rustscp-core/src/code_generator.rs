@@ -219,21 +219,37 @@ impl CodeGenerator {
                             .unwrap_or("us-east-1");
                         (
                             format!("https://{host}:{port}{encoded_path}"),
-                            format!(" --aws-sigv4 {}", posix_shell_quote(&format!("aws:amz:{region}:s3"))),
+                            format!(
+                                " --aws-sigv4 {}",
+                                posix_shell_quote(&format!("aws:amz:{region}:s3"))
+                            ),
                         )
                     }
-                    Protocol::WebDav => (format!("https://{host}:{port}{encoded_path}"), String::new()),
-                    _ => (format!("{scheme}://{host}:{port}{encoded_path}"), String::new()),
+                    Protocol::WebDav => (
+                        format!("https://{host}:{port}{encoded_path}"),
+                        String::new(),
+                    ),
+                    _ => (
+                        format!("{scheme}://{host}:{port}{encoded_path}"),
+                        String::new(),
+                    ),
                 };
                 let auth = match key_path {
                     Some(k) => {
-                        let mut s = format!(" --user {} --key {}", posix_shell_quote(user), posix_shell_quote(k));
+                        let mut s = format!(
+                            " --user {} --key {}",
+                            posix_shell_quote(user),
+                            posix_shell_quote(k)
+                        );
                         if has_passphrase {
                             s.push_str(&format!(" --pass \"${PASSPHRASE_ENV_VAR}\""));
                         }
                         s
                     }
-                    None => format!(" --user {}:\"${PASSWORD_ENV_VAR}\"", posix_shell_quote(user)),
+                    None => format!(
+                        " --user {}:\"${PASSWORD_ENV_VAR}\"",
+                        posix_shell_quote(user)
+                    ),
                 };
                 format!(
                     "# The password is read from ${PASSWORD_ENV_VAR}; it is not stored here.\n\
@@ -384,7 +400,10 @@ mod tests {
             for lang in ALL {
                 let out = CodeGenerator::generate(cfg, lang, "/var/www/a b.txt", "/tmp/out");
                 assert!(!out.contains(SECRET), "{lang:?} leaked the secret:\n{out}");
-                assert!(!out.contains("S3cr3t"), "{lang:?} leaked part of the secret");
+                assert!(
+                    !out.contains("S3cr3t"),
+                    "{lang:?} leaked part of the secret"
+                );
                 assert!(!out.contains("AutoAddPolicy"));
                 assert!(!out.contains("-hostkey=\"*\""));
             }
@@ -404,7 +423,10 @@ mod tests {
     fn test_url_is_percent_encoded_and_uses_protocol_port() {
         let cfg = config(AuthMethod::Password(SECRET.into()), Protocol::Sftp);
         let url = CodeGenerator::generate(&cfg, CodeTargetLanguage::WinScpUrl, "var/www/a b#1", "");
-        assert_eq!(url, "sftp://deploy%40corp@srv.example.com:22/var/www/a%20b%231");
+        assert_eq!(
+            url,
+            "sftp://deploy%40corp@srv.example.com:22/var/www/a%20b%231"
+        );
 
         let ftp = config(AuthMethod::None, Protocol::Ftp);
         let url = CodeGenerator::generate(&ftp, CodeTargetLanguage::WinScpUrl, "/", "");
@@ -421,10 +443,16 @@ mod tests {
             "/tmp/my dir",
         );
         assert!(rsync.contains("'/tmp/my dir/'"), "{rsync}");
-        assert!(rsync.contains("'deploy@corp@srv.example.com:/srv/it'\\''s here'"), "{rsync}");
+        assert!(
+            rsync.contains("'deploy@corp@srv.example.com:/srv/it'\\''s here'"),
+            "{rsync}"
+        );
 
         let curl = CodeGenerator::generate(&cfg, CodeTargetLanguage::Curl, "/a;b", "/tmp");
-        assert!(curl.contains("--user 'deploy@corp':\"$RUSTSCP_PASSWORD\""), "{curl}");
+        assert!(
+            curl.contains("--user 'deploy@corp':\"$RUSTSCP_PASSWORD\""),
+            "{curl}"
+        );
         assert!(curl.contains("'sftp://srv.example.com:22/a%3Bb'"), "{curl}");
 
         let py = CodeGenerator::generate(&cfg, CodeTargetLanguage::Python, "/it's", "/tmp");
@@ -432,12 +460,18 @@ mod tests {
         assert!(py.contains("os.environ['RUSTSCP_PASSWORD']"));
         assert!(py.contains("RejectPolicy"));
 
-        let cs = CodeGenerator::generate(&cfg, CodeTargetLanguage::DotNetCSharp, "/say \"hi\"", "C:\\out");
+        let cs = CodeGenerator::generate(
+            &cfg,
+            CodeTargetLanguage::DotNetCSharp,
+            "/say \"hi\"",
+            "C:\\out",
+        );
         assert!(cs.contains("@\"/say \"\"hi\"\"\""), "{cs}");
         assert!(cs.contains("@\"C:\\out\\say \"\"hi\"\"\""), "{cs}");
         assert!(cs.contains("GetEnvironmentVariable(\"RUSTSCP_PASSWORD\")"));
 
-        let script = CodeGenerator::generate(&cfg, CodeTargetLanguage::WinScpScript, "/x \"y\"", "C:\\dl");
+        let script =
+            CodeGenerator::generate(&cfg, CodeTargetLanguage::WinScpScript, "/x \"y\"", "C:\\dl");
         assert!(script.contains("cd \"/x \"\"y\"\"\""), "{script}");
         assert!(script.contains("-password=\"%RUSTSCP_PASSWORD%\""));
     }

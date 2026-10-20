@@ -155,8 +155,7 @@ impl ChunkCacheManager {
         }
         lock.total_bytes += size;
 
-        while lock.map.len() > self.max_memory_chunks || lock.total_bytes > self.max_memory_bytes
-        {
+        while lock.map.len() > self.max_memory_chunks || lock.total_bytes > self.max_memory_bytes {
             let victim = lock
                 .map
                 .iter()
@@ -175,8 +174,7 @@ impl ChunkCacheManager {
 
         // The new chunk itself is clean and still does not fit: do not keep it.
         if !dirty
-            && (lock.map.len() > self.max_memory_chunks
-                || lock.total_bytes > self.max_memory_bytes)
+            && (lock.map.len() > self.max_memory_chunks || lock.total_bytes > self.max_memory_bytes)
         {
             if let Some(e) = lock.map.remove(&key) {
                 lock.total_bytes = lock.total_bytes.saturating_sub(e.chunk.data.len());
@@ -275,7 +273,10 @@ mod tests {
         }
         // Touch chunk 0 so chunk 1 is the least recently used.
         assert!(m.get_chunk(&key(0)).await.is_some());
-        assert!(m.put_chunk_checked(key(3), Bytes::from(vec![0u8; 10]), false).await);
+        assert!(
+            m.put_chunk_checked(key(3), Bytes::from(vec![0u8; 10]), false)
+                .await
+        );
         assert!(m.get_chunk(&key(1)).await.is_none());
         assert!(m.get_chunk(&key(0)).await.is_some());
         assert_eq!(m.memory_usage().await, (3, 30));
@@ -291,9 +292,18 @@ mod tests {
     #[tokio::test]
     async fn test_dirty_chunks_are_never_evicted_and_report_over_budget() {
         let m = ChunkCacheManager::with_memory_budget(10, 100, 20);
-        assert!(m.put_chunk_checked(key(0), Bytes::from(vec![0u8; 10]), true).await);
-        assert!(m.put_chunk_checked(key(1), Bytes::from(vec![0u8; 10]), true).await);
-        assert!(!m.put_chunk_checked(key(2), Bytes::from(vec![0u8; 10]), true).await);
+        assert!(
+            m.put_chunk_checked(key(0), Bytes::from(vec![0u8; 10]), true)
+                .await
+        );
+        assert!(
+            m.put_chunk_checked(key(1), Bytes::from(vec![0u8; 10]), true)
+                .await
+        );
+        assert!(
+            !m.put_chunk_checked(key(2), Bytes::from(vec![0u8; 10]), true)
+                .await
+        );
         assert!(m.is_over_budget().await);
         assert_eq!(m.get_dirty_chunks().await.len(), 3);
 

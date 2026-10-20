@@ -119,8 +119,7 @@ pub fn normalize_remote_path(path: &str) -> String {
 /// (`/...`) and home paths (`~`, `~/...`) are kept, relative ones are joined to `cwd`;
 /// the result is normalized.
 pub fn resolve_remote_path(cwd: &str, arg: &str) -> String {
-    let joined = if arg.starts_with('/') || arg == "~" || arg.starts_with("~/") || cwd.is_empty()
-    {
+    let joined = if arg.starts_with('/') || arg == "~" || arg.starts_with("~/") || cwd.is_empty() {
         arg.to_string()
     } else {
         format!("{}/{}", cwd.trim_end_matches('/'), arg)
@@ -422,7 +421,10 @@ impl ScriptInterpreter {
                 };
                 let len = data.len();
                 match local_vfs.write_file(&local, data).await {
-                    Ok(_) => (true, format!("Downloaded {} -> {} ({} bytes)", remote, local, len)),
+                    Ok(_) => (
+                        true,
+                        format!("Downloaded {} -> {} ({} bytes)", remote, local, len),
+                    ),
                     Err(e) => (false, format!("Could not write {}: {}", local, e)),
                 }
             }
@@ -441,7 +443,9 @@ impl ScriptInterpreter {
                     return (false, format!("Not a file name: {}", local));
                 };
                 match local_vfs.metadata(&local).await {
-                    Ok(meta) if meta.is_dir() => return (false, format!("{} is a directory", local)),
+                    Ok(meta) if meta.is_dir() => {
+                        return (false, format!("{} is a directory", local))
+                    }
                     Ok(meta) if meta.size > MAX_SCRIPT_TRANSFER_BYTES => {
                         return (
                             false,
@@ -471,7 +475,10 @@ impl ScriptInterpreter {
                 };
                 let len = data.len();
                 match rvfs.write_file(&remote, data).await {
-                    Ok(_) => (true, format!("Uploaded {} -> {} ({} bytes)", local, remote, len)),
+                    Ok(_) => (
+                        true,
+                        format!("Uploaded {} -> {} ({} bytes)", local, remote, len),
+                    ),
                     Err(e) => (false, format!("Upload failed: {}", e)),
                 }
             }
@@ -521,7 +528,10 @@ mod tests {
     fn test_remote_path_resolution() {
         assert_eq!(resolve_remote_path("/a/b", ".."), "/a");
         assert_eq!(resolve_remote_path("/a/b", "../../.."), "/");
-        assert_eq!(resolve_remote_path("/a/b", "/var/www/old.txt"), "/var/www/old.txt");
+        assert_eq!(
+            resolve_remote_path("/a/b", "/var/www/old.txt"),
+            "/var/www/old.txt"
+        );
         assert_eq!(resolve_remote_path("/a/b", "./c//d/"), "/a/b/c/d");
         assert_eq!(resolve_remote_path("/", "x"), "/x");
         assert_eq!(resolve_remote_path("~", "x/../y"), "~/y");
@@ -539,7 +549,12 @@ mod tests {
         assert_eq!(resolve_local_path("/a/b", "./c/../d"), "/a/b/d");
     }
 
-    fn setup() -> (tempfile::TempDir, Arc<dyn VirtualFileSystem>, String, String) {
+    fn setup() -> (
+        tempfile::TempDir,
+        Arc<dyn VirtualFileSystem>,
+        String,
+        String,
+    ) {
         let tmp = tempfile::tempdir().unwrap();
         let local = tmp.path().join("local");
         let remote = tmp.path().join("remote");
@@ -590,15 +605,28 @@ mod tests {
         let start_r = r.clone();
         let start_l = l.clone();
 
-        let out =
-            ScriptInterpreter::execute_line("cd docs", vfs.clone(), Some(vfs.clone()), &mut l, &mut r)
-                .await;
+        let out = ScriptInterpreter::execute_line(
+            "cd docs",
+            vfs.clone(),
+            Some(vfs.clone()),
+            &mut l,
+            &mut r,
+        )
+        .await;
         assert!(out.success);
-        assert_eq!(out.remote_dir.as_deref(), Some(format!("{start_r}/docs").as_str()));
+        assert_eq!(
+            out.remote_dir.as_deref(),
+            Some(format!("{start_r}/docs").as_str())
+        );
 
-        let out =
-            ScriptInterpreter::execute_line("cd ..", vfs.clone(), Some(vfs.clone()), &mut l, &mut r)
-                .await;
+        let out = ScriptInterpreter::execute_line(
+            "cd ..",
+            vfs.clone(),
+            Some(vfs.clone()),
+            &mut l,
+            &mut r,
+        )
+        .await;
         assert_eq!(out.remote_dir.as_deref(), Some(start_r.as_str()));
         assert_eq!(r, start_r);
 
@@ -607,14 +635,15 @@ mod tests {
         assert!(out.success, "{}", out.output);
         assert_eq!(out.local_dir.as_deref(), Some(start_l.as_str()));
 
-        let out = ScriptInterpreter::execute_line("lcd nope", vfs.clone(), None, &mut l, &mut r)
-            .await;
+        let out =
+            ScriptInterpreter::execute_line("lcd nope", vfs.clone(), None, &mut l, &mut r).await;
         assert!(!out.success);
         assert_eq!(l, start_l, "failed lcd keeps the old directory");
         assert_eq!(out.local_dir.as_deref(), Some(start_l.as_str()));
 
         // Comments and errors still report the working dirs.
-        let out = ScriptInterpreter::execute_line("# note", vfs.clone(), None, &mut l, &mut r).await;
+        let out =
+            ScriptInterpreter::execute_line("# note", vfs.clone(), None, &mut l, &mut r).await;
         assert!(out.success);
         assert_eq!(out.remote_dir.as_deref(), Some(start_r.as_str()));
     }
@@ -624,9 +653,14 @@ mod tests {
         let (_tmp, vfs, mut l, mut r) = setup();
         let rv = Some(vfs.clone());
 
-        let out =
-            ScriptInterpreter::execute_line("mkdir \"new dir\"", vfs.clone(), rv.clone(), &mut l, &mut r)
-                .await;
+        let out = ScriptInterpreter::execute_line(
+            "mkdir \"new dir\"",
+            vfs.clone(),
+            rv.clone(),
+            &mut l,
+            &mut r,
+        )
+        .await;
         assert!(out.success, "{}", out.output);
         assert!(std::path::Path::new(&format!("{r}/new dir")).is_dir());
 
@@ -645,8 +679,9 @@ mod tests {
         assert!(!std::path::Path::new(&abs).exists());
 
         std::fs::write(format!("{r}/docs/readme.md"), "hello").unwrap();
-        let out = ScriptInterpreter::execute_line("ls docs", vfs.clone(), rv.clone(), &mut l, &mut r)
-            .await;
+        let out =
+            ScriptInterpreter::execute_line("ls docs", vfs.clone(), rv.clone(), &mut l, &mut r)
+                .await;
         assert!(out.success, "{}", out.output);
         assert!(out.output.contains("readme.md"));
 
@@ -659,22 +694,39 @@ mod tests {
         )
         .await;
         assert!(out.success, "{}", out.output);
-        assert_eq!(std::fs::read_to_string(format!("{l}/readme.md")).unwrap(), "hello");
+        assert_eq!(
+            std::fs::read_to_string(format!("{l}/readme.md")).unwrap(),
+            "hello"
+        );
 
-        let out =
-            ScriptInterpreter::execute_line("get docs/readme.md sub", vfs.clone(), rv.clone(), &mut l, &mut r)
-                .await;
+        let out = ScriptInterpreter::execute_line(
+            "get docs/readme.md sub",
+            vfs.clone(),
+            rv.clone(),
+            &mut l,
+            &mut r,
+        )
+        .await;
         assert!(out.success, "{}", out.output);
         assert!(std::path::Path::new(&format!("{l}/sub/readme.md")).exists());
 
         std::fs::write(format!("{l}/up.txt"), "up").unwrap();
-        let out =
-            ScriptInterpreter::execute_line("put up.txt docs", vfs.clone(), rv.clone(), &mut l, &mut r)
-                .await;
+        let out = ScriptInterpreter::execute_line(
+            "put up.txt docs",
+            vfs.clone(),
+            rv.clone(),
+            &mut l,
+            &mut r,
+        )
+        .await;
         assert!(out.success, "{}", out.output);
-        assert_eq!(std::fs::read_to_string(format!("{r}/docs/up.txt")).unwrap(), "up");
+        assert_eq!(
+            std::fs::read_to_string(format!("{r}/docs/up.txt")).unwrap(),
+            "up"
+        );
 
-        let out = ScriptInterpreter::execute_line("get", vfs.clone(), rv.clone(), &mut l, &mut r).await;
+        let out =
+            ScriptInterpreter::execute_line("get", vfs.clone(), rv.clone(), &mut l, &mut r).await;
         assert!(!out.success);
 
         let out = ScriptInterpreter::execute_line("help", vfs.clone(), None, &mut l, &mut r).await;

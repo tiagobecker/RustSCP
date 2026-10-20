@@ -112,7 +112,10 @@ impl Reply {
 #[derive(Debug)]
 enum FtpError {
     /// The server answered with an unexpected reply.
-    Reply { context: String, reply: Reply },
+    Reply {
+        context: String,
+        reply: Reply,
+    },
     Core(CoreError),
 }
 
@@ -152,7 +155,13 @@ fn reply_to_core(context: &str, reply: &Reply) -> CoreError {
         530 | 532 => CoreError::AuthFailed(detail),
         421 => CoreError::ConnectionFailed(detail),
         450 | 550 | 553 => {
-            if has(&["permission", "denied", "not allowed", "access is", "access to"]) {
+            if has(&[
+                "permission",
+                "denied",
+                "not allowed",
+                "access is",
+                "access to",
+            ]) {
                 CoreError::PermissionDenied(detail)
             } else if has(&[
                 "no such",
@@ -190,7 +199,10 @@ fn describe(verb: &str, arg: Option<&str>) -> String {
 /// One reply line without its line terminator.
 fn read_line<R: BufRead>(r: &mut R) -> io::Result<String> {
     let mut buf = Vec::new();
-    let n = r.by_ref().take(MAX_LINE_BYTES).read_until(b'\n', &mut buf)?;
+    let n = r
+        .by_ref()
+        .take(MAX_LINE_BYTES)
+        .read_until(b'\n', &mut buf)?;
     if n == 0 {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -199,7 +211,10 @@ fn read_line<R: BufRead>(r: &mut R) -> io::Result<String> {
     }
     if buf.last() != Some(&b'\n') {
         if n as u64 >= MAX_LINE_BYTES {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "reply line too long"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "reply line too long",
+            ));
         }
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -229,7 +244,10 @@ pub(crate) fn read_ftp_reply<R: BufRead>(r: &mut R) -> io::Result<Reply> {
     let code = parse_reply_code(&first).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("malformed reply {:?}", first.chars().take(80).collect::<String>()),
+            format!(
+                "malformed reply {:?}",
+                first.chars().take(80).collect::<String>()
+            ),
         )
     })?;
     let multiline = first.as_bytes().get(3) == Some(&b'-');
@@ -245,7 +263,10 @@ pub(crate) fn read_ftp_reply<R: BufRead>(r: &mut R) -> io::Result<Reply> {
                 break;
             }
             if lines.len() > MAX_REPLY_LINES {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "reply has too many lines"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "reply has too many lines",
+                ));
             }
         }
     }
@@ -291,7 +312,11 @@ pub(crate) fn parse_pasv(msg: &str) -> Option<([u8; 4], u16)> {
         }
         let nums: Vec<&str> = msg[start..i].split(',').collect();
         if nums.len() == 6 {
-            if let Ok(v) = nums.iter().map(|n| n.parse::<u8>()).collect::<Result<Vec<u8>, _>>() {
+            if let Ok(v) = nums
+                .iter()
+                .map(|n| n.parse::<u8>())
+                .collect::<Result<Vec<u8>, _>>()
+            {
                 let port = u16::from(v[4]) * 256 + u16::from(v[5]);
                 if port != 0 {
                     return Some(([v[0], v[1], v[2], v[3]], port));
@@ -454,7 +479,11 @@ fn entry_from_facts(facts: &[(String, String)], name: &str, path: &str) -> Optio
         .or_else(|| get("sizd"))
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(0);
-    let default_mode = if file_type == FileType::Directory { 0o755 } else { 0o644 };
+    let default_mode = if file_type == FileType::Directory {
+        0o755
+    } else {
+        0o644
+    };
     let mode = get("unix.mode")
         .and_then(|m| u32::from_str_radix(m.trim(), 8).ok())
         .map(|m| m & 0o7777)
@@ -502,7 +531,11 @@ pub(crate) struct ListItem {
 impl ListItem {
     fn into_entry(self, dir: &str) -> FileEntry {
         let path = join_path(dir, &self.name);
-        let default_mode = if self.file_type == FileType::Directory { 0o755 } else { 0o644 };
+        let default_mode = if self.file_type == FileType::Directory {
+            0o755
+        } else {
+            0o644
+        };
         FileEntry {
             is_hidden: self.name.starts_with('.'),
             path,
@@ -587,13 +620,24 @@ fn parse_mode_string(s: &str) -> u32 {
         return 0;
     }
     let mut mode = 0;
-    let rw = [(0, 0o400), (1, 0o200), (3, 0o040), (4, 0o020), (6, 0o004), (7, 0o002)];
+    let rw = [
+        (0, 0o400),
+        (1, 0o200),
+        (3, 0o040),
+        (4, 0o020),
+        (6, 0o004),
+        (7, 0o002),
+    ];
     for (i, bit) in rw {
         if c[i] == 'r' || c[i] == 'w' {
             mode |= bit;
         }
     }
-    let exec = [(2, 0o100, 0o4000, 's'), (5, 0o010, 0o2000, 's'), (8, 0o001, 0o1000, 't')];
+    let exec = [
+        (2, 0o100, 0o4000, 's'),
+        (5, 0o010, 0o2000, 's'),
+        (8, 0o001, 0o1000, 't'),
+    ];
     for (i, x, special, lower) in exec {
         match c[i] {
             'x' => mode |= x,
@@ -634,7 +678,11 @@ pub(crate) fn parse_unix_list_line(line: &str, now: DateTime<Utc>) -> Option<Lis
             if m + 3 >= toks.len() {
                 continue;
             }
-            let Some(day) = tok(m + 1).parse::<u32>().ok().filter(|d| (1..=31).contains(d)) else {
+            let Some(day) = tok(m + 1)
+                .parse::<u32>()
+                .ok()
+                .filter(|d| (1..=31).contains(d))
+            else {
                 continue;
             };
             let t = tok(m + 2);
@@ -660,7 +708,8 @@ pub(crate) fn parse_unix_list_line(line: &str, now: DateTime<Utc>) -> Option<Lis
                 continue;
             };
             (
-                date.and_hms_opt(h, mi, 0).map(|d| Utc.from_utc_datetime(&d)),
+                date.and_hms_opt(h, mi, 0)
+                    .map(|d| Utc.from_utc_datetime(&d)),
                 m + 1,
             )
         } else {
@@ -684,7 +733,11 @@ pub(crate) fn parse_unix_list_line(line: &str, now: DateTime<Utc>) -> Option<Lis
         return Some(ListItem {
             name,
             file_type,
-            size: if file_type == FileType::Directory { 0 } else { size },
+            size: if file_type == FileType::Directory {
+                0
+            } else {
+                size
+            },
             modified,
             mode: Some(mode),
             owner: (size_idx >= 3).then(|| tok(2).to_string()),
@@ -824,7 +877,9 @@ impl Conn {
         let addrs: Vec<SocketAddr> = (host.as_str(), port)
             .to_socket_addrs()
             .map_err(|e| {
-                CoreError::ConnectionFailed(format!("could not resolve FTP host '{host}:{port}': {e}"))
+                CoreError::ConnectionFailed(format!(
+                    "could not resolve FTP host '{host}:{port}': {e}"
+                ))
             })?
             .collect();
 
@@ -904,7 +959,10 @@ impl Conn {
     fn read_reply_timeout(&mut self, context: &str, timeout: Duration) -> Result<Reply, FtpError> {
         let _ = self.reader.get_ref().set_read_timeout(Some(timeout));
         let reply = self.read_reply(context);
-        let _ = self.reader.get_ref().set_read_timeout(Some(CONTROL_TIMEOUT));
+        let _ = self
+            .reader
+            .get_ref()
+            .set_read_timeout(Some(CONTROL_TIMEOUT));
         reply
     }
 
@@ -959,7 +1017,10 @@ impl Conn {
 
     fn login(&mut self, user: &str, pass: Option<&str>) -> Result<(), FtpError> {
         let (user, pass) = if user.trim().is_empty() {
-            ("anonymous", pass.filter(|p| !p.is_empty()).unwrap_or("anonymous@"))
+            (
+                "anonymous",
+                pass.filter(|p| !p.is_empty()).unwrap_or("anonymous@"),
+            )
         } else {
             (user, pass.unwrap_or(""))
         };
@@ -1074,8 +1135,8 @@ impl Conn {
         };
         let addr = SocketAddr::new(self.peer_ip, port);
         let context = format!("data connection to {addr}");
-        let stream =
-            TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| io_error(&context, e))?;
+        let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+            .map_err(|e| io_error(&context, e))?;
         stream
             .set_read_timeout(Some(DATA_TIMEOUT))
             .and_then(|_| stream.set_write_timeout(Some(DATA_TIMEOUT)))
@@ -1258,7 +1319,9 @@ impl Conn {
         }
         let context = describe("RETR", Some(path));
         let reusable = self.retr.as_ref().is_some_and(|r| {
-            r.path == path && r.next_offset == offset && self.last_used.elapsed() < RETR_REUSE_WINDOW
+            r.path == path
+                && r.next_offset == offset
+                && self.last_used.elapsed() < RETR_REUSE_WINDOW
         });
         if !reusable {
             self.close_retr()?;
@@ -1440,7 +1503,9 @@ impl Conn {
 
     fn remove_dir(&mut self, path: &str, recursive: bool) -> Result<(), FtpError> {
         if path == "/" {
-            return Err(CoreError::PermissionDenied("refusing to delete the FTP root".into()).into());
+            return Err(
+                CoreError::PermissionDenied("refusing to delete the FTP root".into()).into(),
+            );
         }
         let entry = self.stat(path)?;
         match entry.file_type {
@@ -1467,7 +1532,9 @@ impl Conn {
 
     fn remove_tree(&mut self, path: &str, real: &str, depth: usize) -> Result<(), FtpError> {
         if depth > MAX_WALK_DEPTH {
-            return Err(CoreError::General(format!("FTP: directory tree too deep at {path}")).into());
+            return Err(
+                CoreError::General(format!("FTP: directory tree too deep at {path}")).into(),
+            );
         }
         let real_prefix = format!("{}/", real.trim_end_matches('/'));
         for entry in self.list(path)? {
@@ -1505,7 +1572,12 @@ impl Conn {
     }
 
     /// Breadth-first walk below `root`. `visit(entry, depth)` returns false to stop.
-    fn walk<F>(&mut self, root: &str, max_depth: Option<usize>, mut visit: F) -> Result<(), FtpError>
+    fn walk<F>(
+        &mut self,
+        root: &str,
+        max_depth: Option<usize>,
+        mut visit: F,
+    ) -> Result<(), FtpError>
     where
         F: FnMut(&FileEntry, usize) -> bool,
     {
@@ -1597,7 +1669,9 @@ impl FtpDriver {
     /// Connects and logs in (verifying the credentials), keeping the
     /// connection for later operations.
     pub async fn connect(&self) -> CoreResult<()> {
-        let home = self.with_conn(Prefer::Idle, |c| c.pwd().map(Some).or(Ok(None))).await?;
+        let home = self
+            .with_conn(Prefer::Idle, |c| c.pwd().map(Some).or(Ok(None)))
+            .await?;
         *lock(&self.home) = home;
         Ok(())
     }
@@ -1739,8 +1813,10 @@ impl VirtualFileSystem for FtpDriver {
 
     async fn remove_file(&self, path: &str) -> CoreResult<()> {
         let path = normalize_path(path);
-        self.with_conn(Prefer::Idle, move |c| c.expect_ok("DELE", Some(&path)).map(|_| ()))
-            .await
+        self.with_conn(Prefer::Idle, move |c| {
+            c.expect_ok("DELE", Some(&path)).map(|_| ())
+        })
+        .await
     }
 
     async fn remove_dir(&self, path: &str, recursive: bool) -> CoreResult<()> {
@@ -1755,7 +1831,8 @@ impl VirtualFileSystem for FtpDriver {
         if from == to {
             return Ok(());
         }
-        self.with_conn(Prefer::Idle, move |c| c.rename(&from, &to)).await
+        self.with_conn(Prefer::Idle, move |c| c.rename(&from, &to))
+            .await
     }
 
     async fn set_permissions(&self, path: &str, mode: u32) -> CoreResult<()> {
@@ -1840,16 +1917,16 @@ impl VirtualFileSystem for FtpDriver {
 
     async fn find_files(&self, query: &FindFileQuery) -> CoreResult<Vec<FindFileMatch>> {
         let mask = crate::file_masks::FileMaskFilter::new(&query.mask);
-        let needle = query
-            .contains_text
-            .clone()
-            .filter(|t| !t.is_empty());
+        let needle = query.contains_text.clone().filter(|t| !t.is_empty());
         let Some(needle) = needle else {
             let mask_for_walk = mask.clone();
             return Ok(self
-                .walk_matching(&query.base_path, query.max_depth, query.max_results, move |e| {
-                    mask_for_walk.matches(&e.name, e.is_dir())
-                })
+                .walk_matching(
+                    &query.base_path,
+                    query.max_depth,
+                    query.max_results,
+                    move |e| mask_for_walk.matches(&e.name, e.is_dir()),
+                )
                 .await?
                 .into_iter()
                 .map(|entry| FindFileMatch {
@@ -1922,7 +1999,8 @@ mod tests {
         assert_eq!(r.code, 220);
         assert_eq!(r.message(), "Service ready");
 
-        let r = reply("220-Welcome\r\n220-to the server\r\n  211 not an end\r\n220 ready\r\nextra").unwrap();
+        let r = reply("220-Welcome\r\n220-to the server\r\n  211 not an end\r\n220 ready\r\nextra")
+            .unwrap();
         assert_eq!(r.code, 220);
         assert_eq!(r.lines.len(), 4);
         assert_eq!(r.message(), "Welcome to the server 211 not an end ready");
@@ -1944,21 +2022,36 @@ mod tests {
 
     #[test]
     fn passive_reply_parsers() {
-        assert_eq!(parse_epsv_port("Entering Extended Passive Mode (|||6446|)"), Some(6446));
-        assert_eq!(parse_epsv_port("Entering Extended Passive Mode (!!!21!)"), Some(21));
+        assert_eq!(
+            parse_epsv_port("Entering Extended Passive Mode (|||6446|)"),
+            Some(6446)
+        );
+        assert_eq!(
+            parse_epsv_port("Entering Extended Passive Mode (!!!21!)"),
+            Some(21)
+        );
         assert_eq!(parse_epsv_port("Entering Extended Passive Mode"), None);
         assert_eq!(
             parse_pasv("Entering Passive Mode (192,168,1,2,195,149)."),
             Some(([192, 168, 1, 2], 195 * 256 + 149))
         );
-        assert_eq!(parse_pasv("Entering Passive Mode 10,0,0,1,4,1"), Some(([10, 0, 0, 1], 1025)));
+        assert_eq!(
+            parse_pasv("Entering Passive Mode 10,0,0,1,4,1"),
+            Some(([10, 0, 0, 1], 1025))
+        );
         assert_eq!(parse_pasv("Entering Passive Mode (300,1,1,1,1,1)"), None);
     }
 
     #[test]
     fn pwd_and_time_parsers() {
-        assert_eq!(parse_pwd("\"/home/user\" is the current directory").as_deref(), Some("/home/user"));
-        assert_eq!(parse_pwd("\"/a \"\"quoted\"\" dir\"").as_deref(), Some("/a \"quoted\" dir"));
+        assert_eq!(
+            parse_pwd("\"/home/user\" is the current directory").as_deref(),
+            Some("/home/user")
+        );
+        assert_eq!(
+            parse_pwd("\"/a \"\"quoted\"\" dir\"").as_deref(),
+            Some("/a \"quoted\" dir")
+        );
         assert_eq!(parse_pwd("no quotes"), None);
         let t = parse_ftp_time("20240102030405.123").unwrap();
         assert_eq!(t.to_rfc3339(), "2024-01-02T03:04:05+00:00");
@@ -1983,7 +2076,10 @@ mod tests {
         assert_eq!(f.permissions.mode, 0o640);
         assert!(f.permissions.readonly);
         assert_eq!(f.permissions.owner.as_deref(), Some("alice"));
-        assert_eq!(f.modified_at.unwrap().to_rfc3339(), "2024-01-02T03:04:05+00:00");
+        assert_eq!(
+            f.modified_at.unwrap().to_rfc3339(),
+            "2024-01-02T03:04:05+00:00"
+        );
         assert_eq!(entries[1].file_type, FileType::Directory);
         assert_eq!(entries[1].path, "/data/photos");
         assert_eq!(entries[2].file_type, FileType::Symlink);
@@ -2012,22 +2108,39 @@ mod tests {
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["docs", "old  name.tar.gz", "setuid-bin", "current", "no-group.txt", "null", "iso date.txt"]
+            vec![
+                "docs",
+                "old  name.tar.gz",
+                "setuid-bin",
+                "current",
+                "no-group.txt",
+                "null",
+                "iso date.txt"
+            ]
         );
         let docs = &entries[0];
         assert_eq!(docs.file_type, FileType::Directory);
         assert_eq!(docs.path, "/pub/docs");
         assert_eq!(docs.permissions.mode, 0o755);
-        assert_eq!(docs.modified_at.unwrap().to_rfc3339(), "2024-03-10T09:30:00+00:00");
+        assert_eq!(
+            docs.modified_at.unwrap().to_rfc3339(),
+            "2024-03-10T09:30:00+00:00"
+        );
         // December is in the future relative to March: previous year.
         let old = &entries[1];
         assert_eq!(old.size, 123456);
-        assert_eq!(old.modified_at.unwrap().to_rfc3339(), "2023-12-24T18:05:00+00:00");
+        assert_eq!(
+            old.modified_at.unwrap().to_rfc3339(),
+            "2023-12-24T18:05:00+00:00"
+        );
         assert_eq!(old.permissions.owner.as_deref(), Some("ftp"));
         assert_eq!(old.permissions.group.as_deref(), Some("ftp"));
         let suid = &entries[2];
         assert_eq!(suid.permissions.mode, 0o4750);
-        assert_eq!(suid.modified_at.unwrap().to_rfc3339(), "2021-01-05T00:00:00+00:00");
+        assert_eq!(
+            suid.modified_at.unwrap().to_rfc3339(),
+            "2021-01-05T00:00:00+00:00"
+        );
         assert_eq!(entries[3].file_type, FileType::Symlink);
         assert_eq!(entries[3].name, "current");
         let ng = &entries[4];
@@ -2036,7 +2149,10 @@ mod tests {
         assert_eq!(ng.permissions.group, None);
         assert_eq!(entries[5].file_type, FileType::Other);
         assert_eq!(entries[6].size, 42);
-        assert_eq!(entries[6].modified_at.unwrap().to_rfc3339(), "2023-07-08T09:10:00+00:00");
+        assert_eq!(
+            entries[6].modified_at.unwrap().to_rfc3339(),
+            "2023-07-08T09:10:00+00:00"
+        );
     }
 
     #[test]
@@ -2049,11 +2165,20 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].name, "My Documents");
         assert_eq!(entries[0].file_type, FileType::Directory);
-        assert_eq!(entries[0].modified_at.unwrap().to_rfc3339(), "2024-01-02T15:04:00+00:00");
+        assert_eq!(
+            entries[0].modified_at.unwrap().to_rfc3339(),
+            "2024-01-02T15:04:00+00:00"
+        );
         assert_eq!(entries[1].name, "report final.txt");
         assert_eq!(entries[1].size, 1234);
-        assert_eq!(entries[1].modified_at.unwrap().to_rfc3339(), "1999-12-31T11:59:00+00:00");
-        assert_eq!(entries[2].modified_at.unwrap().to_rfc3339(), "2023-07-08T00:00:00+00:00");
+        assert_eq!(
+            entries[1].modified_at.unwrap().to_rfc3339(),
+            "1999-12-31T11:59:00+00:00"
+        );
+        assert_eq!(
+            entries[2].modified_at.unwrap().to_rfc3339(),
+            "2023-07-08T00:00:00+00:00"
+        );
     }
 
     #[test]
@@ -2062,7 +2187,10 @@ mod tests {
             code,
             lines: vec![format!("{code} {text}")],
         };
-        assert!(matches!(reply_to_core("PASS", &r(530, "Login incorrect.")), CoreError::AuthFailed(_)));
+        assert!(matches!(
+            reply_to_core("PASS", &r(530, "Login incorrect.")),
+            CoreError::AuthFailed(_)
+        ));
         assert!(matches!(
             reply_to_core("RETR /x", &r(550, "/x: No such file or directory")),
             CoreError::NotFound(_)
@@ -2182,7 +2310,11 @@ mod tests {
         }
 
         fn children(fs: &Fs, dir: &str) -> Vec<(String, bool, usize)> {
-            let prefix = if dir == "/" { "/".to_string() } else { format!("{dir}/") };
+            let prefix = if dir == "/" {
+                "/".to_string()
+            } else {
+                format!("{dir}/")
+            };
             let mut out = Vec::new();
             for d in &fs.dirs {
                 if let Some(rest) = d.strip_prefix(&prefix) {
@@ -2248,7 +2380,10 @@ mod tests {
                         }
                     }
                     "OPTS" | "TYPE" | "NOOP" => send(&mut out, "200 OK\r\n"),
-                    "PWD" => send(&mut out, &format!("257 \"{cwd}\" is the current directory\r\n")),
+                    "PWD" => send(
+                        &mut out,
+                        &format!("257 \"{cwd}\" is the current directory\r\n"),
+                    ),
                     "CWD" => {
                         let p = resolve(&cwd, &arg);
                         if fs.lock().unwrap().dirs.contains(&p) {
@@ -2262,7 +2397,10 @@ mod tests {
                         let l = TcpListener::bind("127.0.0.1:0").unwrap();
                         let port = l.local_addr().unwrap().port();
                         passive = Some(l);
-                        send(&mut out, &format!("229 Entering Extended Passive Mode (|||{port}|)\r\n"));
+                        send(
+                            &mut out,
+                            &format!("229 Entering Extended Passive Mode (|||{port}|)\r\n"),
+                        );
                     }
                     "PASV" => {
                         let l = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2271,7 +2409,11 @@ mod tests {
                         // A bogus address: the client must use the control peer.
                         send(
                             &mut out,
-                            &format!("227 Entering Passive Mode (10,255,255,1,{},{})\r\n", port / 256, port % 256),
+                            &format!(
+                                "227 Entering Passive Mode (10,255,255,1,{},{})\r\n",
+                                port / 256,
+                                port % 256
+                            ),
                         );
                     }
                     "REST" => {
@@ -2307,7 +2449,9 @@ mod tests {
                                 let mut s = format!("type=cdir; {p}\r\n");
                                 for (name, is_dir, size) in children(&g, &p) {
                                     if is_dir {
-                                        s.push_str(&format!("type=dir;modify=20240102030405; {name}\r\n"));
+                                        s.push_str(&format!(
+                                            "type=dir;modify=20240102030405; {name}\r\n"
+                                        ));
                                     } else {
                                         s.push_str(&format!("type=file;size={size};modify=20240102030405; {name}\r\n"));
                                     }
@@ -2497,8 +2641,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wrong_password_fails_to_connect() {
-        let server = fake::start(fake::Options { mlst: true, epsv: true });
-        let err = driver_for(server.port, "wrong").connect().await.unwrap_err();
+        let server = fake::start(fake::Options {
+            mlst: true,
+            epsv: true,
+        });
+        let err = driver_for(server.port, "wrong")
+            .connect()
+            .await
+            .unwrap_err();
         assert!(matches!(err, CoreError::AuthFailed(_)), "{err:?}");
     }
 
@@ -2515,7 +2665,9 @@ mod tests {
 
         // Upload, download, metadata, listing.
         let file = "/home/a/b c/hello world.txt";
-        d.write_file(file, Bytes::from_static(b"hello world")).await.unwrap();
+        d.write_file(file, Bytes::from_static(b"hello world"))
+            .await
+            .unwrap();
         assert_eq!(server.fs.lock().unwrap().files[file], b"hello world");
         assert_eq!(&d.read_file(file).await.unwrap()[..], b"hello world");
         let meta = d.metadata(file).await.unwrap();
@@ -2536,7 +2688,11 @@ mod tests {
         assert_eq!(&d.read_range(file, 0, 4).await.unwrap()[..], b"hell");
         assert_eq!(&d.read_range(file, 4, 4).await.unwrap()[..], b"o wo");
         assert_eq!(&d.read_range(file, 8, 10).await.unwrap()[..], b"rld");
-        assert_eq!(server.fs.lock().unwrap().retr_count - retr_before, 1, "one RETR for three sequential reads");
+        assert_eq!(
+            server.fs.lock().unwrap().retr_count - retr_before,
+            1,
+            "one RETR for three sequential reads"
+        );
         assert_eq!(&d.read_range(file, 6, 5).await.unwrap()[..], b"world");
         assert_eq!(&d.read_range(file, 2, 3).await.unwrap()[..], b"llo");
         assert_eq!(server.fs.lock().unwrap().retr_count - retr_before, 3);
@@ -2556,16 +2712,27 @@ mod tests {
 
         // Positional writes.
         let chunked = "/home/a/chunked.bin";
-        d.write_at(chunked, 0, Bytes::from_static(b"12345")).await.unwrap();
-        d.write_at(chunked, 5, Bytes::from_static(b"678")).await.unwrap();
-        assert!(d.write_at(chunked, 3, Bytes::from_static(b"x")).await.is_err());
+        d.write_at(chunked, 0, Bytes::from_static(b"12345"))
+            .await
+            .unwrap();
+        d.write_at(chunked, 5, Bytes::from_static(b"678"))
+            .await
+            .unwrap();
+        assert!(d
+            .write_at(chunked, 3, Bytes::from_static(b"x"))
+            .await
+            .is_err());
         assert_eq!(server.fs.lock().unwrap().files[chunked], b"12345678");
         // Not advertised: many servers refuse APPE to an existing file, so
         // the transfer queue must upload to FTP with a single STOR.
         assert!(!d.supports_write_at());
         // Offset 0 truncates an existing file.
-        d.write_at(chunked, 0, Bytes::from_static(b"ab")).await.unwrap();
-        d.write_at(chunked, 2, Bytes::from_static(b"cdefgh")).await.unwrap();
+        d.write_at(chunked, 0, Bytes::from_static(b"ab"))
+            .await
+            .unwrap();
+        d.write_at(chunked, 2, Bytes::from_static(b"cdefgh"))
+            .await
+            .unwrap();
         assert_eq!(server.fs.lock().unwrap().files[chunked], b"abcdefgh");
 
         // Uploading into a missing directory reports the server's refusal.
@@ -2607,23 +2774,38 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn end_to_end_with_mlsd_and_epsv() {
-        exercise_driver(fake::Options { mlst: true, epsv: true }).await;
+        exercise_driver(fake::Options {
+            mlst: true,
+            epsv: true,
+        })
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn end_to_end_with_list_and_pasv_fallbacks() {
-        exercise_driver(fake::Options { mlst: false, epsv: false }).await;
+        exercise_driver(fake::Options {
+            mlst: false,
+            epsv: false,
+        })
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn positional_writes_fall_back_to_rest_stor_without_appe() {
-        let server = fake::start(fake::Options { mlst: true, epsv: true });
+        let server = fake::start(fake::Options {
+            mlst: true,
+            epsv: true,
+        });
         server.fs.lock().unwrap().refuse_appe = true;
         let d = driver_for(server.port, "secret");
         d.connect().await.unwrap();
         let path = "/home/resume.bin";
-        d.write_at(path, 0, Bytes::from_static(b"abc")).await.unwrap();
-        d.write_at(path, 3, Bytes::from_static(b"def")).await.unwrap();
+        d.write_at(path, 0, Bytes::from_static(b"abc"))
+            .await
+            .unwrap();
+        d.write_at(path, 3, Bytes::from_static(b"def"))
+            .await
+            .unwrap();
         d.write_at(path, 6, Bytes::from_static(b"g")).await.unwrap();
         assert_eq!(server.fs.lock().unwrap().files[path], b"abcdefg");
         // Out-of-order writes are still refused.
@@ -2641,11 +2823,15 @@ mod tests {
         use crate::types::TransferStatus;
         use std::collections::HashMap;
 
-        let server = fake::start(fake::Options { mlst: true, epsv: true });
+        let server = fake::start(fake::Options {
+            mlst: true,
+            epsv: true,
+        });
         {
             let mut g = server.fs.lock().unwrap();
             g.refuse_append_existing = true;
-            g.files.insert("/home/existing.bin".into(), vec![9u8; 16_000]);
+            g.files
+                .insert("/home/existing.bin".into(), vec![9u8; 16_000]);
         }
         let d = driver_for(server.port, "secret");
         d.connect().await.unwrap();
@@ -2654,7 +2840,10 @@ mod tests {
             .write_at("/home/existing.bin", 16_000, Bytes::from_static(b"x"))
             .await
             .is_err());
-        assert_eq!(server.fs.lock().unwrap().files["/home/existing.bin"].len(), 16_000);
+        assert_eq!(
+            server.fs.lock().unwrap().files["/home/existing.bin"].len(),
+            16_000
+        );
 
         let local = tempfile::tempdir().unwrap();
         let data: Vec<u8> = (0..300_000u32).map(|i| (i * 7 % 251) as u8).collect();
@@ -2678,12 +2867,20 @@ mod tests {
                 .await;
             let task = loop {
                 let t = q.get_task(&id).await.unwrap();
-                if !matches!(t.status, TransferStatus::Queued | TransferStatus::InProgress) {
+                if !matches!(
+                    t.status,
+                    TransferStatus::Queued | TransferStatus::InProgress
+                ) {
                     break t;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             };
-            assert_eq!(task.status, TransferStatus::Completed, "{dest}: {:?}", task.error);
+            assert_eq!(
+                task.status,
+                TransferStatus::Completed,
+                "{dest}: {:?}",
+                task.error
+            );
             assert_eq!(server.fs.lock().unwrap().files[dest], data, "{dest}");
         }
     }
@@ -2692,7 +2889,10 @@ mod tests {
     /// trimmed sibling.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn trailing_whitespace_names_are_not_trimmed() {
-        let server = fake::start(fake::Options { mlst: true, epsv: true });
+        let server = fake::start(fake::Options {
+            mlst: true,
+            epsv: true,
+        });
         {
             let mut g = server.fs.lock().unwrap();
             g.files.insert("/home/notes".into(), b"keep".to_vec());
@@ -2705,7 +2905,9 @@ mod tests {
         assert_eq!(spaced.path, "/home/notes ");
         assert_eq!(d.metadata("/home/notes ").await.unwrap().size, 6);
         assert_eq!(&d.read_file("/home/notes ").await.unwrap()[..], b"spaced");
-        d.write_file("/home/notes ", Bytes::from_static(b"new")).await.unwrap();
+        d.write_file("/home/notes ", Bytes::from_static(b"new"))
+            .await
+            .unwrap();
         d.remove_file("/home/notes ").await.unwrap();
         let g = server.fs.lock().unwrap();
         assert!(!g.files.contains_key("/home/notes "));
@@ -2714,7 +2916,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_operations_use_separate_connections() {
-        let server = fake::start(fake::Options { mlst: true, epsv: true });
+        let server = fake::start(fake::Options {
+            mlst: true,
+            epsv: true,
+        });
         let d = driver_for(server.port, "secret");
         d.connect().await.unwrap();
         let mut handles = Vec::new();
@@ -2723,7 +2928,9 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 let path = format!("/home/f{i}.txt");
                 let body = format!("content {i}");
-                d.write_file(&path, Bytes::from(body.clone())).await.unwrap();
+                d.write_file(&path, Bytes::from(body.clone()))
+                    .await
+                    .unwrap();
                 assert_eq!(d.read_file(&path).await.unwrap(), Bytes::from(body));
             }));
         }

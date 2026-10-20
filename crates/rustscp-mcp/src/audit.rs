@@ -84,7 +84,11 @@ impl AuditLogger {
         }
     }
 
-    async fn append_to_file(&self, path: &std::path::Path, event: &AuditEvent) -> std::io::Result<()> {
+    async fn append_to_file(
+        &self,
+        path: &std::path::Path,
+        event: &AuditEvent,
+    ) -> std::io::Result<()> {
         use tokio::io::AsyncWriteExt;
         let _guard = self.file_lock.lock().await;
         if let Some(parent) = path.parent() {
@@ -146,8 +150,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit").join("mcp-audit.log");
         let logger = AuditLogger::with_log_file(&path);
-        logger.log("agent", "fs_read_file", "local", "/etc/hosts", "success", None).await;
-        logger.log("agent", "fs_write_file", "local", "/tmp/x", "error: denied", None).await;
+        logger
+            .log(
+                "agent",
+                "fs_read_file",
+                "local",
+                "/etc/hosts",
+                "success",
+                None,
+            )
+            .await;
+        logger
+            .log(
+                "agent",
+                "fs_write_file",
+                "local",
+                "/tmp/x",
+                "error: denied",
+                None,
+            )
+            .await;
 
         let text = tokio::fs::read_to_string(&path).await.unwrap();
         let lines: Vec<AuditEvent> = text

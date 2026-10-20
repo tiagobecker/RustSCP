@@ -584,11 +584,13 @@ pub fn quarantine_local_vault() -> Result<Option<PathBuf>, VaultError> {
     quarantine_vault_in(&get_rustscp_config_dir())
 }
 
-fn decrypt_local_envelope(json_str: &str, device_key: &str) -> Result<Vec<ConnectionConfig>, VaultError> {
+fn decrypt_local_envelope(
+    json_str: &str,
+    device_key: &str,
+) -> Result<Vec<ConnectionConfig>, VaultError> {
     let envelope = parse_vault_from_json(json_str)?;
     // Local vaults: 1 round (current format) up to the legacy 100k (older builds).
-    let plaintext =
-        decrypt_bytes_bounded(&envelope, device_key, 1, MAX_PASSWORD_KDF_ITERATIONS)?;
+    let plaintext = decrypt_bytes_bounded(&envelope, device_key, 1, MAX_PASSWORD_KDF_ITERATIONS)?;
     Ok(serde_json::from_slice(&plaintext)?)
 }
 
@@ -603,9 +605,10 @@ fn save_vault_in(dir: &Path, sites: &[ConnectionConfig]) -> Result<(), VaultErro
     match fs::read_to_string(&vault_path) {
         Ok(existing) => match decrypt_local_envelope(&existing, &device_key) {
             Ok(_) => {
-                if let Err(e) =
-                    write_private_file_atomic(&dir.join(LOCAL_VAULT_BACKUP_FILE), existing.as_bytes())
-                {
+                if let Err(e) = write_private_file_atomic(
+                    &dir.join(LOCAL_VAULT_BACKUP_FILE),
+                    existing.as_bytes(),
+                ) {
                     tracing::warn!("could not refresh the vault backup: {e}");
                 }
             }
@@ -635,9 +638,8 @@ fn load_vault_in(dir: &Path) -> Result<Vec<ConnectionConfig>, VaultError> {
         Err(e) => return Err(VaultError::IoError(e)),
     };
     // Loading never creates a key: a vault without its key is an error, not "empty".
-    let device_key = read_device_key_in(dir)?.ok_or_else(|| {
-        VaultError::DeviceKeyMissing(vault_path.to_string_lossy().to_string())
-    })?;
+    let device_key = read_device_key_in(dir)?
+        .ok_or_else(|| VaultError::DeviceKeyMissing(vault_path.to_string_lossy().to_string()))?;
     decrypt_local_envelope(&json_str, &device_key)
 }
 
@@ -835,8 +837,7 @@ mod tests {
     #[test]
     fn test_untrusted_iteration_count_is_rejected_before_deriving() {
         let sites = sample_sites();
-        let mut envelope =
-            encrypt_sites_with_iterations(&sites, "pw", TEST_ITERATIONS).unwrap();
+        let mut envelope = encrypt_sites_with_iterations(&sites, "pw", TEST_ITERATIONS).unwrap();
 
         envelope.kdf_iterations = u32::MAX;
         match decrypt_sites(&envelope, "pw") {
@@ -909,7 +910,9 @@ mod tests {
     #[tokio::test]
     async fn test_async_wrappers_roundtrip() {
         let sites = sample_sites();
-        let envelope = encrypt_sites_async(sites, "AsyncPassword".into()).await.unwrap();
+        let envelope = encrypt_sites_async(sites, "AsyncPassword".into())
+            .await
+            .unwrap();
         let back = decrypt_sites_async(envelope, "AsyncPassword".into())
             .await
             .unwrap();
@@ -971,7 +974,10 @@ mod tests {
             save_vault_in(dir.path(), &[]),
             Err(VaultError::DeviceKeyMissing(_))
         ));
-        assert!(!dir.path().join(DEVICE_KEY_FILE).exists(), "no new key may be created");
+        assert!(
+            !dir.path().join(DEVICE_KEY_FILE).exists(),
+            "no new key may be created"
+        );
         assert_eq!(fs::read(&vault_path).unwrap(), original);
 
         // A blank key file is treated the same way.
@@ -1001,7 +1007,11 @@ mod tests {
         let corrupt: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("sites.vault.corrupt-"))
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("sites.vault.corrupt-")
+            })
             .collect();
         assert_eq!(corrupt.len(), 1, "unreadable vault must be kept aside");
         assert_eq!(fs::read(corrupt[0].path()).unwrap(), original);
@@ -1022,7 +1032,10 @@ mod tests {
             .to_string_lossy()
             .starts_with("sites.vault.corrupt-"));
         assert!(!dir.path().join(LOCAL_VAULT_FILE).exists());
-        assert!(dir.path().join(DEVICE_KEY_FILE).exists(), "key file is kept");
+        assert!(
+            dir.path().join(DEVICE_KEY_FILE).exists(),
+            "key file is kept"
+        );
         assert!(load_vault_in(dir.path()).unwrap().is_empty());
         assert!(quarantine_vault_in(dir.path()).unwrap().is_none());
     }
@@ -1052,7 +1065,10 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             for name in [LOCAL_VAULT_FILE, DEVICE_KEY_FILE, LOCAL_VAULT_BACKUP_FILE] {
-                let mode = fs::metadata(dir.path().join(name)).unwrap().permissions().mode();
+                let mode = fs::metadata(dir.path().join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode();
                 assert_eq!(mode & 0o777, 0o600, "{name} must be 0600");
             }
         }
@@ -1065,8 +1081,8 @@ mod tests {
         assert_eq!(key.len(), 64);
 
         // A vault written by an older build (100k rounds, hex key as password).
-        let legacy = encrypt_sites_with_iterations(&sample_sites(), &key, LEGACY_KDF_ITERATIONS)
-            .unwrap();
+        let legacy =
+            encrypt_sites_with_iterations(&sample_sites(), &key, LEGACY_KDF_ITERATIONS).unwrap();
         fs::write(
             dir.path().join(LOCAL_VAULT_FILE),
             serde_json::to_string_pretty(&legacy).unwrap(),
@@ -1100,6 +1116,9 @@ mod tests {
             VaultError::DeviceKeyMissing(String::new()).code(),
             "vault.device_key_missing"
         );
-        assert_eq!(VaultError::KdfOutOfRange(1).code(), "vault.kdf_out_of_range");
+        assert_eq!(
+            VaultError::KdfOutOfRange(1).code(),
+            "vault.kdf_out_of_range"
+        );
     }
 }

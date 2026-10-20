@@ -83,7 +83,11 @@ impl ActionContext {
 
     /// Raw (unquoted) value of a context variable, used inside field default values.
     fn raw_var(&self, name: &str) -> Option<String> {
-        let first = self.selected_paths.first().map(String::as_str).unwrap_or("");
+        let first = self
+            .selected_paths
+            .first()
+            .map(String::as_str)
+            .unwrap_or("");
         let first_name = self.first_selected_name();
         let (stem, ext) = split_ext(&first_name);
         Some(match name {
@@ -176,9 +180,7 @@ fn expand_default(default: &str, ctx: &ActionContext) -> String {
     for caps in re.captures_iter(default) {
         let m = caps.get(0).expect("match");
         out.push_str(&default[last..m.start()]);
-        let replacement = caps
-            .get(1)
-            .and_then(|name| ctx.raw_var(name.as_str()));
+        let replacement = caps.get(1).and_then(|name| ctx.raw_var(name.as_str()));
         match replacement {
             Some(v) => out.push_str(&v),
             None => out.push_str(m.as_str()),
@@ -236,23 +238,27 @@ impl ActionExecutor {
             // Check select options
             FieldType::Select { options } => {
                 if !options.iter().any(|opt| opt.value == val) {
-                    return Err(ActionError::InvalidOption(val.to_string(), field.id.clone()));
+                    return Err(ActionError::InvalidOption(
+                        val.to_string(),
+                        field.id.clone(),
+                    ));
                 }
             }
             FieldType::Number { min, max, .. } => {
                 let n: f64 = val
                     .parse()
                     .map_err(|_| ActionError::InvalidNumber(field.id.clone(), val.to_string()))?;
-                if !n.is_finite()
-                    || min.is_some_and(|m| n < m)
-                    || max.is_some_and(|m| n > m)
-                {
+                if !n.is_finite() || min.is_some_and(|m| n < m) || max.is_some_and(|m| n > m) {
                     let range = format!(
                         "{}..{}",
                         min.map(|m| m.to_string()).unwrap_or_default(),
                         max.map(|m| m.to_string()).unwrap_or_default()
                     );
-                    return Err(ActionError::OutOfRange(field.id.clone(), val.to_string(), range));
+                    return Err(ActionError::OutOfRange(
+                        field.id.clone(),
+                        val.to_string(),
+                        range,
+                    ));
                 }
             }
             _ => {}
@@ -660,10 +666,7 @@ mod tests {
 
     #[test]
     fn test_every_builtin_renders_with_defaults() {
-        let ctx = ActionContext::new(
-            "/var/www",
-            vec!["/var/www/archive.tar.gz".to_string()],
-        );
+        let ctx = ActionContext::new("/var/www", vec!["/var/www/archive.tar.gz".to_string()]);
         for action in ActionCatalog::builtin_actions() {
             let cmd = ActionExecutor::render_command(&action, &ctx, &HashMap::new())
                 .unwrap_or_else(|e| panic!("{} failed: {e}", action.id));

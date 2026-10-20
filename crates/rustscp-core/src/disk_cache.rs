@@ -603,9 +603,11 @@ impl ManagedDiskCache {
         remote_path: &str,
         data: &[u8],
     ) -> CoreResult<()> {
-        let local_path = self.get_local_file_path(session_id, remote_path).ok_or_else(|| {
-            CoreError::InvalidPath(format!("cannot cache content for '{remote_path}'"))
-        })?;
+        let local_path = self
+            .get_local_file_path(session_id, remote_path)
+            .ok_or_else(|| {
+                CoreError::InvalidPath(format!("cannot cache content for '{remote_path}'"))
+            })?;
 
         let max_limit = *self.max_bytes.read().await;
         if data.len() as u64 > max_limit / LARGE_FILE_DIVISOR {
@@ -719,11 +721,9 @@ impl ManagedDiskCache {
                         let (bytes, count, last_t) = inspect_dir_size(&entry.path()).await;
                         total_bytes += bytes;
                         total_files += count;
-                        let slot = site_map.entry(sess_id).or_insert((
-                            0,
-                            0,
-                            std::time::UNIX_EPOCH,
-                        ));
+                        let slot = site_map
+                            .entry(sess_id)
+                            .or_insert((0, 0, std::time::UNIX_EPOCH));
                         slot.0 += bytes;
                         slot.1 += count;
                         if last_t > slot.2 {
@@ -989,9 +989,18 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(cache.get_file_content("sess1", "/file0.txt").await.is_some());
-        assert!(cache.get_file_content("sess1", "/file1.txt").await.is_none());
-        assert!(cache.get_file_content("sess1", "/file5.txt").await.is_some());
+        assert!(cache
+            .get_file_content("sess1", "/file0.txt")
+            .await
+            .is_some());
+        assert!(cache
+            .get_file_content("sess1", "/file1.txt")
+            .await
+            .is_none());
+        assert!(cache
+            .get_file_content("sess1", "/file5.txt")
+            .await
+            .is_some());
 
         let mut names = HashMap::new();
         names.insert("sess1".to_string(), "Site 1".to_string());
@@ -1136,15 +1145,24 @@ mod tests {
         cache.put_file_content("s", "/a", b"file").await.unwrap();
         // "/a" became a folder.
         cache.put_file_content("s", "/a/b", b"child").await.unwrap();
-        assert_eq!(&cache.get_file_content("s", "/a/b").await.unwrap()[..], b"child");
+        assert_eq!(
+            &cache.get_file_content("s", "/a/b").await.unwrap()[..],
+            b"child"
+        );
         assert!(cache.get_file_content("s", "/a").await.is_none());
         // ...and a file again.
         cache.put_file_content("s", "/a", b"file2").await.unwrap();
-        assert_eq!(&cache.get_file_content("s", "/a").await.unwrap()[..], b"file2");
+        assert_eq!(
+            &cache.get_file_content("s", "/a").await.unwrap()[..],
+            b"file2"
+        );
         assert!(cache.get_file_content("s", "/a/b").await.is_none());
 
         cache.put_file_content("s", "/dir/x", b"1").await.unwrap();
-        cache.put_file_content("s", "/dir/sub/y", b"2").await.unwrap();
+        cache
+            .put_file_content("s", "/dir/sub/y", b"2")
+            .await
+            .unwrap();
         cache.invalidate_content("s", "/dir").await;
         assert!(cache.get_file_content("s", "/dir/x").await.is_none());
         assert!(cache.get_file_content("s", "/dir/sub/y").await.is_none());
@@ -1213,7 +1231,9 @@ mod tests {
         cache.set_max_size(50).await;
         assert!(!legacy.join("old.bin").exists());
 
-        tokio::fs::write(legacy.join("again.bin"), b"zz").await.unwrap();
+        tokio::fs::write(legacy.join("again.bin"), b"zz")
+            .await
+            .unwrap();
         cache.clear_session("old-session").await.unwrap();
         assert!(!legacy.exists());
 
@@ -1288,7 +1308,11 @@ mod tests {
     async fn test_invalidating_a_folder_drops_cached_subfolder_listings() {
         let cache = ManagedDiskCache::new(Some(temp_cache_dir()), 1024);
         cache
-            .put_catalog("s", "/var/www", vec![file_entry("/var/www/site", FileType::Directory)])
+            .put_catalog(
+                "s",
+                "/var/www",
+                vec![file_entry("/var/www/site", FileType::Directory)],
+            )
             .await;
         cache
             .put_catalog(
@@ -1298,26 +1322,42 @@ mod tests {
             )
             .await;
         cache
-            .put_catalog("s", "/var/www/sitemap", vec![file_entry("/var/www/sitemap/x", FileType::File)])
+            .put_catalog(
+                "s",
+                "/var/www/sitemap",
+                vec![file_entry("/var/www/sitemap/x", FileType::File)],
+            )
             .await;
         cache
             .put_catalog("other", "/var/www/site/assets", vec![])
             .await;
 
         cache.invalidate_catalog("s", "/var/www/site").await;
-        assert!(cache.get_catalog("s", "/var/www/site/assets").await.is_none());
+        assert!(cache
+            .get_catalog("s", "/var/www/site/assets")
+            .await
+            .is_none());
         assert!(cache
             .get_entry_metadata("s", "/var/www/site/assets/a.css")
             .await
             .is_none());
-        assert!(cache.get_catalog("s", "/var/www").await.is_none(), "parent listing changed");
+        assert!(
+            cache.get_catalog("s", "/var/www").await.is_none(),
+            "parent listing changed"
+        );
         // Siblings sharing a name prefix and other sessions are kept.
         assert!(cache.get_catalog("s", "/var/www/sitemap").await.is_some());
-        assert!(cache.get_catalog("other", "/var/www/site/assets").await.is_some());
+        assert!(cache
+            .get_catalog("other", "/var/www/site/assets")
+            .await
+            .is_some());
 
         cache.invalidate_catalog("s", "/").await;
         assert!(cache.get_catalog("s", "/var/www/sitemap").await.is_none());
-        assert!(cache.get_catalog("other", "/var/www/site/assets").await.is_some());
+        assert!(cache
+            .get_catalog("other", "/var/www/site/assets")
+            .await
+            .is_some());
     }
 
     #[tokio::test]
@@ -1326,7 +1366,11 @@ mod tests {
         cache.set_catalog_ttl_secs(0);
         for i in 0..10 {
             cache
-                .put_catalog("s", &format!("/d{i}"), vec![file_entry(&format!("/d{i}/f"), FileType::File)])
+                .put_catalog(
+                    "s",
+                    &format!("/d{i}"),
+                    vec![file_entry(&format!("/d{i}/f"), FileType::File)],
+                )
                 .await;
         }
         assert!(cache.purge_expired_catalogs().await >= 20);

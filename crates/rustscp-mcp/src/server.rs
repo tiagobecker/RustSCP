@@ -302,8 +302,15 @@ impl McpServer {
         match tool_name {
             "session_list" => {
                 let list = self.connection_ids().await;
-                self.audit(agent_id, tool_name, "none", "listing sessions", "success", None)
-                    .await;
+                self.audit(
+                    agent_id,
+                    tool_name,
+                    "none",
+                    "listing sessions",
+                    "success",
+                    None,
+                )
+                .await;
                 McpToolResult::success_text(json!({ "active_sessions": list }).to_string())
             }
 
@@ -317,8 +324,15 @@ impl McpServer {
                         McpToolResult::success_text(json!({ "entries": entries }).to_string())
                     }
                     Err(err) => {
-                        self.audit(agent_id, tool_name, conn_id, path, &format!("error: {}", err), None)
-                            .await;
+                        self.audit(
+                            agent_id,
+                            tool_name,
+                            conn_id,
+                            path,
+                            &format!("error: {}", err),
+                            None,
+                        )
+                        .await;
                         McpToolResult::error_text(format!("Failed to list directory: {}", err))
                     }
                 }
@@ -327,7 +341,10 @@ impl McpServer {
             "fs_read_file" => {
                 let vfs = vfs.expect("connection checked");
                 let path = str_arg("path").unwrap_or("");
-                let offset = arguments.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+                let offset = arguments
+                    .get("offset")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 let length = arguments
                     .get("length")
                     .and_then(|v| v.as_u64())
@@ -337,8 +354,15 @@ impl McpServer {
 
                 let total = match vfs.metadata(path).await {
                     Ok(meta) if meta.is_dir() => {
-                        self.audit(agent_id, tool_name, conn_id, &summary, "error: is a directory", None)
-                            .await;
+                        self.audit(
+                            agent_id,
+                            tool_name,
+                            conn_id,
+                            &summary,
+                            "error: is a directory",
+                            None,
+                        )
+                        .await;
                         return McpToolResult::error_text(format!("{} is a directory", path));
                     }
                     Ok(meta) => Some(meta.size),
@@ -369,14 +393,23 @@ impl McpServer {
                         McpToolResult {
                             content: vec![
                                 McpContent::Text { text: content },
-                                McpContent::Text { text: meta.to_string() },
+                                McpContent::Text {
+                                    text: meta.to_string(),
+                                },
                             ],
                             is_error: false,
                         }
                     }
                     Err(err) => {
-                        self.audit(agent_id, tool_name, conn_id, &summary, &format!("error: {}", err), None)
-                            .await;
+                        self.audit(
+                            agent_id,
+                            tool_name,
+                            conn_id,
+                            &summary,
+                            &format!("error: {}", err),
+                            None,
+                        )
+                        .await;
                         McpToolResult::error_text(format!("Failed to read file: {}", err))
                     }
                 }
@@ -392,14 +425,30 @@ impl McpServer {
                     "base64" => match base64_decode(content) {
                         Ok(d) => d,
                         Err(e) => {
-                            self.audit(agent_id, tool_name, conn_id, path, &format!("error: {e}"), None)
-                                .await;
-                            return McpToolResult::error_text(format!("Invalid base64 content: {e}"));
+                            self.audit(
+                                agent_id,
+                                tool_name,
+                                conn_id,
+                                path,
+                                &format!("error: {e}"),
+                                None,
+                            )
+                            .await;
+                            return McpToolResult::error_text(format!(
+                                "Invalid base64 content: {e}"
+                            ));
                         }
                     },
                     other => {
-                        self.audit(agent_id, tool_name, conn_id, path, "error: unsupported encoding", None)
-                            .await;
+                        self.audit(
+                            agent_id,
+                            tool_name,
+                            conn_id,
+                            path,
+                            "error: unsupported encoding",
+                            None,
+                        )
+                        .await;
                         return McpToolResult::error_text(format!(
                             "Unsupported encoding '{other}' (use 'utf-8' or 'base64')"
                         ));
@@ -409,8 +458,15 @@ impl McpServer {
                 // Record what the write replaces, for the audit trail.
                 let previous = match vfs.metadata(path).await {
                     Ok(meta) if meta.is_dir() => {
-                        self.audit(agent_id, tool_name, conn_id, path, "error: is a directory", None)
-                            .await;
+                        self.audit(
+                            agent_id,
+                            tool_name,
+                            conn_id,
+                            path,
+                            "error: is a directory",
+                            None,
+                        )
+                        .await;
                         return McpToolResult::error_text(format!("{} is a directory", path));
                     }
                     Ok(meta) if meta.size <= MAX_HASHED_PREVIOUS_BYTES => {
@@ -443,8 +499,15 @@ impl McpServer {
                         ))
                     }
                     Err(err) => {
-                        self.audit(agent_id, tool_name, conn_id, path, &format!("error: {}", err), Some(diff))
-                            .await;
+                        self.audit(
+                            agent_id,
+                            tool_name,
+                            conn_id,
+                            path,
+                            &format!("error: {}", err),
+                            Some(diff),
+                        )
+                        .await;
                         McpToolResult::error_text(format!("Failed to write file: {}", err))
                     }
                 }
@@ -462,8 +525,15 @@ impl McpServer {
                         McpToolResult::success_text(json!({ "matches": results }).to_string())
                     }
                     Err(err) => {
-                        self.audit(agent_id, tool_name, conn_id, &summary, &format!("error: {}", err), None)
-                            .await;
+                        self.audit(
+                            agent_id,
+                            tool_name,
+                            conn_id,
+                            &summary,
+                            &format!("error: {}", err),
+                            None,
+                        )
+                        .await;
                         McpToolResult::error_text(format!("Search failed: {}", err))
                     }
                 }
@@ -495,8 +565,15 @@ impl McpServer {
 
                 let actions = ActionCatalog::builtin_actions();
                 let Some(act) = actions.iter().find(|a| a.id == action_id) else {
-                    self.audit(agent_id, tool_name, conn_id, action_id, "error: unknown action", None)
-                        .await;
+                    self.audit(
+                        agent_id,
+                        tool_name,
+                        conn_id,
+                        action_id,
+                        "error: unknown action",
+                        None,
+                    )
+                    .await;
                     return McpToolResult::error_text(format!(
                         "Action '{}' not found in catalog",
                         action_id
@@ -525,8 +602,15 @@ impl McpServer {
                         )
                     }
                     Err(err) => {
-                        self.audit(agent_id, tool_name, conn_id, action_id, &format!("error: {}", err), None)
-                            .await;
+                        self.audit(
+                            agent_id,
+                            tool_name,
+                            conn_id,
+                            action_id,
+                            &format!("error: {}", err),
+                            None,
+                        )
+                        .await;
                         McpToolResult::error_text(format!("Action validation failed: {}", err))
                     }
                 }
@@ -739,11 +823,18 @@ mod tests {
         assert_eq!(text_of(&res, 0).len() as u64, 200_000.min(MAX_READ_BYTES));
 
         let res = server
-            .handle_tool_call("t", "fs_read_file", &json!({ "path": bin_path.to_str().unwrap() }))
+            .handle_tool_call(
+                "t",
+                "fs_read_file",
+                &json!({ "path": bin_path.to_str().unwrap() }),
+            )
             .await;
         let meta: Value = serde_json::from_str(&text_of(&res, 1)).unwrap();
         assert_eq!(meta["encoding"], "base64");
-        assert_eq!(base64_decode(&text_of(&res, 0)).unwrap(), vec![0u8, 159, 146, 150, 255]);
+        assert_eq!(
+            base64_decode(&text_of(&res, 0)).unwrap(),
+            vec![0u8, 159, 146, 150, 255]
+        );
     }
 
     #[tokio::test]
@@ -753,7 +844,11 @@ mod tests {
         std::fs::write(&p, "aé").unwrap(); // 'é' is two bytes
         let server = McpServer::new(AuditLogger::new());
         let res = server
-            .handle_tool_call("t", "fs_read_file", &json!({ "path": p.to_str().unwrap(), "length": 2 }))
+            .handle_tool_call(
+                "t",
+                "fs_read_file",
+                &json!({ "path": p.to_str().unwrap(), "length": 2 }),
+            )
             .await;
         assert_eq!(text_of(&res, 0), "a");
         let meta: Value = serde_json::from_str(&text_of(&res, 1)).unwrap();
@@ -799,13 +894,25 @@ mod tests {
         let audit = AuditLogger::new();
         let server = McpServer::new(audit.clone());
         let res = server
-            .handle_tool_call("t", "fs_list_dir", &json!({ "connection_id": "gone", "path": "/" }))
+            .handle_tool_call(
+                "t",
+                "fs_list_dir",
+                &json!({ "connection_id": "gone", "path": "/" }),
+            )
             .await;
         assert!(res.is_error);
-        assert_eq!(audit.get_recent_events(1).await[0].status, "error: connection not found");
+        assert_eq!(
+            audit.get_recent_events(1).await[0].status,
+            "error: connection not found"
+        );
 
-        server.handle_tool_call("t", "no_such_tool", &json!({})).await;
-        assert_eq!(audit.get_recent_events(1).await[0].status, "error: unknown tool");
+        server
+            .handle_tool_call("t", "no_such_tool", &json!({}))
+            .await;
+        assert_eq!(
+            audit.get_recent_events(1).await[0].status,
+            "error: unknown tool"
+        );
 
         server
             .handle_rpc(
@@ -827,7 +934,11 @@ mod tests {
         assert!(server.unregister_connection("prod").await);
         assert!(!server.unregister_connection("prod").await);
         let res = server
-            .handle_tool_call("t", "fs_list_dir", &json!({ "connection_id": "prod", "path": "/" }))
+            .handle_tool_call(
+                "t",
+                "fs_list_dir",
+                &json!({ "connection_id": "prod", "path": "/" }),
+            )
             .await;
         assert!(res.is_error);
     }
@@ -848,7 +959,10 @@ mod tests {
             assert_eq!(v["executed"], false);
         }
         let tools = server.list_tools();
-        let exec = tools.iter().find(|t| t.name == "exec_smart_action").unwrap();
+        let exec = tools
+            .iter()
+            .find(|t| t.name == "exec_smart_action")
+            .unwrap();
         assert!(exec.description.contains("NOT execute"));
     }
 
