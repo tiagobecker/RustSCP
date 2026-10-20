@@ -136,7 +136,11 @@ pub enum Protocol {
     #[serde(alias = "scp", alias = "ssh")]
     Sftp,
     S3,
+    /// Plain FTP: user name, password and files travel unencrypted.
     Ftp,
+    /// Explicit FTPS (FTP over TLS, RFC 4217): the same server port as FTP,
+    /// upgraded with `AUTH TLS` before logging in.
+    Ftps,
     WebDav,
 }
 
@@ -147,6 +151,7 @@ impl fmt::Display for Protocol {
             Self::Sftp => write!(f, "sftp"),
             Self::S3 => write!(f, "s3"),
             Self::Ftp => write!(f, "ftp"),
+            Self::Ftps => write!(f, "ftps"),
             Self::WebDav => write!(f, "webdav"),
         }
     }
@@ -215,6 +220,11 @@ pub struct ConnectionConfig {
     pub auth: AuthMethod,
     #[serde(default)]
     pub remote_root: String,
+    /// FTPS only: SHA-256 fingerprint of a server certificate trusted although
+    /// the system does not trust it (a self-signed server). Not written when
+    /// unset, so other sites serialize exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_fingerprint: Option<String>,
 }
 
 impl ConnectionConfig {
@@ -228,6 +238,7 @@ impl ConnectionConfig {
             username: whoami(),
             auth: AuthMethod::None,
             remote_root: "/".to_string(),
+            tls_fingerprint: None,
         }
     }
 }

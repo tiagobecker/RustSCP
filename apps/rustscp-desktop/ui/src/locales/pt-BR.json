@@ -306,7 +306,11 @@
     "doubleClickHint": "Clique duas vezes para conectar",
     "savedSecret": "Salva — digite para trocar",
     "ftpHint": "FTP simples: usuário, senha e arquivos trafegam sem criptografia",
-    "ftpWarning": "O FTP não é criptografado: sua senha e seus arquivos trafegam em texto puro. Prefira SFTP quando o servidor suportar."
+    "ftpWarning": "O FTP não é criptografado: sua senha e seus arquivos trafegam em texto puro. Prefira FTPS ou SFTP quando o servidor suportar.",
+    "ftpsHint": "FTP sobre TLS (explícito): usuário, senha e arquivos trafegam criptografados",
+    "tlsFingerprint": "Certificado confiável (SHA-256)",
+    "tlsFingerprintHint": "Só para servidores com certificado autoassinado. Certificados em que o sistema confia são sempre aceitos. Se a conexão acusar um certificado não confiável, compare a impressão digital com a do servidor e cole-a aqui.",
+    "errFingerprint": "O certificado confiável deve ser uma impressão digital SHA-256 (64 dígitos hexadecimais)."
   },
   "virtualDisk": {
     "title": "Disco Virtual & Drive Nativo",

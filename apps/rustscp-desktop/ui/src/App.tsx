@@ -913,10 +913,10 @@ export const App: React.FC = () => {
     return proto === 'sftp' || proto === 'scp';
   };
 
-  /** chmod works on SSH servers and this computer; S3 and FTP sessions have no Unix permissions here. */
+  /** chmod works on SSH servers and this computer; S3 and FTP(S) sessions have no Unix permissions here. */
   const supportsPermissions = (sid: string) => {
     const proto = sessionById(sid)?.config.protocol;
-    return proto !== 's3' && proto !== 'ftp';
+    return proto !== 's3' && proto !== 'ftp' && proto !== 'ftps';
   };
 
   /**

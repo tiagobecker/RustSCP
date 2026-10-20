@@ -77,7 +77,7 @@ fn percent_encode(value: &str, keep_slash: bool) -> String {
 
 fn default_port(protocol: &Protocol) -> u16 {
     match protocol {
-        Protocol::Ftp => 21,
+        Protocol::Ftp | Protocol::Ftps => 21,
         Protocol::S3 | Protocol::WebDav => 443,
         Protocol::Sftp | Protocol::Local => 22,
     }
@@ -142,6 +142,8 @@ impl CodeGenerator {
     ) -> String {
         let scheme = match config.protocol {
             Protocol::Local => "sftp".to_string(),
+            // WinSCP's scheme for explicit FTPS (its "ftps://" is implicit TLS on port 990).
+            Protocol::Ftps => "ftpes".to_string(),
             ref p => p.to_string(),
         };
         let user = if config.username.is_empty() {
@@ -187,10 +189,15 @@ impl CodeGenerator {
                     }
                     None => format!(" -password=\"%{PASSWORD_ENV_VAR}%\""),
                 };
-                let hostkey = if matches!(config.protocol, Protocol::Sftp | Protocol::Local) {
-                    format!(" -hostkey={}", winscp_arg(HOSTKEY_PLACEHOLDER))
-                } else {
-                    String::new()
+                let hostkey = match (&config.protocol, config.tls_fingerprint.as_deref()) {
+                    (Protocol::Sftp | Protocol::Local, _) => {
+                        format!(" -hostkey={}", winscp_arg(HOSTKEY_PLACEHOLDER))
+                    }
+                    // The self-signed certificate this site trusts.
+                    (Protocol::Ftps, Some(fp)) if !fp.trim().is_empty() => {
+                        format!(" -certificate={}", winscp_arg(fp.trim()))
+                    }
+                    _ => String::new(),
                 };
                 format!(
                     "# RustSCP Batch Automation Script (WinSCP syntax)\n\
@@ -228,6 +235,11 @@ impl CodeGenerator {
                     Protocol::WebDav => (
                         format!("https://{host}:{port}{encoded_path}"),
                         String::new(),
+                    ),
+                    // curl's ftps:// is implicit TLS; explicit FTPS is ftp:// with --ssl-reqd.
+                    Protocol::Ftps => (
+                        format!("ftp://{host}:{port}{encoded_path}"),
+                        " --ssl-reqd".to_string(),
                     ),
                     _ => (
                         format!("{scheme}://{host}:{port}{encoded_path}"),
@@ -370,6 +382,7 @@ mod tests {
             username: "deploy@corp".into(),
             auth,
             remote_root: "/".into(),
+            tls_fingerprint: None,
         }
     }
 
@@ -431,6 +444,28 @@ mod tests {
         let ftp = config(AuthMethod::None, Protocol::Ftp);
         let url = CodeGenerator::generate(&ftp, CodeTargetLanguage::WinScpUrl, "/", "");
         assert_eq!(url, "ftp://deploy%40corp@srv.example.com:21/");
+    }
+
+    #[test]
+    fn test_ftps_uses_explicit_tls_everywhere() {
+        let mut ftps = config(AuthMethod::Password(SECRET.into()), Protocol::Ftps);
+        ftps.port = 0;
+        let url = CodeGenerator::generate(&ftps, CodeTargetLanguage::WinScpUrl, "/", "");
+        assert_eq!(url, "ftpes://deploy%40corp@srv.example.com:21/");
+
+        let curl = CodeGenerator::generate(&ftps, CodeTargetLanguage::Curl, "/a.txt", "/tmp");
+        assert!(curl.contains(" --ssl-reqd "), "{curl}");
+        assert!(curl.contains("'ftp://srv.example.com:21/a.txt'"), "{curl}");
+
+        let fp = "AB:".repeat(31) + "AB";
+        ftps.tls_fingerprint = Some(fp.clone());
+        let script = CodeGenerator::generate(&ftps, CodeTargetLanguage::WinScpScript, "/", "");
+        assert!(script.contains("open ftpes://"), "{script}");
+        assert!(
+            script.contains(&format!("-certificate=\"{fp}\"")),
+            "{script}"
+        );
+        assert!(!script.contains("-hostkey"), "{script}");
     }
 
     #[test]

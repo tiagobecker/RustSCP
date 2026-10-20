@@ -306,7 +306,11 @@
     "doubleClickHint": "Double-click to connect",
     "savedSecret": "Saved — type to replace",
     "ftpHint": "Plain FTP: user name, password and files travel unencrypted",
-    "ftpWarning": "FTP is not encrypted: your password and files travel in clear text. Prefer SFTP when the server supports it."
+    "ftpWarning": "FTP is not encrypted: your password and files travel in clear text. Prefer FTPS or SFTP when the server supports them.",
+    "ftpsHint": "FTP over TLS (explicit): user name, password and files are encrypted",
+    "tlsFingerprint": "Trusted certificate (SHA-256)",
+    "tlsFingerprintHint": "Only for a server with a self-signed certificate. Certificates your system trusts are always accepted. If the connection reports an untrusted certificate, compare its fingerprint with the server's and paste it here.",
+    "errFingerprint": "The trusted certificate must be a SHA-256 fingerprint (64 hexadecimal digits)."
   },
   "virtualDisk": {
     "title": "Native Virtual Disk & Network Drive",

@@ -89,7 +89,7 @@ export const FindFilesModal: React.FC<FindFilesModalProps> = ({
   const listRef = useRef<HTMLDivElement>(null);
 
   const proto = (protocol || '').toLowerCase();
-  const textSearchUnsupported = proto === 'ftp' || proto === 's3';
+  const textSearchUnsupported = proto === 'ftp' || proto === 'ftps' || proto === 's3';
 
   // Every opening starts in the folder it was opened from, with no results from another session.
   useEffect(() => {

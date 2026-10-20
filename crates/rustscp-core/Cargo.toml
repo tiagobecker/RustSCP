@@ -27,6 +27,15 @@ libc = "0.2"
 aes-gcm = "0.10"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 rand = "0.8"
+# FTPS (FTP over TLS). The same rustls build reqwest already uses: aws-lc-rs
+# crypto and the operating system's certificate verifier.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
+rustls-platform-verifier = "0.6"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The local vault's device key lives in the macOS Keychain.
+security-framework = "3"
+core-foundation = "0.10"
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -38,8 +38,20 @@ interface LoginDialogProps {
 
 type AuthMode = 'password' | 'key' | 'agent';
 
-const DEFAULT_PORTS: Record<string, number> = { sftp: 22, scp: 22, ftp: 21, s3: 443, local: 0, webdav: 443 };
+const DEFAULT_PORTS: Record<string, number> = { sftp: 22, scp: 22, ftp: 21, ftps: 21, s3: 443, local: 0, webdav: 443 };
 const isSsh = (p: Protocol) => p === 'sftp' || p === 'scp';
+const isFtp = (p: Protocol) => p === 'ftp' || p === 'ftps';
+
+/** Same rule as the backend: 64 hex digits, separators and a `SHA256:` / `SHA256 Fingerprint=` prefix allowed. */
+const isSha256Fingerprint = (text: string) => {
+  const afterEquals = text.includes('=') ? text.slice(text.indexOf('=') + 1) : text;
+  const digits = afterEquals
+    .trim()
+    .toLowerCase()
+    .replace(/^sha-?256:/, '')
+    .replace(/[:\s-]/g, '');
+  return /^[0-9a-f]{64}$/.test(digits);
+};
 
 const ProtocolIcon: React.FC<{ protocol: Protocol; className?: string }> = ({ protocol, className = 'w-4 h-4' }) => {
   if (protocol === 's3') return <Cloud className={className} />;
@@ -73,6 +85,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   const [privateKeyPath, setPrivateKeyPath] = useState<string>('');
   const [passphrase, setPassphrase] = useState<string>('');
   const [remoteRoot, setRemoteRoot] = useState<string>('');
+  const [tlsFingerprint, setTlsFingerprint] = useState<string>('');
   const [showPassword, setShowPassword] = useState<boolean>(false);
   const [isConnecting, setIsConnecting] = useState<boolean>(false);
   const [isSaving, setIsSaving] = useState<boolean>(false);
@@ -124,6 +137,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
     setPort(String(site.port || DEFAULT_PORTS[site.protocol] || ''));
     setUsername(site.username);
     setRemoteRoot(site.remote_root || '');
+    setTlsFingerprint(site.tls_fingerprint || '');
     setErrorMessage('');
     setShowPassword(false);
     setPendingDeleteId(null);
@@ -166,6 +180,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
     setPrivateKeyPath('');
     setPassphrase('');
     setRemoteRoot('');
+    setTlsFingerprint('');
     setErrorMessage('');
     setShowPassword(false);
     setPendingDeleteId(null);
@@ -180,10 +195,11 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   /** Accepts pasted `user@host:port`, `sftp://user@host:2222/path` or `s3://endpoint` and splits it into fields. */
   const splitHostInput = (raw: string) => {
     const value = raw.trim();
-    const m = value.match(/^(?:(sftp|scp|ftp|s3|https?):\/\/)?(?:([^@\s/]+)@)?([^:/\s]+)(?::(\d{1,5}))?(\/[^\s]*)?$/i);
+    const m = value.match(/^(?:(sftp|scp|ftps|ftpes|ftp|s3|https?):\/\/)?(?:([^@\s/]+)@)?([^:/\s]+)(?::(\d{1,5}))?(\/[^\s]*)?$/i);
     if (!m || !(m[1] || m[2] || m[4] || m[5])) return;
     const [, scheme, user, h, p, path] = m;
-    if (scheme && !/^https?$/i.test(scheme)) handleProtocolChange(scheme.toLowerCase() as Protocol);
+    // ftpes:// is WinSCP's name for explicit FTPS, the only FTPS mode RustSCP speaks.
+    if (scheme && !/^https?$/i.test(scheme)) handleProtocolChange((/^ftpes$/i.test(scheme) ? 'ftps' : scheme.toLowerCase()) as Protocol);
     if (/^https?$/i.test(scheme || '')) return; // S3 endpoints keep their URL form
     setHost(h);
     if (user && !username) setUsername(user);
@@ -218,6 +234,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
       username: trimmedUser,
       auth: buildAuth(),
       remote_root: remoteRoot.trim(),
+      tls_fingerprint: protocol === 'ftps' && tlsFingerprint.trim() ? tlsFingerprint.trim() : null,
     };
   };
 
@@ -227,6 +244,9 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
     const p = parseInt(port, 10);
     if (!Number.isFinite(p) || p < 1 || p > 65535) return t('loginDialog.errPort', 'Port must be a number between 1 and 65535.');
     if (isSsh(protocol) && authMode === 'key' && !privateKeyPath.trim()) return t('loginDialog.errKey', 'Choose a private key file.');
+    if (protocol === 'ftps' && tlsFingerprint.trim() && !isSha256Fingerprint(tlsFingerprint)) {
+      return t('loginDialog.errFingerprint', 'The trusted certificate must be a SHA-256 fingerprint (64 hexadecimal digits).');
+    }
     return null;
   };
 
@@ -350,6 +370,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
     { value: 'sftp', label: 'SFTP' },
     { value: 'scp', label: 'SCP', title: t('loginDialog.scpHint', 'SCP runs over the same SSH connection') },
     { value: 'ftp', label: 'FTP', title: t('loginDialog.ftpHint', 'Plain FTP: user name, password and files travel unencrypted') },
+    { value: 'ftps', label: 'FTPS', title: t('loginDialog.ftpsHint', 'FTP over TLS (explicit): user name, password and files are encrypted') },
     { value: 's3', label: 'S3', title: 'Amazon S3, Cloudflare R2, MinIO, Wasabi, B2' },
     { value: 'local', label: t('loginDialog.localShort', 'Local') },
   ];
@@ -499,7 +520,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
               {protocol === 'ftp' && (
                 <p className="flex items-start gap-2 text-[12px] text-amber-700 dark:text-amber-400 leading-snug">
                   <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-px" />
-                  {t('loginDialog.ftpWarning', 'FTP is not encrypted: your password and files travel in clear text. Prefer SFTP when the server supports it.')}
+                  {t('loginDialog.ftpWarning', 'FTP is not encrypted: your password and files travel in clear text. Prefer FTPS or SFTP when the server supports them.')}
                 </p>
               )}
 
@@ -575,7 +596,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
                             setUsername(e.target.value);
                             setIsDirty(true);
                           }}
-                          placeholder={isS3 ? 'AKIA…' : protocol === 'ftp' ? 'anonymous' : 'root'}
+                          placeholder={isS3 ? 'AKIA…' : isFtp(protocol) ? 'anonymous' : 'root'}
                         />
                       )}
                     </Field>
@@ -680,12 +701,36 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
                   )}
 
                   {!isS3 && (
-                    <Disclosure label={t('loginDialog.advancedTab')} defaultOpen={!!remoteRoot}>
-                      <Field label={t('loginDialog.remoteRoot')} hint={t('loginDialog.remoteRootHelper')}>
-                        {(id) => (
-                          <TextInput id={id} mono value={remoteRoot} onChange={handleRemoteRootChange} placeholder="~" />
+                    <Disclosure label={t('loginDialog.advancedTab')} defaultOpen={!!remoteRoot || (protocol === 'ftps' && !!tlsFingerprint)}>
+                      <div className="space-y-4">
+                        <Field label={t('loginDialog.remoteRoot')} hint={t('loginDialog.remoteRootHelper')}>
+                          {(id) => (
+                            <TextInput id={id} mono value={remoteRoot} onChange={handleRemoteRootChange} placeholder="~" />
+                          )}
+                        </Field>
+                        {protocol === 'ftps' && (
+                          <Field
+                            label={t('loginDialog.tlsFingerprint', 'Trusted certificate (SHA-256)')}
+                            hint={t(
+                              'loginDialog.tlsFingerprintHint',
+                              "Only for a server with a self-signed certificate. Certificates your system trusts are always accepted. If the connection reports an untrusted certificate, compare its fingerprint with the server's and paste it here."
+                            )}
+                          >
+                            {(id) => (
+                              <TextInput
+                                id={id}
+                                mono
+                                value={tlsFingerprint}
+                                onChange={(e) => {
+                                  setTlsFingerprint(e.target.value);
+                                  setIsDirty(true);
+                                }}
+                                placeholder="AB:CD:EF:…"
+                              />
+                            )}
+                          </Field>
                         )}
-                      </Field>
+                      </div>
                     </Disclosure>
                   )}
                 </>

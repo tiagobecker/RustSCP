@@ -1,8 +1,14 @@
-//! Minimal plain-FTP client (RFC 959 with the RFC 2428 EPSV and RFC 3659
+//! Minimal FTP client (RFC 959 with the RFC 2428 EPSV and RFC 3659
 //! MLSD/MLST/SIZE/MDTM/REST extensions) on `std::net::TcpStream`, run on the
-//! blocking thread pool.
+//! blocking thread pool, with optional explicit FTPS (RFC 4217).
 //!
-//! Only plain FTP is supported: credentials and data travel unencrypted.
+//! Plain FTP sends credentials and data unencrypted. With [`FtpConfig::tls`]
+//! the control connection is upgraded with `AUTH TLS` before the user name
+//! is sent, `PBSZ 0` + `PROT P` put every data connection under TLS too, and
+//! nothing falls back to clear text. The server certificate is checked by the
+//! operating system's verifier; a self-signed server is accepted only when
+//! the user pinned its SHA-256 fingerprint.
+//!
 //! Every operation either really happens on the server or returns an error;
 //! nothing reports success without doing the work.
 
@@ -14,6 +20,13 @@ use crate::vfs::VirtualFileSystem;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{
+    CertificateError, ClientConfig, ClientConnection, DigitallySignedStruct, OtherError,
+    SignatureScheme, StreamOwned,
+};
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -28,6 +41,11 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 const DATA_TIMEOUT: Duration = Duration::from_secs(60);
 /// Wait for the final reply after a transfer (servers may flush large uploads).
 const TRANSFER_END_TIMEOUT: Duration = Duration::from_secs(120);
+/// After a TLS upload, how long to wait for the server to close the data
+/// connection (its close_notify and session tickets arrive meanwhile).
+const TLS_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long to wait for the server's explanation of a failed data handshake.
+const TLS_FAILURE_REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 /// Idle pooled connections are checked with NOOP after this long.
 const LIVENESS_CHECK_AFTER: Duration = Duration::from_secs(10);
 /// An open sequential download is abandoned after this much idle time.
@@ -46,6 +64,13 @@ pub struct FtpConfig {
     pub port: u16,
     pub username: String,
     pub password: Option<String>,
+    /// Explicit FTPS: `AUTH TLS` on the control connection before the user
+    /// name is sent, then `PROT P` so data connections are TLS as well.
+    pub tls: bool,
+    /// SHA-256 fingerprint of a server certificate to accept although the
+    /// system does not trust it (a self-signed server). Certificates the
+    /// system trusts are accepted either way. Only used with `tls`.
+    pub tls_fingerprint: Option<String>,
 }
 
 impl fmt::Debug for FtpConfig {
@@ -55,6 +80,8 @@ impl fmt::Debug for FtpConfig {
             .field("port", &self.port)
             .field("username", &self.username)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("tls", &self.tls)
+            .field("tls_fingerprint", &self.tls_fingerprint)
             .finish()
     }
 }
@@ -818,6 +845,329 @@ pub(crate) fn parse_dos_list_line(line: &str) -> Option<ListItem> {
 }
 
 // ---------------------------------------------------------------------------
+// TLS (explicit FTPS, RFC 4217)
+// ---------------------------------------------------------------------------
+
+/// `AB:CD:…` (upper-case hex pairs): the SHA-256 fingerprint of a DER
+/// certificate, as `openssl x509 -noout -fingerprint -sha256` prints it.
+pub fn certificate_fingerprint(der: &[u8]) -> String {
+    Sha256::digest(der)
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// Reads a SHA-256 certificate fingerprint typed or pasted by the user:
+/// 64 hex digits in any case, optionally separated by colons, spaces or
+/// dashes, optionally after `SHA256:` or OpenSSL's `SHA256 Fingerprint=`.
+pub fn parse_certificate_fingerprint(text: &str) -> Option<[u8; 32]> {
+    let mut s = text.trim();
+    if let Some((_, after)) = s.split_once('=') {
+        s = after;
+    }
+    let lower = s.trim().to_ascii_lowercase();
+    let digits: String = lower
+        .strip_prefix("sha256:")
+        .or_else(|| lower.strip_prefix("sha-256:"))
+        .unwrap_or(&lower)
+        .chars()
+        .filter(|c| !matches!(c, ':' | ' ' | '-' | '\t'))
+        .collect();
+    if digits.len() != 64 {
+        return None;
+    }
+    hex::decode(digits).ok()?.try_into().ok()
+}
+
+/// What a server's answer to `AUTH TLS` / `AUTH SSL` means (RFC 4217 §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthReply {
+    /// 234: start the TLS handshake now.
+    Accepted,
+    /// The server does not know the command or this mechanism (500, 501,
+    /// 502, 504): try the older `AUTH SSL`, or the server has no FTPS.
+    Unsupported,
+    /// Anything else (431 unavailable, 534 policy, 334 ADAT, 421…).
+    Refused,
+}
+
+fn classify_auth_reply(code: u16) -> AuthReply {
+    match code {
+        234 => AuthReply::Accepted,
+        500 | 501 | 502 | 504 => AuthReply::Unsupported,
+        _ => AuthReply::Refused,
+    }
+}
+
+/// A server certificate that the system rejected and no pinned fingerprint
+/// matched. Travels inside the rustls error so the handshake error can show
+/// the fingerprint the user would have to check and pin.
+#[derive(Debug)]
+struct UntrustedCertificate {
+    fingerprint: String,
+    reason: String,
+}
+
+impl fmt::Display for UntrustedCertificate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} (SHA-256 {})", self.reason, self.fingerprint)
+    }
+}
+
+impl std::error::Error for UntrustedCertificate {}
+
+fn certificate_problem(e: &rustls::Error) -> String {
+    match e {
+        rustls::Error::InvalidCertificate(c) => match c {
+            CertificateError::UnknownIssuer => {
+                "it is not issued by an authority this computer trusts (self-signed or private CA)"
+                    .to_string()
+            }
+            CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => {
+                "it was issued for a different host name".to_string()
+            }
+            CertificateError::Expired | CertificateError::ExpiredContext { .. } => {
+                "it has expired".to_string()
+            }
+            CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => {
+                "it is not valid yet".to_string()
+            }
+            CertificateError::Revoked => "it has been revoked".to_string(),
+            // The platform's own explanation (macOS: "… certificate is not trusted").
+            CertificateError::Other(OtherError(inner)) => inner.to_string(),
+            other => format!("{other:?}"),
+        },
+        other => other.to_string(),
+    }
+}
+
+/// The operating system's certificate verification (trust store, host name,
+/// validity), plus one pinned certificate for self-signed servers.
+#[derive(Debug)]
+struct FtpsVerifier {
+    system: rustls_platform_verifier::Verifier,
+    pinned: Option<[u8; 32]>,
+}
+
+impl ServerCertVerifier for FtpsVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let err = match self.system.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Ok(verified) => return Ok(verified),
+            Err(e) => e,
+        };
+        let digest = Sha256::digest(end_entity.as_ref());
+        if self.pinned.is_some_and(|pin| pin[..] == digest[..]) {
+            return Ok(ServerCertVerified::assertion());
+        }
+        let mut reason = certificate_problem(&err);
+        if self.pinned.is_some() {
+            reason.push_str(", and it is not the certificate pinned for this site");
+        }
+        Err(rustls::Error::InvalidCertificate(CertificateError::Other(
+            OtherError(Arc::new(UntrustedCertificate {
+                fingerprint: certificate_fingerprint(end_entity.as_ref()),
+                reason,
+            })),
+        )))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.system.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.system.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.system.supported_verify_schemes()
+    }
+}
+
+/// TLS settings of one control connection, shared by its data connections.
+///
+/// Every control connection gets its own client config, and with it its own
+/// session cache: servers such as vsftpd (`require_ssl_reuse`, on by default)
+/// only accept data connections that resume the TLS session of their own
+/// control connection.
+#[derive(Clone)]
+struct TlsSession {
+    config: Arc<ClientConfig>,
+    server_name: ServerName<'static>,
+}
+
+impl TlsSession {
+    fn new(host: &str, pinned_fingerprint: Option<&str>) -> Result<Self, FtpError> {
+        let pinned = match pinned_fingerprint.map(str::trim).filter(|s| !s.is_empty()) {
+            None => None,
+            Some(text) => Some(parse_certificate_fingerprint(text).ok_or_else(|| {
+                CoreError::ConnectionFailed(format!(
+                    "the trusted certificate fingerprint '{text}' is not a SHA-256 \
+                     fingerprint (64 hexadecimal digits)"
+                ))
+            })?),
+        };
+        let setup_error =
+            |e: rustls::Error| CoreError::ConnectionFailed(format!("FTPS: TLS setup failed: {e}"));
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let system =
+            rustls_platform_verifier::Verifier::new(provider.clone()).map_err(setup_error)?;
+        let config = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(setup_error)?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(FtpsVerifier { system, pinned }))
+            .with_no_client_auth();
+        let server_name = ServerName::try_from(host.to_string()).map_err(|_| {
+            CoreError::ConnectionFailed(format!("FTPS: '{host}' is not a valid TLS server name"))
+        })?;
+        Ok(Self {
+            config: Arc::new(config),
+            server_name,
+        })
+    }
+
+    /// Starts TLS as the client on `tcp` and completes the handshake.
+    fn connect(&self, tcp: TcpStream) -> io::Result<Stream> {
+        let conn = ClientConnection::new(self.config.clone(), self.server_name.clone())
+            .map_err(io::Error::other)?;
+        let mut stream = Stream::Tls(Box::new(StreamOwned::new(conn, tcp)));
+        stream.handshake()?;
+        Ok(stream)
+    }
+}
+
+/// Explains a failed TLS handshake. A certificate the system does not trust
+/// is reported with its SHA-256 fingerprint so the user can check it with
+/// the server's administrator and pin it.
+fn tls_error(context: &str, e: io::Error) -> CoreError {
+    let tls = e
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>());
+    let untrusted = match tls {
+        Some(rustls::Error::InvalidCertificate(CertificateError::Other(OtherError(inner)))) => {
+            inner.downcast_ref::<UntrustedCertificate>()
+        }
+        _ => None,
+    };
+    if let Some(u) = untrusted {
+        return CoreError::ConnectionFailed(format!(
+            "FTPS {context}: the server's certificate is not trusted: {}. No user name or \
+             password was sent. If this is your server, compare this SHA-256 fingerprint with \
+             the certificate on the server and add it to the site as the trusted certificate: {}",
+            u.reason, u.fingerprint
+        ));
+    }
+    match tls {
+        Some(err) => {
+            CoreError::ConnectionFailed(format!("FTPS {context}: TLS handshake failed: {err}"))
+        }
+        None => io_error(&format!("{context} (TLS handshake)"), e),
+    }
+}
+
+/// A control or data connection: plain TCP, or TLS over TCP.
+enum Stream {
+    Plain(TcpStream),
+    Tls(Box<StreamOwned<ClientConnection, TcpStream>>),
+}
+
+impl Stream {
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            Stream::Plain(s) => s,
+            Stream::Tls(t) => &t.sock,
+        }
+    }
+
+    fn handshake(&mut self) -> io::Result<()> {
+        if let Stream::Tls(t) = self {
+            while t.conn.is_handshaking() {
+                t.conn.complete_io(&mut t.sock)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Ends the sending direction: TLS close_notify, then a TCP half-close.
+    fn finish_sending(&mut self) {
+        if let Stream::Tls(t) = self {
+            t.conn.send_close_notify();
+            let _ = t.flush();
+        }
+        let _ = self.tcp().shutdown(Shutdown::Write);
+    }
+
+    /// After a TLS upload: reads what the server still sends (session
+    /// tickets, close_notify) until it closes the connection. The tickets
+    /// let later data connections resume this session.
+    fn drain(&mut self) {
+        if let Stream::Tls(t) = self {
+            let _ = t.sock.set_read_timeout(Some(TLS_DRAIN_TIMEOUT));
+            let _ = io::copy(&mut (&mut **t).take(MAX_LINE_BYTES), &mut io::sink());
+        }
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.read(buf),
+            Stream::Tls(t) => match t.read(buf) {
+                // Many servers close data connections without a TLS
+                // close_notify. That is the end of the data: the transfer's
+                // final reply (on the TLS control connection) still says
+                // whether it completed.
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof && !t.conn.is_handshaking() => {
+                    Ok(0)
+                }
+                other => other,
+            },
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.write(buf),
+            Stream::Tls(t) => t.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Stream::Plain(s) => s.flush(),
+            Stream::Tls(t) => t.flush(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Control connection
 // ---------------------------------------------------------------------------
 
@@ -826,11 +1176,11 @@ pub(crate) fn parse_dos_list_line(line: &str) -> Option<ListItem> {
 struct ActiveRetr {
     path: String,
     next_offset: u64,
-    data: TcpStream,
+    data: Stream,
 }
 
 enum Transfer {
-    Data(TcpStream),
+    Data(Stream),
     /// The server sent the final reply right away (e.g. an empty listing).
     Finished,
     /// REST was refused; nothing was started.
@@ -838,8 +1188,12 @@ enum Transfer {
 }
 
 struct Conn {
-    reader: BufReader<TcpStream>,
-    writer: TcpStream,
+    /// The control connection; commands are written through `get_mut()`.
+    reader: BufReader<Stream>,
+    /// Set once the control connection runs over TLS.
+    tls: Option<TlsSession>,
+    /// PROT P accepted: data connections use TLS too.
+    protected_data: bool,
     peer_ip: IpAddr,
     /// The control connection is unusable and must not go back to the pool.
     broken: bool,
@@ -874,6 +1228,12 @@ impl Conn {
             return Err(CoreError::ConnectionFailed("FTP host is empty".into()).into());
         }
         let port = if cfg.port == 0 { 21 } else { cfg.port };
+        // Before any network I/O, so a mistyped fingerprint fails right away.
+        let tls = if cfg.tls {
+            Some(TlsSession::new(&host, cfg.tls_fingerprint.as_deref())?)
+        } else {
+            None
+        };
         let addrs: Vec<SocketAddr> = (host.as_str(), port)
             .to_socket_addrs()
             .map_err(|e| {
@@ -909,11 +1269,11 @@ impl Conn {
         };
         setup(&stream).map_err(|e| io_error("connect", e))?;
         let peer_ip = stream.peer_addr().map_err(|e| io_error("connect", e))?.ip();
-        let writer = stream.try_clone().map_err(|e| io_error("connect", e))?;
 
         let mut conn = Conn {
-            reader: BufReader::new(stream),
-            writer,
+            reader: BufReader::new(Stream::Plain(stream)),
+            tls: None,
+            protected_data: false,
             peer_ip,
             broken: false,
             last_used: Instant::now(),
@@ -936,9 +1296,118 @@ impl Conn {
             ))
             .into());
         }
+        if let Some(tls) = tls {
+            conn.start_tls(tls)?;
+        }
         conn.login(&cfg.username, cfg.password.as_deref())?;
+        if conn.tls.is_some() {
+            conn.protect_data()?;
+        }
         conn.negotiate()?;
         Ok(conn)
+    }
+
+    /// `AUTH TLS` (falling back to the older `AUTH SSL`) and the TLS
+    /// handshake on the control connection. Runs before USER, so neither the
+    /// user name nor the password ever travels in clear text; a server
+    /// without FTPS is an error, never a silent downgrade to plain FTP.
+    fn start_tls(&mut self, tls: TlsSession) -> Result<(), FtpError> {
+        let mut reply = self.command("AUTH", Some("TLS"))?;
+        if classify_auth_reply(reply.code) == AuthReply::Unsupported {
+            reply = self.command("AUTH", Some("SSL"))?;
+        }
+        match classify_auth_reply(reply.code) {
+            AuthReply::Accepted => {}
+            AuthReply::Unsupported => {
+                return Err(CoreError::ConnectionFailed(format!(
+                    "the FTP server does not support FTPS (AUTH TLS): {} {}. Nothing was sent; \
+                     use plain FTP only if you accept that the password and files travel \
+                     unencrypted",
+                    reply.code,
+                    reply.message().trim_end_matches('.')
+                ))
+                .into())
+            }
+            AuthReply::Refused => {
+                return Err(CoreError::ConnectionFailed(format!(
+                    "the FTP server refused to start TLS (AUTH TLS): {} {}",
+                    reply.code,
+                    reply.message()
+                ))
+                .into())
+            }
+        }
+        // Anything already buffered arrived in clear text after the server
+        // accepted AUTH: it could be injected by an attacker, so refuse it.
+        if !self.reader.buffer().is_empty() {
+            self.broken = true;
+            return Err(CoreError::Protocol(
+                "FTPS: the server sent unexpected data after accepting AUTH TLS".into(),
+            )
+            .into());
+        }
+        let tcp = self
+            .reader
+            .get_ref()
+            .tcp()
+            .try_clone()
+            .map_err(|e| io_error("AUTH TLS", e))?;
+        let stream = tls.connect(tcp).map_err(|e| {
+            self.broken = true;
+            tls_error("control connection", e)
+        })?;
+        self.reader = BufReader::new(stream);
+        self.tls = Some(tls);
+        Ok(())
+    }
+
+    /// `PBSZ 0` and `PROT P` (RFC 4217 §8–9): data connections use TLS too.
+    /// A server that refuses PROT P is an error: files are never sent in
+    /// clear text on an FTPS session.
+    fn protect_data(&mut self) -> Result<(), FtpError> {
+        let pbsz = self.command("PBSZ", Some("0"))?;
+        // Only "not implemented" is tolerated: such servers may still take PROT P.
+        if !pbsz.is_ok() && !matches!(pbsz.code, 500 | 502) {
+            return Err(reply_error("PBSZ 0".into(), pbsz));
+        }
+        let prot = self.command("PROT", Some("P"))?;
+        if !prot.is_ok() {
+            return Err(CoreError::ConnectionFailed(format!(
+                "the FTP server refused to encrypt file transfers (PROT P): {} {}. The session \
+                 was closed so that no file travels unencrypted",
+                prot.code,
+                prot.message().trim_end_matches('.')
+            ))
+            .into());
+        }
+        self.protected_data = true;
+        Ok(())
+    }
+
+    /// Puts a data connection under TLS once the server has answered the
+    /// transfer command (servers start their side of the handshake then).
+    fn secure_data(&mut self, tcp: TcpStream, context: &str) -> Result<Stream, FtpError> {
+        let tls = match &self.tls {
+            Some(tls) if self.protected_data => tls.clone(),
+            _ => return Ok(Stream::Plain(tcp)),
+        };
+        let err = match tls.connect(tcp) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => tls_error(&format!("{context} data connection"), e),
+        };
+        // The transfer is in an unknown state: this control connection is
+        // not reused. The server usually explains the failure (vsftpd:
+        // "522 SSL connection failed: session reuse required").
+        self.broken = true;
+        match self.read_reply_timeout(context, TLS_FAILURE_REPLY_TIMEOUT) {
+            Ok(reply) if !reply.is_ok() => Err(CoreError::ConnectionFailed(format!(
+                "{err} (server: {} {})",
+                reply.code,
+                reply.message()
+            ))
+            .into()),
+            _ => Err(err.into()),
+        }
     }
 
     fn read_reply(&mut self, context: &str) -> Result<Reply, FtpError> {
@@ -957,11 +1426,12 @@ impl Conn {
     }
 
     fn read_reply_timeout(&mut self, context: &str, timeout: Duration) -> Result<Reply, FtpError> {
-        let _ = self.reader.get_ref().set_read_timeout(Some(timeout));
+        let _ = self.reader.get_ref().tcp().set_read_timeout(Some(timeout));
         let reply = self.read_reply(context);
         let _ = self
             .reader
             .get_ref()
+            .tcp()
             .set_read_timeout(Some(CONTROL_TIMEOUT));
         reply
     }
@@ -970,7 +1440,7 @@ impl Conn {
     fn close_retr(&mut self) -> Result<(), FtpError> {
         if let Some(active) = self.retr.take() {
             let context = describe("RETR", Some(&active.path));
-            let _ = active.data.shutdown(Shutdown::Both);
+            let _ = active.data.tcp().shutdown(Shutdown::Both);
             drop(active);
             self.read_reply_timeout(&context, TRANSFER_END_TIMEOUT)?;
         }
@@ -992,10 +1462,10 @@ impl Conn {
         } else {
             describe(verb, arg)
         };
-        let sent = self
-            .writer
+        let writer = self.reader.get_mut();
+        let sent = writer
             .write_all(line.as_bytes())
-            .and_then(|_| self.writer.flush());
+            .and_then(|_| writer.flush());
         if let Err(e) = sent {
             self.broken = true;
             return Err(io_error(&context, e).into());
@@ -1161,7 +1631,9 @@ impl Conn {
         }
         let reply = self.command(verb, arg)?;
         match reply.code / 100 {
-            1 => Ok(Transfer::Data(data)),
+            1 => Ok(Transfer::Data(
+                self.secure_data(data, &describe(verb, arg))?,
+            )),
             2 => Ok(Transfer::Finished),
             _ => Err(reply_error(describe(verb, arg), reply)),
         }
@@ -1411,7 +1883,10 @@ impl Conn {
             }
         };
         let written = sock.write_all(data).and_then(|_| sock.flush());
-        let _ = sock.shutdown(Shutdown::Write);
+        sock.finish_sending();
+        if written.is_ok() {
+            sock.drain();
+        }
         drop(sock);
         // The final reply explains a failed upload (quota, permissions...).
         match self.read_reply_timeout(&context, TRANSFER_END_TIMEOUT) {
@@ -1737,7 +2212,11 @@ impl FtpDriver {
 #[async_trait]
 impl VirtualFileSystem for FtpDriver {
     fn protocol(&self) -> Protocol {
-        Protocol::Ftp
+        if self.config.tls {
+            Protocol::Ftps
+        } else {
+            Protocol::Ftp
+        }
     }
 
     /// Not advertised: chunked uploads need APPE (or REST + STOR) on a file
@@ -2236,6 +2715,8 @@ mod tests {
             port: 21,
             username: "u".into(),
             password: Some("hunter2".into()),
+            tls: false,
+            tls_fingerprint: None,
         });
         let dbg = format!("{d:?}");
         assert!(!dbg.contains("hunter2"));
@@ -2246,11 +2727,147 @@ mod tests {
     // -----------------------------------------------------------------------
 
     mod fake {
+        use base64::Engine as _;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        use rustls::{HandshakeKind, ServerConfig, ServerConnection, StreamOwned};
         use std::collections::{BTreeMap, BTreeSet};
-        use std::io::{BufRead, BufReader, Read, Write};
+        use std::io::{self, BufRead, BufReader, Read, Write};
         use std::net::{TcpListener, TcpStream};
         use std::sync::{Arc, Mutex};
         use std::thread;
+
+        /// Self-signed P-256 test certificate (CN=localhost, SAN localhost and
+        /// 127.0.0.1, valid until 2126) and its PKCS#8 key, DER in base64.
+        const TEST_CERT_B64: &str =
+            "MIIBPjCB5aADAgECAgkAnhBfzQ3bhPAwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJbG9jYWxob3N0\
+            MCAXDTI2MTAyMDE1NDgzNloYDzIxMjYwOTI2MTU0ODM2WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3Qw\
+            WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQxRoBM2H5DuHB9T/w1Zp2tAcZcCH18aeFuHVi2xdwt\
+            l4P55iZls5M6eM7kF6lpY1xKCoo+fYzNu4NLFDK358Npox4wHDAaBgNVHREEEzARgglsb2NhbGhv\
+            c3SHBH8AAAEwCgYIKoZIzj0EAwIDSAAwRQIgUssOX5ElE2vZW7mWW0AmgNYQ7ZoAhMA7fzQOBool\
+            +aICIQDOfPfkKDY9m7HEiQ1lovYnp0wUa5TTUdrX3yyXjSRbYQ==";
+        const TEST_KEY_B64: &str =
+            "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgv/YKp+XzmrEJh2ETTm+BNmbJUWvy\
+            xI0lOa16igNIgWqhRANCAAQxRoBM2H5DuHB9T/w1Zp2tAcZcCH18aeFuHVi2xdwtl4P55iZls5M6\
+            eM7kF6lpY1xKCoo+fYzNu4NLFDK358Np";
+        /// `openssl x509 -noout -fingerprint -sha256` of the test certificate.
+        pub const TEST_CERT_FINGERPRINT: &str = "FC:C5:C2:3D:8C:C6:0B:25:06:62:0D:2E:D5:63:A2:1C:\
+            9C:38:A4:9E:A0:88:4F:CB:0C:F2:24:2F:D3:5A:2A:A9";
+
+        fn der(b64: &str) -> Vec<u8> {
+            let compact: String = b64.split_whitespace().collect();
+            base64::engine::general_purpose::STANDARD
+                .decode(compact)
+                .unwrap()
+        }
+
+        pub fn test_cert_der() -> Vec<u8> {
+            der(TEST_CERT_B64)
+        }
+
+        /// A fresh server config, and so a fresh session cache, per control
+        /// connection: like vsftpd's per-session process, a data connection
+        /// can only resume its own control connection's session.
+        fn session_tls_config(tls12_only: bool) -> Arc<ServerConfig> {
+            let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+            let builder = ServerConfig::builder_with_provider(provider);
+            let builder = if tls12_only {
+                builder.with_protocol_versions(&[&rustls::version::TLS12])
+            } else {
+                builder.with_safe_default_protocol_versions()
+            };
+            let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der(TEST_KEY_B64)));
+            Arc::new(
+                builder
+                    .unwrap()
+                    .with_no_client_auth()
+                    .with_single_cert(vec![CertificateDer::from(test_cert_der())], key)
+                    .unwrap(),
+            )
+        }
+
+        /// One end of a control or data connection, plain or TLS.
+        pub enum Conn {
+            Plain(TcpStream),
+            Tls(Box<StreamOwned<ServerConnection, TcpStream>>),
+            Closed,
+        }
+
+        impl Read for Conn {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                match self {
+                    Conn::Plain(s) => s.read(buf),
+                    Conn::Tls(t) => t.read(buf),
+                    Conn::Closed => Ok(0),
+                }
+            }
+        }
+
+        impl Write for Conn {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                match self {
+                    Conn::Plain(s) => s.write(buf),
+                    Conn::Tls(t) => t.write(buf),
+                    Conn::Closed => Err(io::ErrorKind::BrokenPipe.into()),
+                }
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                match self {
+                    Conn::Plain(s) => s.flush(),
+                    Conn::Tls(t) => t.flush(),
+                    Conn::Closed => Ok(()),
+                }
+            }
+        }
+
+        /// The control connection, shared by the line reader and the reply
+        /// writer (one session thread uses it, so the lock never contends).
+        #[derive(Clone)]
+        pub struct Ctl(Arc<Mutex<Conn>>);
+
+        impl Read for Ctl {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().read(buf)
+            }
+        }
+
+        impl Write for Ctl {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().write(buf)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                self.0.lock().unwrap().flush()
+            }
+        }
+
+        /// A data connection; TLS ones end with close_notify, like vsftpd's.
+        pub struct Data(Conn);
+
+        impl Read for Data {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.0.read(buf)
+            }
+        }
+
+        impl Write for Data {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.write(buf)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                self.0.flush()
+            }
+        }
+
+        impl Drop for Data {
+            fn drop(&mut self) {
+                if let Conn::Tls(t) = &mut self.0 {
+                    t.conn.send_close_notify();
+                    let _ = t.flush();
+                }
+            }
+        }
 
         #[derive(Default)]
         pub struct Fs {
@@ -2263,12 +2880,30 @@ mod tests {
             /// Answer APPE and REST + STOR on an existing file with 451, like
             /// stock ProFTPD without `AllowStoreRestart`.
             pub refuse_append_existing: bool,
+            /// USER commands received on a control connection without / with TLS.
+            pub plain_users: usize,
+            pub tls_users: usize,
+            /// TLS data connections that resumed the control connection's
+            /// session, and those that needed a full handshake.
+            pub data_resumed: usize,
+            pub data_full: usize,
         }
 
-        #[derive(Clone, Copy)]
+        #[derive(Clone, Copy, Default)]
         pub struct Options {
             pub mlst: bool,
             pub epsv: bool,
+            /// Offer explicit FTPS (AUTH TLS) with the test certificate.
+            pub tls: bool,
+            /// TLS 1.2 only (session-ID resumption instead of TLS 1.3 tickets).
+            pub tls12_only: bool,
+            /// Answer `AUTH TLS` with 504; only the older `AUTH SSL` works.
+            pub auth_ssl_only: bool,
+            /// Answer `PROT P` with 536.
+            pub refuse_prot_p: bool,
+            /// vsftpd's `require_ssl_reuse`: a TLS data connection that does
+            /// not resume its control connection's session fails with 522.
+            pub require_reuse: bool,
         }
 
         pub struct Server {
@@ -2333,13 +2968,54 @@ mod tests {
             out
         }
 
+        /// Accepts the passive data connection. Under PROT P (`tls` set) it
+        /// completes the TLS handshake first and enforces session reuse; on
+        /// failure the 522 reply has been sent and None is returned.
+        fn open_data(
+            passive: &mut Option<TcpListener>,
+            out: &mut Ctl,
+            tls: Option<&Arc<ServerConfig>>,
+            opts: Options,
+            fs: &Mutex<Fs>,
+        ) -> Option<Data> {
+            let listener = passive.take().expect("no passive listener");
+            let tcp = listener.accept().unwrap().0;
+            let Some(cfg) = tls else {
+                return Some(Data(Conn::Plain(tcp)));
+            };
+            let mut tls = StreamOwned::new(ServerConnection::new(cfg.clone()).unwrap(), tcp);
+            while tls.conn.is_handshaking() {
+                if tls.conn.complete_io(&mut tls.sock).is_err() {
+                    let _ = out.write_all(b"522 SSL connection failed\r\n");
+                    return None;
+                }
+            }
+            let resumed = tls.conn.handshake_kind() == Some(HandshakeKind::Resumed);
+            {
+                let mut g = fs.lock().unwrap();
+                if resumed {
+                    g.data_resumed += 1;
+                } else {
+                    g.data_full += 1;
+                }
+            }
+            if opts.require_reuse && !resumed {
+                let _ = out.write_all(b"522 SSL connection failed: session reuse required\r\n");
+                return None;
+            }
+            Some(Data(Conn::Tls(Box::new(tls))))
+        }
+
         fn session(stream: TcpStream, fs: Arc<Mutex<Fs>>, opts: Options) {
-            let mut out = stream.try_clone().unwrap();
-            let mut reader = BufReader::new(stream);
-            let send = |out: &mut TcpStream, s: &str| {
-                let _ = out.write_all(s.as_bytes());
+            let mut out = Ctl(Arc::new(Mutex::new(Conn::Plain(stream))));
+            let mut reader = BufReader::new(out.clone());
+            let send = |out: &mut Ctl, s: &str| {
+                let _ = out.write_all(s.as_bytes()).and_then(|_| out.flush());
             };
             send(&mut out, "220-Fake FTP server\r\n220 Ready\r\n");
+            let session_tls = opts.tls.then(|| session_tls_config(opts.tls12_only));
+            let mut tls_active = false;
+            let mut prot_p = false;
             let mut cwd = "/home".to_string();
             let mut passive: Option<TcpListener> = None;
             let mut rest: u64 = 0;
@@ -2356,12 +3032,48 @@ mod tests {
                     Some((v, a)) => (v.to_ascii_uppercase(), a.to_string()),
                     None => (raw.to_ascii_uppercase(), String::new()),
                 };
-                let accept = |passive: &mut Option<TcpListener>| -> TcpStream {
-                    let l = passive.take().expect("no passive listener");
-                    l.accept().unwrap().0
-                };
+                let data_tls = if prot_p { session_tls.as_ref() } else { None };
                 match verb.as_str() {
+                    "AUTH" if opts.tls => {
+                        let mech = arg.to_ascii_uppercase();
+                        if (mech == "TLS" && opts.auth_ssl_only)
+                            || !matches!(mech.as_str(), "TLS" | "SSL")
+                        {
+                            send(&mut out, "504 Unknown AUTH type.\r\n");
+                            continue;
+                        }
+                        send(&mut out, "234 Proceed with negotiation.\r\n");
+                        let cfg = session_tls.clone().expect("TLS config");
+                        let mut g = out.0.lock().unwrap();
+                        if let Conn::Plain(tcp) = std::mem::replace(&mut *g, Conn::Closed) {
+                            let conn = ServerConnection::new(cfg).unwrap();
+                            *g = Conn::Tls(Box::new(StreamOwned::new(conn, tcp)));
+                        }
+                        tls_active = true;
+                    }
+                    "PBSZ" if opts.tls => send(&mut out, "200 PBSZ=0\r\n"),
+                    "PROT" if opts.tls => match arg.to_ascii_uppercase().as_str() {
+                        "P" if opts.refuse_prot_p => {
+                            send(&mut out, "536 PROT P not supported.\r\n")
+                        }
+                        "P" => {
+                            prot_p = true;
+                            send(&mut out, "200 Protection level set to Private.\r\n");
+                        }
+                        _ => {
+                            prot_p = false;
+                            send(&mut out, "200 Protection level set to Clear.\r\n");
+                        }
+                    },
                     "USER" => {
+                        {
+                            let mut g = fs.lock().unwrap();
+                            if tls_active {
+                                g.tls_users += 1;
+                            } else {
+                                g.plain_users += 1;
+                            }
+                        }
                         user_ok = arg == "alice";
                         send(&mut out, "331 Password required\r\n");
                     }
@@ -2463,7 +3175,11 @@ mod tests {
                             None => send(&mut out, "550 No such file or directory\r\n"),
                             Some(s) => {
                                 send(&mut out, "150 Here comes the listing\r\n");
-                                let mut data = accept(&mut passive);
+                                let Some(mut data) =
+                                    open_data(&mut passive, &mut out, data_tls, opts, &fs)
+                                else {
+                                    continue;
+                                };
                                 let _ = data.write_all(s.as_bytes());
                                 drop(data);
                                 send(&mut out, "226 Transfer complete\r\n");
@@ -2481,7 +3197,10 @@ mod tests {
                             s
                         };
                         send(&mut out, "150 Here comes the listing\r\n");
-                        let mut data = accept(&mut passive);
+                        let Some(mut data) = open_data(&mut passive, &mut out, data_tls, opts, &fs)
+                        else {
+                            continue;
+                        };
                         let _ = data.write_all(s.as_bytes());
                         drop(data);
                         send(&mut out, "226 Transfer complete\r\n");
@@ -2497,7 +3216,11 @@ mod tests {
                             None => send(&mut out, "550 Failed to open file.\r\n"),
                             Some(d) => {
                                 send(&mut out, "150 Opening BINARY mode data connection\r\n");
-                                let mut data = accept(&mut passive);
+                                let Some(mut data) =
+                                    open_data(&mut passive, &mut out, data_tls, opts, &fs)
+                                else {
+                                    continue;
+                                };
                                 let start = (rest as usize).min(d.len());
                                 rest = 0;
                                 let ok = data.write_all(&d[start..]).is_ok();
@@ -2543,7 +3266,10 @@ mod tests {
                             continue;
                         }
                         send(&mut out, "150 Ok to send data\r\n");
-                        let mut data = accept(&mut passive);
+                        let Some(mut data) = open_data(&mut passive, &mut out, data_tls, opts, &fs)
+                        else {
+                            continue;
+                        };
                         let mut buf = Vec::new();
                         let _ = data.read_to_end(&mut buf);
                         let mut g = fs.lock().unwrap();
@@ -2636,7 +3362,86 @@ mod tests {
             port,
             username: "alice".into(),
             password: Some(password.into()),
+            tls: false,
+            tls_fingerprint: None,
         })
+    }
+
+    fn ftps_driver(port: u16, fingerprint: Option<&str>) -> FtpDriver {
+        FtpDriver::new(FtpConfig {
+            host: "127.0.0.1".into(),
+            port,
+            username: "alice".into(),
+            password: Some("secret".into()),
+            tls: true,
+            tls_fingerprint: fingerprint.map(str::to_string),
+        })
+    }
+
+    /// The driver a test server expects: FTPS trusting the (self-signed)
+    /// test certificate by its pinned fingerprint when the server offers TLS.
+    fn driver_with(server: &fake::Server, opts: fake::Options) -> FtpDriver {
+        if opts.tls {
+            ftps_driver(server.port, Some(fake::TEST_CERT_FINGERPRINT))
+        } else {
+            driver_for(server.port, "secret")
+        }
+    }
+
+    /// FTPS with MLSD/EPSV over TLS 1.3, and a server that, like vsftpd,
+    /// refuses data connections that do not resume the control session.
+    fn ftps_options() -> fake::Options {
+        fake::Options {
+            mlst: true,
+            epsv: true,
+            tls: true,
+            require_reuse: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn certificate_fingerprints_are_formatted_and_parsed() {
+        let fp = certificate_fingerprint(&fake::test_cert_der());
+        assert_eq!(fp, fake::TEST_CERT_FINGERPRINT);
+        let bytes = parse_certificate_fingerprint(&fp).unwrap();
+        assert_eq!(bytes[0], 0xFC);
+        assert_eq!(bytes[31], 0xA9);
+        // The forms users paste: bare lower-case hex, OpenSSL output, SHA256: prefix, spaces.
+        let bare = fp.replace(':', "").to_lowercase();
+        assert_eq!(parse_certificate_fingerprint(&bare), Some(bytes));
+        assert_eq!(
+            parse_certificate_fingerprint(&format!("SHA256 Fingerprint={fp}")),
+            Some(bytes)
+        );
+        assert_eq!(
+            parse_certificate_fingerprint(&format!("sha256:{bare}")),
+            Some(bytes)
+        );
+        assert_eq!(
+            parse_certificate_fingerprint(&format!("  {}  ", fp.replace(':', " "))),
+            Some(bytes)
+        );
+        // Wrong length, SHA-1 sized, or not hex.
+        assert_eq!(parse_certificate_fingerprint(""), None);
+        assert_eq!(parse_certificate_fingerprint(&bare[..40]), None);
+        assert_eq!(parse_certificate_fingerprint(&format!("{bare}00")), None);
+        assert_eq!(parse_certificate_fingerprint(&"zz".repeat(32)), None);
+    }
+
+    #[test]
+    fn auth_replies_are_classified() {
+        assert_eq!(classify_auth_reply(234), AuthReply::Accepted);
+        for code in [500, 501, 502, 504] {
+            assert_eq!(classify_auth_reply(code), AuthReply::Unsupported, "{code}");
+        }
+        // 334 asks for ADAT (security data exchange), which TLS never uses.
+        for code in [334, 421, 431, 530, 534] {
+            assert_eq!(classify_auth_reply(code), AuthReply::Refused, "{code}");
+        }
+        // AUTH replies arrive like any other reply.
+        let r = reply("234 Proceed with negotiation.\r\n").unwrap();
+        assert_eq!(classify_auth_reply(r.code), AuthReply::Accepted);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2644,6 +3449,7 @@ mod tests {
         let server = fake::start(fake::Options {
             mlst: true,
             epsv: true,
+            ..Default::default()
         });
         let err = driver_for(server.port, "wrong")
             .connect()
@@ -2654,7 +3460,7 @@ mod tests {
 
     async fn exercise_driver(opts: fake::Options) {
         let server = fake::start(opts);
-        let d = driver_for(server.port, "secret");
+        let d = driver_with(&server, opts);
         d.connect().await.unwrap();
         assert_eq!(d.get_default_path().await.unwrap(), "/home");
 
@@ -2770,6 +3576,28 @@ mod tests {
             assert!(!fs.files.keys().any(|p| p.starts_with("/home/a")));
         }
         assert!(!d.exists("/home/a").await.unwrap());
+
+        let fs = server.fs.lock().unwrap();
+        if opts.tls {
+            assert_eq!(d.protocol(), Protocol::Ftps);
+            assert_eq!(
+                fs.plain_users, 0,
+                "the user name must never travel in clear text"
+            );
+            assert!(fs.tls_users >= 1);
+            assert!(
+                fs.data_resumed > 10,
+                "data connections resumed: {}",
+                fs.data_resumed
+            );
+            assert_eq!(
+                fs.data_full, 0,
+                "every data connection resumes its control session"
+            );
+        } else {
+            assert_eq!(d.protocol(), Protocol::Ftp);
+            assert_eq!(fs.data_resumed + fs.data_full, 0);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2777,6 +3605,7 @@ mod tests {
         exercise_driver(fake::Options {
             mlst: true,
             epsv: true,
+            ..Default::default()
         })
         .await;
     }
@@ -2786,8 +3615,123 @@ mod tests {
         exercise_driver(fake::Options {
             mlst: false,
             epsv: false,
+            ..Default::default()
         })
         .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ftps_end_to_end_tls13_with_pinned_certificate_and_session_reuse() {
+        exercise_driver(ftps_options()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ftps_end_to_end_tls12_with_list_and_pasv_fallbacks() {
+        exercise_driver(fake::Options {
+            mlst: false,
+            epsv: false,
+            tls12_only: true,
+            ..ftps_options()
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ftps_untrusted_certificate_is_refused_before_the_user_name_is_sent() {
+        let server = fake::start(ftps_options());
+        let err = ftps_driver(server.port, None).connect().await.unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, CoreError::ConnectionFailed(_)), "{err:?}");
+        assert!(msg.contains("not trusted"), "{msg}");
+        assert!(
+            msg.contains(fake::TEST_CERT_FINGERPRINT),
+            "the error shows the fingerprint: {msg}"
+        );
+
+        // A different pinned certificate does not help either.
+        let other = "00:".repeat(31) + "00";
+        let err = ftps_driver(server.port, Some(&other))
+            .connect()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not the certificate pinned"),
+            "{err}"
+        );
+
+        let fs = server.fs.lock().unwrap();
+        assert_eq!(fs.plain_users + fs.tls_users, 0, "no user name may be sent");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ftps_pinned_fingerprint_accepts_pasted_formats_and_rejects_garbage() {
+        let server = fake::start(ftps_options());
+        let bare = fake::TEST_CERT_FINGERPRINT.replace(':', "").to_lowercase();
+        let d = ftps_driver(server.port, Some(&format!(" SHA256 Fingerprint={bare} ")));
+        d.connect().await.unwrap();
+        assert_eq!(d.list_dir("/").await.unwrap().len(), 1);
+
+        let err = ftps_driver(server.port, Some("AB:CD"))
+            .connect()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not a SHA-256 fingerprint"),
+            "{err}"
+        );
+        // A blank fingerprint means "nothing pinned", not an error.
+        let err = ftps_driver(server.port, Some("  "))
+            .connect()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not trusted"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ftps_falls_back_to_auth_ssl() {
+        let opts = fake::Options {
+            auth_ssl_only: true,
+            ..ftps_options()
+        };
+        let server = fake::start(opts);
+        let d = driver_with(&server, opts);
+        d.connect().await.unwrap();
+        d.write_file("/home/x.txt", Bytes::from_static(b"over tls"))
+            .await
+            .unwrap();
+        assert_eq!(&d.read_file("/home/x.txt").await.unwrap()[..], b"over tls");
+        let fs = server.fs.lock().unwrap();
+        assert_eq!(fs.plain_users, 0);
+        assert_eq!(fs.data_full, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ftps_never_falls_back_to_plain_ftp() {
+        let server = fake::start(fake::Options {
+            mlst: true,
+            epsv: true,
+            ..Default::default()
+        });
+        let err = ftps_driver(server.port, None).connect().await.unwrap_err();
+        assert!(matches!(err, CoreError::ConnectionFailed(_)), "{err:?}");
+        assert!(err.to_string().contains("does not support FTPS"), "{err}");
+        assert_eq!(
+            server.fs.lock().unwrap().plain_users,
+            0,
+            "no user name may be sent"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ftps_requires_encrypted_data_connections() {
+        let opts = fake::Options {
+            refuse_prot_p: true,
+            ..ftps_options()
+        };
+        let server = fake::start(opts);
+        let err = driver_with(&server, opts).connect().await.unwrap_err();
+        assert!(matches!(err, CoreError::ConnectionFailed(_)), "{err:?}");
+        assert!(err.to_string().contains("PROT P"), "{err}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2795,6 +3739,7 @@ mod tests {
         let server = fake::start(fake::Options {
             mlst: true,
             epsv: true,
+            ..Default::default()
         });
         server.fs.lock().unwrap().refuse_appe = true;
         let d = driver_for(server.port, "secret");
@@ -2826,6 +3771,7 @@ mod tests {
         let server = fake::start(fake::Options {
             mlst: true,
             epsv: true,
+            ..Default::default()
         });
         {
             let mut g = server.fs.lock().unwrap();
@@ -2892,6 +3838,7 @@ mod tests {
         let server = fake::start(fake::Options {
             mlst: true,
             epsv: true,
+            ..Default::default()
         });
         {
             let mut g = server.fs.lock().unwrap();
@@ -2916,11 +3863,29 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_operations_use_separate_connections() {
-        let server = fake::start(fake::Options {
+        concurrent_operations(fake::Options {
             mlst: true,
             epsv: true,
-        });
-        let d = driver_for(server.port, "secret");
+            ..Default::default()
+        })
+        .await;
+    }
+
+    /// Each pooled control connection has its own TLS session, which its data
+    /// connections resume.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ftps_concurrent_connections_resume_their_own_sessions() {
+        concurrent_operations(ftps_options()).await;
+        concurrent_operations(fake::Options {
+            tls12_only: true,
+            ..ftps_options()
+        })
+        .await;
+    }
+
+    async fn concurrent_operations(opts: fake::Options) {
+        let server = fake::start(opts);
+        let d = driver_with(&server, opts);
         d.connect().await.unwrap();
         let mut handles = Vec::new();
         for i in 0..8 {
@@ -2937,7 +3902,9 @@ mod tests {
         for h in handles {
             h.await.unwrap();
         }
-        assert_eq!(server.fs.lock().unwrap().files.len(), 8);
+        let fs = server.fs.lock().unwrap();
+        assert_eq!(fs.files.len(), 8);
         assert!(lock(&d.pool).len() <= MAX_CONNECTIONS);
+        assert_eq!(fs.data_full, 0);
     }
 }

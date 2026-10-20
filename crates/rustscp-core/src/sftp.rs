@@ -2496,6 +2496,7 @@ mod tests {
                 passphrase: None,
             },
             remote_root: "/".into(),
+            tls_fingerprint: None,
         };
 
         // Trust on first use, then known.
@@ -2756,6 +2757,7 @@ mod tests {
             username: "u".into(),
             auth: AuthMethod::Password("hunter2".into()),
             remote_root: "/".into(),
+            tls_fingerprint: None,
         };
         let dbg = format!("{:?}", SftpDriver::new(cfg));
         assert!(!dbg.contains("hunter2"), "{dbg}");

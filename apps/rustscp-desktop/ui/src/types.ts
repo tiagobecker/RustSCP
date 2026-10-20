@@ -1,4 +1,5 @@
-export type Protocol = 'sftp' | 'scp' | 's3' | 'ftp' | 'local' | 'webdav';
+/** 'ftps' is explicit FTP over TLS (AUTH TLS on the FTP port). */
+export type Protocol = 'sftp' | 'scp' | 's3' | 'ftp' | 'ftps' | 'local' | 'webdav';
 
 export type FileType = 'file' | 'directory' | 'symlink' | 'other';
 
@@ -34,6 +35,8 @@ export interface ConnectionConfig {
   username: string;
   auth: AuthMethod;
   remote_root: string;
+  /** FTPS only: SHA-256 fingerprint of a self-signed server certificate to trust. */
+  tls_fingerprint?: string | null;
 }
 
 export type SyncDirection = 'local_to_remote' | 'remote_to_local' | 'both';

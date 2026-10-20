@@ -1026,7 +1026,7 @@ pub async fn connect_session(
             Arc::new(S3Driver::new(s3_cfg))
         }
 
-        Protocol::Ftp => {
+        Protocol::Ftp | Protocol::Ftps => {
             let ftp_cfg = FtpConfig {
                 host: config.host.clone(),
                 port: if config.port == 0 { 21 } else { config.port },
@@ -1035,6 +1035,8 @@ pub async fn connect_session(
                     rustscp_core::AuthMethod::Password(p) => Some(p.clone()),
                     _ => None,
                 },
+                tls: config.protocol == Protocol::Ftps,
+                tls_fingerprint: config.tls_fingerprint.clone(),
             };
             let driver = FtpDriver::new(ftp_cfg);
             driver.connect().await.map_err(|e| e.to_string())?;
@@ -1820,7 +1822,7 @@ fn effective_port(cfg: &ConnectionConfig) -> u16 {
         return cfg.port;
     }
     match cfg.protocol {
-        Protocol::Ftp => 21,
+        Protocol::Ftp | Protocol::Ftps => 21,
         Protocol::Sftp => 22,
         Protocol::S3 | Protocol::WebDav => 443,
         Protocol::Local => 0,
@@ -1841,7 +1843,15 @@ fn comparable_host(host: &str) -> String {
 /// ignored on purpose: two accounts on one host can reach the same files, and the only
 /// cost is refusing a copy onto the identical path.
 pub(crate) fn same_file_tree(a: &ConnectionConfig, b: &ConnectionConfig) -> bool {
-    if a.protocol != b.protocol {
+    // FTPS is FTP over TLS: both reach the same files on one host and port.
+    let family = |p: Protocol| {
+        if p == Protocol::Ftps {
+            Protocol::Ftp
+        } else {
+            p
+        }
+    };
+    if family(a.protocol) != family(b.protocol) {
         return false;
     }
     match a.protocol {
@@ -5922,6 +5932,7 @@ mod security_tests {
             username: "deploy".to_string(),
             auth,
             remote_root: "/".to_string(),
+            tls_fingerprint: None,
         }
     }
 
@@ -7711,6 +7722,7 @@ mod correctness_tests {
             username: user.to_string(),
             auth: rustscp_core::AuthMethod::None,
             remote_root: "/".to_string(),
+            tls_fingerprint: None,
         };
         let a = sftp("Example.com", 22, "deploy");
         assert!(same_file_tree(&a, &sftp(" example.com ", 0, "deploy")));
@@ -7720,6 +7732,14 @@ mod correctness_tests {
         let mut ftp = sftp("example.com", 0, "deploy");
         ftp.protocol = Protocol::Ftp;
         assert!(!same_file_tree(&a, &ftp));
+        let mut ftps = ftp.clone();
+        ftps.protocol = Protocol::Ftps;
+        assert!(
+            same_file_tree(&ftp, &ftps),
+            "FTP and FTPS reach the same files"
+        );
+        ftps.port = 990;
+        assert!(!same_file_tree(&ftp, &ftps));
         assert!(same_file_tree(
             &ConnectionConfig::local(),
             &ConnectionConfig::local()
