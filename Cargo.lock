@@ -3208,7 +3208,7 @@ dependencies = [
 
 [[package]]
 name = "rustscp-actions"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "regex",
@@ -3225,7 +3225,7 @@ dependencies = [
 
 [[package]]
 name = "rustscp-cache"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3242,7 +3242,7 @@ dependencies = [
 
 [[package]]
 name = "rustscp-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -3274,7 +3274,7 @@ dependencies = [
 
 [[package]]
 name = "rustscp-desktop"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3302,7 +3302,7 @@ dependencies = [
 
 [[package]]
 name = "rustscp-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
