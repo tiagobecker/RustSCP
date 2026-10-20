@@ -457,11 +457,34 @@ async fn cancelling_a_write_withdraws_its_approval_and_it_is_never_answered() {
         std::fs::read_to_string(&target).unwrap(),
         "hello from the server\n"
     );
-    assert!(!audit
-        .get_recent_events(10)
-        .await
-        .iter()
-        .any(|e| e.tool_name == "fs_write_file" && e.status == "success"));
+    // The withdrawn write is audited once, with what it would have written.
+    let writes = || async {
+        let mut events = audit.get_recent_events(10).await;
+        events.retain(|e| e.tool_name == "fs_write_file");
+        events
+    };
+    within("the withdrawn write to be audited", async {
+        while writes().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let events = writes().await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(
+        events[0].status.starts_with("withdrawn: "),
+        "{}",
+        events[0].status
+    );
+    assert!(
+        events[0]
+            .diff
+            .as_deref()
+            .unwrap()
+            .starts_with("new: 7 bytes sha256="),
+        "{:?}",
+        events[0].diff
+    );
     agent.finish().await;
 }
 

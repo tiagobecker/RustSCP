@@ -26,6 +26,8 @@ pub const MAX_READ_BYTES: u64 = 1024 * 1024;
 const MAX_HASHED_PREVIOUS_BYTES: u64 = 8 * 1024 * 1024;
 /// Start of the new content shown to the person approving a write.
 pub const APPROVAL_PREVIEW_BYTES: usize = 4096;
+/// Audit status of a write whose call ended while it waited for approval.
+const WITHDRAWN_STATUS: &str = "withdrawn: the agent cancelled or disconnected";
 
 /// Tools that change data; each call waits for a person's approval (see [`ToolApprover`]).
 pub fn tool_requires_approval(tool_name: &str) -> bool {
@@ -274,6 +276,53 @@ async fn write_and_audit(
                 .await;
             McpToolResult::error_text(format!("Failed to write file: {}", err))
         }
+    }
+}
+
+/// Audits a write as withdrawn when its call is dropped while waiting for approval (the
+/// agent cancelled or disconnected, or the gateway was turned off). Disarmed once the
+/// approver answers, so every write keeps a single entry.
+struct WithdrawnWriteAudit {
+    audit: AuditLogger,
+    agent_id: String,
+    tool_name: String,
+    conn_id: String,
+    path: String,
+    diff: String,
+    answered: bool,
+}
+
+impl Drop for WithdrawnWriteAudit {
+    fn drop(&mut self) {
+        if self.answered {
+            return;
+        }
+        // `Drop` cannot await, so the entry is written by a task on the caller's runtime.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                "MCP write to {} was withdrawn with no runtime to audit it",
+                self.path
+            );
+            return;
+        };
+        let audit = self.audit.clone();
+        let agent_id = std::mem::take(&mut self.agent_id);
+        let tool_name = std::mem::take(&mut self.tool_name);
+        let conn_id = std::mem::take(&mut self.conn_id);
+        let path = std::mem::take(&mut self.path);
+        let diff = std::mem::take(&mut self.diff);
+        runtime.spawn(async move {
+            audit
+                .log(
+                    &agent_id,
+                    &tool_name,
+                    &conn_id,
+                    &path,
+                    WITHDRAWN_STATUS,
+                    Some(diff),
+                )
+                .await;
+        });
     }
 }
 
@@ -748,14 +797,27 @@ impl McpServer {
                     &new_sha256,
                     previous_size,
                 );
+                let diff = format!("new: {} bytes sha256={new_sha256}", data.len());
                 let decision = match self.current_approver() {
-                    Some(approver) => approver.approve(request).await,
+                    Some(approver) => {
+                        let mut withdrawn = WithdrawnWriteAudit {
+                            audit: self.audit_logger.clone(),
+                            agent_id: agent_id.to_string(),
+                            tool_name: tool_name.to_string(),
+                            conn_id: conn_id.to_string(),
+                            path: path.to_string(),
+                            diff: diff.clone(),
+                            answered: false,
+                        };
+                        let decision = approver.approve(request).await;
+                        withdrawn.answered = true;
+                        decision
+                    }
                     None => ApprovalDecision::Denied(
                         "no RustSCP window is available to approve it".to_string(),
                     ),
                 };
                 if let ApprovalDecision::Denied(reason) = decision {
-                    let diff = format!("new: {} bytes sha256={new_sha256}", data.len());
                     self.audit(
                         agent_id,
                         tool_name,
@@ -975,6 +1037,28 @@ mod tests {
             self.seen.lock().unwrap().push(request);
             self.decision.clone()
         }
+    }
+
+    /// Never answers, like a dialog nobody looks at; tells when it is asked.
+    #[derive(Default)]
+    struct SilentApprover {
+        asked: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl ToolApprover for SilentApprover {
+        async fn approve(&self, _request: ApprovalRequest) -> ApprovalDecision {
+            self.asked.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    /// Audited `fs_write_file` calls, oldest first.
+    async fn write_events(audit: &AuditLogger) -> Vec<crate::audit::AuditEvent> {
+        let mut events = audit.get_recent_events(usize::MAX).await;
+        events.retain(|e| e.tool_name == "fs_write_file");
+        events.reverse();
+        events
     }
 
     #[tokio::test]
@@ -1261,6 +1345,62 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_a_write_dropped_while_waiting_for_approval_is_audited_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("conf.txt");
+        std::fs::write(&p, b"keep me").unwrap();
+        let args =
+            json!({ "connection_id": "local", "path": p.to_str().unwrap(), "content": "replaced" });
+        let audit = AuditLogger::new();
+        let server = local_server(audit.clone()).await;
+        let approver = Arc::new(SilentApprover::default());
+        server.set_approver(approver.clone());
+
+        // The call is dropped mid-approval, as when the agent cancels it.
+        tokio::select! {
+            _ = server.handle_tool_call("agent", "fs_write_file", &args) => {
+                panic!("nobody answered the approval")
+            }
+            _ = approver.asked.notified() => {}
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while write_events(&audit).await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the withdrawn write to be audited");
+        assert_eq!(std::fs::read(&p).unwrap(), b"keep me");
+
+        // Answered writes keep their single entry.
+        server.set_approver(FixedApprover::new(ApprovalDecision::Denied(
+            "rejected by the user".into(),
+        )));
+        server
+            .handle_tool_call("agent", "fs_write_file", &args)
+            .await;
+        server.set_approver(FixedApprover::new(ApprovalDecision::Approved));
+        server
+            .handle_tool_call("agent", "fs_write_file", &args)
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let events = write_events(&audit).await;
+        let statuses: Vec<&str> = events.iter().map(|e| e.status.as_str()).collect();
+        assert_eq!(
+            statuses,
+            [WITHDRAWN_STATUS, "denied: rejected by the user", "success"]
+        );
+        let new_sha256 = rustscp_core::disk_cache::sha256_hex(b"replaced");
+        let expected = format!("new: 8 bytes sha256={new_sha256}");
+        assert_eq!(events[0].diff.as_deref(), Some(expected.as_str()));
+        assert_eq!(events[0].diff, events[1].diff);
+        assert_eq!(events[0].agent_id, "agent");
+        assert_eq!(events[0].connection_id, "local");
+        assert_eq!(events[0].parameters_summary, p.to_str().unwrap());
     }
 
     #[test]
