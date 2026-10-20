@@ -8,7 +8,10 @@ use rustscp_core::{
     SyncEngine, SyncItem, SyncOptions, TransferQueueManager, VirtualDiskInfo, VirtualFileSystem,
     WebDavServer,
 };
-use rustscp_mcp::{AuditEvent, AuditLogger, McpServer};
+use rustscp_mcp::{
+    ApprovalDecision, ApprovalRequest, AuditEvent, AuditLogger, ConnectionInfo, McpGateway,
+    McpServer, ToolApprover,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -18,13 +21,29 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpStatusInfo {
+    /// Agents can connect right now (the build has a transport and the app is listening).
     pub enabled: bool,
+    /// Sessions agents can use (connected remote sessions; never the local disk).
     pub active_sessions_count: usize,
     pub total_audit_events: usize,
-    /// Whether an external MCP client can reach the gateway (`rustscp_mcp`'s
-    /// `MCP_TRANSPORT_AVAILABLE`; while no transport is wired the UI shows a preview).
+    /// Whether this build ships an MCP transport (`rustscp_mcp::MCP_TRANSPORT_AVAILABLE`).
     #[serde(default)]
     pub transport_available: bool,
+    /// Whether the app is accepting agent connections (`--mcp-stdio` bridges).
+    #[serde(default)]
+    pub transport_running: bool,
+    /// Agents connected right now.
+    #[serde(default)]
+    pub connected_agents: usize,
+    /// `claude mcp add ...` command for this executable.
+    #[serde(default)]
+    pub setup_command: Option<String>,
+    /// `mcpServers` JSON for other clients (Cursor, Claude Desktop, ...).
+    #[serde(default)]
+    pub setup_json: Option<String>,
+    /// Why the gateway could not start, when it could not.
+    #[serde(default)]
+    pub gateway_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -542,6 +561,10 @@ pub struct AppState {
     pub transfer_queue: Arc<TransferQueueManager>,
     pub mcp_server: Arc<McpServer>,
     pub audit_logger: AuditLogger,
+    /// Listener for `--mcp-stdio` bridges (started once the window exists).
+    pub mcp_gateway: Arc<std::sync::Mutex<McpGatewayState>>,
+    /// Agent writes waiting for Allow / Deny in the window.
+    pub mcp_approvals: Arc<McpApprovals>,
     /// Why the local vault could not be loaded at startup (`None` when it loaded fine).
     pub vault_load_error: Option<String>,
     /// Where the unreadable vault was moved (`sites.vault.corrupt-<unix_ts>`).
@@ -582,7 +605,8 @@ fn load_saved_sites_at_startup() -> (Vec<ConnectionConfig>, Option<String>, Opti
 
 impl AppState {
     pub fn new() -> Self {
-        let audit = AuditLogger::new();
+        // Agent activity also goes to a private JSON-lines file that survives restarts.
+        let audit = AuditLogger::with_log_file(get_rustscp_config_dir().join(MCP_AUDIT_LOG_FILE));
         let mcp = Arc::new(McpServer::new(audit.clone()));
         let mut active: HashMap<String, Arc<dyn VirtualFileSystem>> = HashMap::new();
         let mut configs = HashMap::new();
@@ -621,6 +645,8 @@ impl AppState {
             transfer_queue: Arc::new(TransferQueueManager::new(3)),
             mcp_server: mcp,
             audit_logger: audit,
+            mcp_gateway: Arc::new(std::sync::Mutex::new(McpGatewayState::default())),
+            mcp_approvals: Arc::new(McpApprovals::default()),
             vault_load_error,
             vault_backup_path,
         }
@@ -1028,17 +1054,22 @@ pub async fn connect_session(
     drop(sessions);
 
     let is_local = config.protocol == Protocol::Local;
+    // What agents see about the session: name, protocol and host, never credentials.
+    let agent_info = ConnectionInfo {
+        name: config.name.clone(),
+        protocol: config.protocol.to_string(),
+        host: config.host.clone(),
+    };
     let mut configs = state.session_configs.write().await;
     configs.insert(session_id.clone(), config);
     drop(configs);
 
     // Register remote sessions with the MCP server so AI agents can browse them. Local
-    // sessions are not registered again: the MCP server already has its own "local"
-    // workspace and a second unrestricted local driver would add nothing but exposure.
+    // sessions never are: agents get no unrestricted access to this computer's disk.
     if !is_local {
         state
             .mcp_server
-            .register_connection(session_id.clone(), vfs)
+            .register_session(session_id.clone(), agent_info, vfs)
             .await;
     }
 
@@ -2108,28 +2139,273 @@ pub async fn get_mcp_audit_logs(
 
 #[tauri::command]
 pub async fn get_mcp_status(state: tauri::State<'_, AppState>) -> Result<McpStatusInfo, String> {
-    let active_sessions_count = state.active_sessions.read().await.len();
+    let reachable_sessions = state.mcp_server.connection_ids().await.len();
     let total_audit_events = state.audit_logger.event_count().await;
+    let gateway = {
+        let slot = lock_gateway(&state.mcp_gateway);
+        GatewayStatus {
+            running: slot.gateway.is_some(),
+            connected_agents: slot.gateway.as_ref().map_or(0, |g| g.connected_clients()),
+            error: slot.error.clone(),
+        }
+    };
+    let exe = std::env::current_exe()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
     Ok(mcp_status_info(
         state.mcp_server.transport_available(),
-        active_sessions_count,
+        gateway,
+        reachable_sessions,
         total_audit_events,
+        exe.as_deref(),
     ))
 }
 
+/// Listener state as the status screen reports it.
+struct GatewayStatus {
+    running: bool,
+    connected_agents: usize,
+    error: Option<String>,
+}
+
 /// The gateway is only reported as enabled when an external MCP client can actually reach
-/// it: without a wired transport (stdio, socket or HTTP) nothing is listening, so the UI
-/// must never show a running gateway.
+/// it: the build has a transport and the app is listening for bridges.
 fn mcp_status_info(
     transport_available: bool,
+    gateway: GatewayStatus,
     active_sessions_count: usize,
     total_audit_events: usize,
+    exe: Option<&str>,
 ) -> McpStatusInfo {
+    let running = transport_available && gateway.running;
     McpStatusInfo {
-        enabled: transport_available,
+        enabled: running,
         active_sessions_count,
         total_audit_events,
         transport_available,
+        transport_running: running,
+        connected_agents: if running { gateway.connected_agents } else { 0 },
+        setup_command: exe.filter(|_| transport_available).map(mcp_setup_command),
+        setup_json: exe.filter(|_| transport_available).map(mcp_setup_json),
+        gateway_error: gateway.error,
+    }
+}
+
+// ---------------------- MCP GATEWAY (AI AGENTS) ----------------------
+
+/// Command-line flag that turns this executable into the MCP stdio server agents launch.
+pub const MCP_STDIO_FLAG: &str = "--mcp-stdio";
+/// Agent activity log in the config directory.
+const MCP_AUDIT_LOG_FILE: &str = "mcp-audit.log";
+/// How long an agent's write waits for Allow / Deny before it is denied.
+const MCP_APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Event carrying an [`McpApprovalPrompt`] to the window.
+const MCP_APPROVAL_REQUEST_EVENT: &str = "mcp-approval-request";
+/// Event with the id of a prompt that is no longer pending (answered, timed out, withdrawn).
+const MCP_APPROVAL_RESOLVED_EVENT: &str = "mcp-approval-resolved";
+
+#[derive(Default)]
+pub struct McpGatewayState {
+    pub gateway: Option<McpGateway>,
+    pub error: Option<String>,
+}
+
+fn lock_gateway(
+    slot: &std::sync::Mutex<McpGatewayState>,
+) -> std::sync::MutexGuard<'_, McpGatewayState> {
+    slot.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Shows how `arg` is typed in a shell: as-is when it has no special characters, quoted
+/// otherwise (double quotes on Windows, POSIX single quotes elsewhere).
+fn display_shell_arg(arg: &str) -> String {
+    let plain = !arg.is_empty()
+        && arg.chars().all(|c| {
+            c.is_ascii_alphanumeric() || "/._-+:@,".contains(c) || (cfg!(windows) && c == '\\')
+        });
+    if plain {
+        arg.to_string()
+    } else if cfg!(windows) {
+        format!("\"{arg}\"")
+    } else {
+        sh_quote(arg)
+    }
+}
+
+/// `claude mcp add` command that registers this executable's stdio server.
+fn mcp_setup_command(exe: &str) -> String {
+    format!(
+        "claude mcp add rustscp -- {} {MCP_STDIO_FLAG}",
+        display_shell_arg(exe)
+    )
+}
+
+/// `mcpServers` entry for clients configured with JSON (Cursor, Claude Desktop, ...).
+fn mcp_setup_json(exe: &str) -> String {
+    let config = serde_json::json!({
+        "mcpServers": { "rustscp": { "command": exe, "args": [MCP_STDIO_FLAG] } }
+    });
+    serde_json::to_string_pretty(&config).unwrap_or_default()
+}
+
+/// Starts accepting `--mcp-stdio` bridges and routes agent writes to the window for
+/// approval. Called once the window exists; a failure is reported by `get_mcp_status`.
+pub async fn start_mcp_gateway(app: tauri::AppHandle) {
+    use tauri::Manager;
+
+    let state = app.state::<AppState>();
+    state.mcp_server.set_approver(Arc::new(WindowApprover {
+        app: app.clone(),
+        approvals: state.mcp_approvals.clone(),
+    }));
+    let started = McpGateway::start(state.mcp_server.clone(), &get_rustscp_config_dir()).await;
+    let mut slot = lock_gateway(&state.mcp_gateway);
+    match started {
+        Ok(gateway) => {
+            slot.gateway = Some(gateway);
+            slot.error = None;
+        }
+        Err(e) => {
+            tracing::warn!("the AI gateway could not start: {e}");
+            slot.error = Some(e.to_string());
+        }
+    }
+}
+
+/// Stops accepting agents; their pending approvals are withdrawn.
+fn stop_mcp_gateway(state: &AppState) {
+    let gateway = lock_gateway(&state.mcp_gateway).gateway.take();
+    drop(gateway);
+}
+
+/// An agent write waiting in the window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpApprovalPrompt {
+    pub id: String,
+    #[serde(flatten)]
+    pub request: ApprovalRequest,
+    /// Unix time in milliseconds at which the write is denied if nobody answers.
+    pub expires_at_ms: i64,
+}
+
+type PendingApprovals = HashMap<String, (McpApprovalPrompt, tokio::sync::oneshot::Sender<bool>)>;
+
+/// Agent writes waiting for Allow / Deny.
+#[derive(Default)]
+pub struct McpApprovals {
+    pending: std::sync::Mutex<PendingApprovals>,
+}
+
+impl McpApprovals {
+    fn lock(&self) -> std::sync::MutexGuard<'_, PendingApprovals> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Waiting prompts, oldest first.
+    pub fn prompts(&self) -> Vec<McpApprovalPrompt> {
+        let mut prompts: Vec<McpApprovalPrompt> =
+            self.lock().values().map(|(p, _)| p.clone()).collect();
+        prompts.sort_by_key(|p| p.expires_at_ms);
+        prompts
+    }
+
+    /// Delivers the person's answer. `false` when the prompt is no longer waiting.
+    pub fn respond(&self, id: &str, approved: bool) -> bool {
+        match self.lock().remove(id) {
+            Some((_, reply)) => reply.send(approved).is_ok(),
+            None => false,
+        }
+    }
+}
+
+/// Removes a prompt that stops waiting for any reason and tells the window.
+struct WithdrawPrompt {
+    app: tauri::AppHandle,
+    approvals: Arc<McpApprovals>,
+    id: String,
+}
+
+impl Drop for WithdrawPrompt {
+    fn drop(&mut self) {
+        use tauri::Emitter;
+        self.approvals.lock().remove(&self.id);
+        let _ = self.app.emit(MCP_APPROVAL_RESOLVED_EVENT, &self.id);
+    }
+}
+
+/// Asks the person at the RustSCP window to allow each agent write.
+struct WindowApprover {
+    app: tauri::AppHandle,
+    approvals: Arc<McpApprovals>,
+}
+
+#[async_trait::async_trait]
+impl ToolApprover for WindowApprover {
+    async fn approve(&self, request: ApprovalRequest) -> ApprovalDecision {
+        use tauri::{Emitter, Manager};
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let expires_at_ms =
+            chrono::Utc::now().timestamp_millis() + MCP_APPROVAL_TIMEOUT.as_millis() as i64;
+        let prompt = McpApprovalPrompt {
+            id: id.clone(),
+            request,
+            expires_at_ms,
+        };
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.approvals
+            .lock()
+            .insert(id.clone(), (prompt.clone(), reply));
+        // Withdrawn from the window however this ends (answer, timeout, agent gone).
+        let _withdraw = WithdrawPrompt {
+            app: self.app.clone(),
+            approvals: self.approvals.clone(),
+            id,
+        };
+
+        if let Err(e) = self.app.emit(MCP_APPROVAL_REQUEST_EVENT, &prompt) {
+            return ApprovalDecision::Denied(format!(
+                "the RustSCP window could not be asked ({e})"
+            ));
+        }
+        if let Some(window) = self.app.get_webview_window("main") {
+            let _ = window.request_user_attention(Some(tauri::UserAttentionType::Critical));
+        }
+
+        match tokio::time::timeout(MCP_APPROVAL_TIMEOUT, answer).await {
+            Ok(Ok(true)) => ApprovalDecision::Approved,
+            Ok(Ok(false)) => ApprovalDecision::Denied("rejected by the user".to_string()),
+            Ok(Err(_)) => {
+                ApprovalDecision::Denied("the approval request was withdrawn".to_string())
+            }
+            Err(_) => ApprovalDecision::Denied(format!(
+                "nobody answered within {} seconds",
+                MCP_APPROVAL_TIMEOUT.as_secs()
+            )),
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn get_pending_mcp_approvals(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<McpApprovalPrompt>, String> {
+    Ok(state.mcp_approvals.prompts())
+}
+
+#[tauri::command]
+pub async fn respond_mcp_approval(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    approved: bool,
+) -> Result<(), String> {
+    if state.mcp_approvals.respond(&id, approved) {
+        Ok(())
+    } else {
+        Err(
+            "This request is no longer waiting (it timed out or the agent disconnected)."
+                .to_string(),
+        )
     }
 }
 
@@ -2728,6 +3004,7 @@ pub async fn unmount_virtual_disk(
 /// handler (`RunEvent::ExitRequested`), so Finder/Explorer never keep a volume that
 /// points at a dead port.
 pub async fn shutdown_background_services(state: &AppState) {
+    stop_mcp_gateway(state);
     let servers: Vec<WebDavServer> = state
         .virtual_disks
         .lock()
@@ -6650,24 +6927,108 @@ mod correctness_tests {
         assert_eq!(continuous_sync_dest("/srv/www", "/c.txt"), "/srv/www/c.txt");
     }
 
+    fn gateway(running: bool) -> GatewayStatus {
+        GatewayStatus {
+            running,
+            connected_agents: 2,
+            error: None,
+        }
+    }
+
     #[test]
-    fn mcp_gateway_is_enabled_only_with_a_transport() {
-        let info = mcp_status_info(rustscp_mcp::MCP_TRANSPORT_AVAILABLE, 2, 7);
-        assert_eq!(info.enabled, rustscp_mcp::MCP_TRANSPORT_AVAILABLE);
+    fn mcp_gateway_is_enabled_only_while_it_listens() {
+        assert!(rustscp_mcp::transport_available());
+        let exe = "/Applications/RustSCP.app/Contents/MacOS/rustscp-desktop";
+        let info = mcp_status_info(true, gateway(true), 2, 7, Some(exe));
+        assert!(info.enabled && info.transport_available && info.transport_running);
+        assert_eq!(info.connected_agents, 2);
         assert_eq!(
-            info.transport_available,
-            rustscp_mcp::MCP_TRANSPORT_AVAILABLE
+            info.setup_command.as_deref(),
+            Some("claude mcp add rustscp -- /Applications/RustSCP.app/Contents/MacOS/rustscp-desktop --mcp-stdio")
         );
-        let offline = mcp_status_info(false, 1, 0);
+        let json: serde_json::Value =
+            serde_json::from_str(info.setup_json.as_deref().unwrap()).unwrap();
+        assert_eq!(json["mcpServers"]["rustscp"]["command"], exe);
+        assert_eq!(json["mcpServers"]["rustscp"]["args"][0], MCP_STDIO_FLAG);
+
+        let stopped = mcp_status_info(
+            true,
+            GatewayStatus {
+                running: false,
+                connected_agents: 0,
+                error: Some("address in use".into()),
+            },
+            1,
+            0,
+            Some(exe),
+        );
+        assert!(!stopped.enabled && !stopped.transport_running);
+        assert_eq!(stopped.gateway_error.as_deref(), Some("address in use"));
+
+        let offline = mcp_status_info(false, gateway(true), 1, 0, Some(exe));
         assert!(!offline.enabled && !offline.transport_available);
+        assert!(offline.setup_command.is_none());
         let json = serde_json::to_value(&offline).unwrap();
         assert_eq!(json["enabled"], false);
-        // Older payloads without the field still deserialize.
+        // Older payloads without the newer fields still deserialize.
         let old: McpStatusInfo = serde_json::from_str(
             r#"{"enabled":false,"active_sessions_count":1,"total_audit_events":0}"#,
         )
         .unwrap();
-        assert!(!old.transport_available);
+        assert!(!old.transport_available && old.setup_command.is_none());
+    }
+
+    #[test]
+    fn mcp_setup_command_quotes_unusual_paths() {
+        let cmd = mcp_setup_command("/Users/me/My Apps/RustSCP.app/Contents/MacOS/rustscp-desktop");
+        if cfg!(windows) {
+            assert!(cmd.contains("\"/Users/me/My Apps/"), "{cmd}");
+        } else {
+            assert_eq!(
+                cmd,
+                "claude mcp add rustscp -- '/Users/me/My Apps/RustSCP.app/Contents/MacOS/rustscp-desktop' --mcp-stdio"
+            );
+            assert_eq!(display_shell_arg("/opt/it's"), "'/opt/it'\\''s'");
+        }
+        assert_eq!(
+            display_shell_arg("/usr/bin/rustscp-desktop"),
+            "/usr/bin/rustscp-desktop"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_approvals_deliver_one_answer_each() {
+        let approvals = McpApprovals::default();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let prompt = McpApprovalPrompt {
+            id: "a1".into(),
+            request: ApprovalRequest {
+                agent_id: "claude-code (stdio)".into(),
+                tool_name: "fs_write_file".into(),
+                connection_id: "prod".into(),
+                connection_name: "Prod".into(),
+                path: "/etc/motd".into(),
+                summary: "Replace /etc/motd (3 bytes) with 5 bytes".into(),
+                new_size: 5,
+                new_sha256: "x".into(),
+                previous_size: Some(3),
+                preview: Some("hello".into()),
+                preview_truncated: false,
+            },
+            expires_at_ms: 1,
+        };
+        approvals.lock().insert("a1".into(), (prompt, tx));
+        let listed = approvals.prompts();
+        assert_eq!(listed.len(), 1);
+        let json = serde_json::to_value(&listed[0]).unwrap();
+        assert_eq!(
+            json["path"], "/etc/motd",
+            "request fields are flattened: {json}"
+        );
+        assert!(approvals.respond("a1", true));
+        assert!(rx.await.unwrap());
+        assert!(!approvals.respond("a1", false));
+        assert!(approvals.prompts().is_empty());
     }
 
     #[test]

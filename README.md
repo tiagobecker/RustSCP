@@ -68,6 +68,14 @@ RustSCP includes an embedded JSON-RPC 2.0 MCP server (`rustscp-mcp`) acting as a
 - Enforces granular permission controls, human-in-the-loop approvals, and structured audit logs.
 - Never reveals raw SSH credentials or root passwords to the AI model.
 
+**Connecting an agent.** The desktop executable doubles as an MCP stdio server: `rustscp-desktop --mcp-stdio` speaks MCP on stdin/stdout and forwards tool calls to the running RustSCP window over a private, token-protected local channel (a 0600 Unix socket, or loopback TCP on Windows). The exact command for your install is shown in **AI gateway (MCP)** inside the app, for example:
+
+```bash
+claude mcp add rustscp -- /Applications/RustSCP.app/Contents/MacOS/rustscp-desktop --mcp-stdio
+```
+
+Agents see only the remote sessions connected in the app (never the local disk), every call lands in the activity log (`mcp-audit.log` in the RustSCP config folder), and each `fs_write_file` waits until you click **Allow** in the app (it is denied after 2 minutes without an answer).
+
 ### 🔄 3. Dual-Session Proactive SSH Architecture
 Unlike traditional tools that disconnect or force a second login prompt when running terminal operations:
 - RustSCP initializes both the SFTP file subsystem and an authenticated Shell channel on the initial handshake.

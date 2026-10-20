@@ -52,15 +52,22 @@ fn disable_macos_text_substitutions() {
 }
 
 fn main() {
+    // `rustscp-desktop --mcp-stdio`: the MCP server AI agents launch. It never opens a
+    // window; it forwards tool calls to the RustSCP app that is already running.
+    if std::env::args_os().skip(1).any(|arg| arg == MCP_STDIO_FLAG) {
+        std::process::exit(run_mcp_stdio());
+    }
+
     tracing_subscriber::fmt::init();
 
     #[cfg(target_os = "macos")]
     disable_macos_text_substitutions();
 
     tauri::Builder::default()
-        .setup(|_app| {
+        .setup(|app| {
             #[cfg(target_os = "macos")]
             setup_macos_dock_icon();
+            tauri::async_runtime::spawn(start_mcp_gateway(app.handle().clone()));
             Ok(())
         })
         .manage(AppState::new())
@@ -91,6 +98,8 @@ fn main() {
             render_action_command,
             get_mcp_audit_logs,
             get_mcp_status,
+            get_pending_mcp_approvals,
+            respond_mcp_approval,
             execute_script_line,
             execute_script_batch,
             generate_automation_code,
@@ -141,6 +150,33 @@ fn main() {
                 stop_background_services_once(app);
             }
         });
+}
+
+/// Serves MCP on stdin/stdout until the agent closes stdin. stdout carries protocol
+/// messages only, so logs go to stderr. Returns the process exit code.
+fn run_mcp_stdio() -> i32 {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("rustscp: could not start the MCP server: {e}");
+            return 1;
+        }
+    };
+    let config_dir = rustscp_core::get_rustscp_config_dir();
+    match runtime.block_on(rustscp_mcp::run_stdio_bridge(config_dir)) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("rustscp: MCP server stopped: {e}");
+            1
+        }
+    }
 }
 
 /// Longest the exit handler waits for virtual disks to unmount and continuous sync to stop.

@@ -57,6 +57,10 @@ pub struct McpToolDefinition {
     pub description: String,
     #[serde(rename = "inputSchema")]
     pub input_schema: Value,
+    /// MCP tool annotations (`readOnlyHint`, `destructiveHint`, ...); clients that predate
+    /// them ignore the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

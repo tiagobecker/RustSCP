@@ -1,19 +1,20 @@
 use crate::audit::AuditLogger;
-use crate::protocol::{
-    JsonRpcRequest, JsonRpcResponse, McpContent, McpToolDefinition, McpToolResult,
-};
+use crate::protocol::{JsonRpcResponse, McpContent, McpToolDefinition, McpToolResult};
+use crate::rpc::{RpcSession, ToolBackend};
+use async_trait::async_trait;
 use bytes::Bytes;
 use rustscp_actions::{ActionCatalog, ActionContext, ActionExecutor};
-use rustscp_core::{LocalFsDriver, VirtualFileSystem};
+use rustscp_core::VirtualFileSystem;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// No MCP transport (stdio, socket or HTTP listener) is wired into the app yet: nothing
-/// outside the process can reach [`McpServer::handle_rpc`]. Status screens should report
-/// the gateway as unavailable while this is `false`.
-pub const MCP_TRANSPORT_AVAILABLE: bool = false;
+/// An MCP stdio transport ships with this build: `rustscp-desktop --mcp-stdio` (or the
+/// `rustscp-mcp` binary) serves MCP on stdin/stdout and forwards tool calls to the
+/// running app through [`crate::gateway`].
+pub const MCP_TRANSPORT_AVAILABLE: bool = true;
 /// MCP protocol revisions this server answers with (latest last).
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 /// Agent id used by [`McpServer::handle_rpc`], which has no authenticated transport.
@@ -23,6 +24,61 @@ pub const DEFAULT_READ_BYTES: u64 = 65_536;
 pub const MAX_READ_BYTES: u64 = 1024 * 1024;
 /// Previous file contents up to this size are hashed for the write audit trail.
 const MAX_HASHED_PREVIOUS_BYTES: u64 = 8 * 1024 * 1024;
+/// Start of the new content shown to the person approving a write.
+pub const APPROVAL_PREVIEW_BYTES: usize = 4096;
+
+/// Tools that change data; each call waits for a person's approval (see [`ToolApprover`]).
+pub fn tool_requires_approval(tool_name: &str) -> bool {
+    matches!(tool_name, "fs_write_file")
+}
+
+/// What an agent sees about a registered connection. Never holds credentials.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConnectionInfo {
+    /// Display name (saved-site name).
+    pub name: String,
+    /// "sftp", "s3", "ftp", ...
+    pub protocol: String,
+    pub host: String,
+}
+
+/// A change an agent asked for, shown to the person who allows or denies it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalRequest {
+    pub agent_id: String,
+    pub tool_name: String,
+    pub connection_id: String,
+    pub connection_name: String,
+    pub path: String,
+    /// One-line description of the change.
+    pub summary: String,
+    pub new_size: u64,
+    pub new_sha256: String,
+    /// Size of the file being replaced (`None` for a new file).
+    pub previous_size: Option<u64>,
+    /// Start of the new content when it is UTF-8 text (at most [`APPROVAL_PREVIEW_BYTES`]).
+    pub preview: Option<String>,
+    pub preview_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    Approved,
+    /// Denied, with the reason recorded in the audit log and told to the agent.
+    Denied(String),
+}
+
+/// Asks a person whether a write may happen (the desktop app shows a dialog). Without an
+/// approver every write is denied.
+#[async_trait]
+pub trait ToolApprover: Send + Sync {
+    async fn approve(&self, request: ApprovalRequest) -> ApprovalDecision;
+}
+
+struct RegisteredConnection {
+    info: ConnectionInfo,
+    vfs: Arc<dyn VirtualFileSystem>,
+}
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -107,21 +163,134 @@ fn encode_for_agent(bytes: &[u8], truncated: bool) -> (String, &'static str, usi
     (base64_encode(bytes), "base64", bytes.len())
 }
 
+/// What the person approving an `fs_write_file` call is shown.
+#[allow(clippy::too_many_arguments)]
+fn write_approval_request(
+    agent_id: &str,
+    tool_name: &str,
+    conn_id: &str,
+    info: &ConnectionInfo,
+    path: &str,
+    data: &[u8],
+    new_sha256: &str,
+    previous_size: Option<u64>,
+) -> ApprovalRequest {
+    let head = &data[..data.len().min(APPROVAL_PREVIEW_BYTES)];
+    let truncated = head.len() < data.len();
+    let (text, encoding, used) = encode_for_agent(head, truncated);
+    let preview = (encoding == "utf-8").then_some(text);
+    let summary = match previous_size {
+        Some(old) => format!("Replace {path} ({old} bytes) with {} bytes", data.len()),
+        None => format!("Create {path} ({} bytes)", data.len()),
+    };
+    let connection_name = if info.name.is_empty() {
+        conn_id.to_string()
+    } else {
+        info.name.clone()
+    };
+    ApprovalRequest {
+        agent_id: agent_id.to_string(),
+        tool_name: tool_name.to_string(),
+        connection_id: conn_id.to_string(),
+        connection_name,
+        path: path.to_string(),
+        summary,
+        new_size: data.len() as u64,
+        new_sha256: new_sha256.to_string(),
+        previous_size,
+        preview_truncated: preview.is_some() && used < data.len(),
+        preview,
+    }
+}
+
+/// Performs an approved write: records what it replaces (size and SHA-256), writes, and
+/// audits the outcome.
+#[allow(clippy::too_many_arguments)]
+async fn write_and_audit(
+    audit: AuditLogger,
+    vfs: Arc<dyn VirtualFileSystem>,
+    agent_id: String,
+    tool_name: String,
+    conn_id: String,
+    path: String,
+    data: Vec<u8>,
+    new_sha256: String,
+) -> McpToolResult {
+    let previous = match vfs.metadata(&path).await {
+        Ok(meta) if meta.is_dir() => {
+            audit
+                .log(
+                    &agent_id,
+                    &tool_name,
+                    &conn_id,
+                    &path,
+                    "error: is a directory",
+                    None,
+                )
+                .await;
+            return McpToolResult::error_text(format!("{} is a directory", path));
+        }
+        Ok(meta) if meta.size <= MAX_HASHED_PREVIOUS_BYTES => match vfs.read_file(&path).await {
+            Ok(old) => format!(
+                "previous: {} bytes sha256={}",
+                old.len(),
+                rustscp_core::disk_cache::sha256_hex(&old)
+            ),
+            Err(_) => format!("previous: {} bytes", meta.size),
+        },
+        Ok(meta) => format!("previous: {} bytes (not hashed)", meta.size),
+        Err(_) => "previous: none (new file)".to_string(),
+    };
+    let len = data.len();
+    let diff = format!("{previous}; new: {len} bytes sha256={new_sha256}");
+
+    match vfs.write_file(&path, Bytes::from(data)).await {
+        Ok(_) => {
+            audit
+                .log(
+                    &agent_id,
+                    &tool_name,
+                    &conn_id,
+                    &path,
+                    "success",
+                    Some(diff),
+                )
+                .await;
+            McpToolResult::success_text(format!(
+                "File written successfully: {} ({} bytes)",
+                path, len
+            ))
+        }
+        Err(err) => {
+            audit
+                .log(
+                    &agent_id,
+                    &tool_name,
+                    &conn_id,
+                    &path,
+                    &format!("error: {}", err),
+                    Some(diff),
+                )
+                .await;
+            McpToolResult::error_text(format!("Failed to write file: {}", err))
+        }
+    }
+}
+
 pub struct McpServer {
     audit_logger: AuditLogger,
-    // Connection registry: ID -> Arc<dyn VirtualFileSystem>
-    connections: Arc<RwLock<HashMap<String, Arc<dyn VirtualFileSystem>>>>,
+    /// Sessions agents may use: id -> driver and display info. Starts empty: the
+    /// unrestricted local filesystem is never registered by default.
+    connections: Arc<RwLock<HashMap<String, RegisteredConnection>>>,
+    approver: std::sync::RwLock<Option<Arc<dyn ToolApprover>>>,
 }
 
 impl McpServer {
     pub fn new(audit_logger: AuditLogger) -> Self {
-        let mut initial_conns: HashMap<String, Arc<dyn VirtualFileSystem>> = HashMap::new();
-        // Default local workspace connection
-        initial_conns.insert("local".to_string(), Arc::new(LocalFsDriver::new()));
-
         Self {
             audit_logger,
-            connections: Arc::new(RwLock::new(initial_conns)),
+            connections: Arc::new(RwLock::new(HashMap::new())),
+            approver: std::sync::RwLock::new(None),
         }
     }
 
@@ -134,9 +303,39 @@ impl McpServer {
         MCP_TRANSPORT_AVAILABLE
     }
 
+    /// Sets who approves write tools. Until one is set every write is denied.
+    pub fn set_approver(&self, approver: Arc<dyn ToolApprover>) {
+        match self.approver.write() {
+            Ok(mut a) => *a = Some(approver),
+            Err(e) => *e.into_inner() = Some(approver),
+        }
+    }
+
+    fn current_approver(&self) -> Option<Arc<dyn ToolApprover>> {
+        match self.approver.read() {
+            Ok(a) => a.clone(),
+            Err(e) => e.into_inner().clone(),
+        }
+    }
+
+    /// Registers a session under `id` with the id as its display name.
     pub async fn register_connection(&self, id: String, vfs: Arc<dyn VirtualFileSystem>) {
+        let info = ConnectionInfo {
+            name: id.clone(),
+            ..ConnectionInfo::default()
+        };
+        self.register_session(id, info, vfs).await;
+    }
+
+    /// Makes a connected session available to agents under `id`.
+    pub async fn register_session(
+        &self,
+        id: String,
+        info: ConnectionInfo,
+        vfs: Arc<dyn VirtualFileSystem>,
+    ) {
         let mut conns = self.connections.write().await;
-        conns.insert(id, vfs);
+        conns.insert(id, RegisteredConnection { info, vfs });
     }
 
     /// Removes a connection (call it when the session is disconnected) so agents can no
@@ -152,7 +351,16 @@ impl McpServer {
         ids
     }
 
+    /// Tools announced to agents.
     pub fn list_tools(&self) -> Vec<McpToolDefinition> {
+        Self::tool_definitions()
+    }
+
+    /// Tool definitions (static; the bridge serves `tools/list` without the app).
+    pub fn tool_definitions() -> Vec<McpToolDefinition> {
+        let read_only = |title: &str| {
+            Some(json!({ "title": title, "readOnlyHint": true, "destructiveHint": false }))
+        };
         let smart_action_schema = json!({
             "type": "object",
             "required": ["connection_id", "action_id", "params"],
@@ -167,11 +375,12 @@ impl McpServer {
         vec![
             McpToolDefinition {
                 name: "session_list".to_string(),
-                description: "List all active, authenticated server sessions available to the AI agent (without exposing credentials)".to_string(),
+                description: "List the server sessions connected in the RustSCP app (connection_id, name, protocol, host). Credentials are never exposed. Call this first: the other tools take one of these connection_id values.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {}
                 }),
+                annotations: read_only("List connected sessions"),
             },
             McpToolDefinition {
                 name: "fs_list_dir".to_string(),
@@ -180,40 +389,48 @@ impl McpServer {
                     "type": "object",
                     "required": ["connection_id", "path"],
                     "properties": {
-                        "connection_id": { "type": "string", "description": "Session ID (e.g. 'local', 'prod-vps')" },
+                        "connection_id": { "type": "string", "description": "Session ID from session_list (e.g. 'prod-vps')" },
                         "path": { "type": "string", "description": "Remote directory path to list" }
                     }
                 }),
+                annotations: read_only("List a directory"),
             },
             McpToolDefinition {
                 name: "fs_read_file".to_string(),
                 description: format!(
-                    "Read part of a remote or local file. Returns at most `length` bytes (default {DEFAULT_READ_BYTES}, max {MAX_READ_BYTES}) from `offset`, as UTF-8 text or base64 for binary data; a second content item reports encoding, total size and whether more data follows."
+                    "Read part of a file on a connected server. Returns at most `length` bytes (default {DEFAULT_READ_BYTES}, max {MAX_READ_BYTES}) from `offset`, as UTF-8 text or base64 for binary data; a second content item reports encoding, total size and whether more data follows."
                 ),
                 input_schema: json!({
                     "type": "object",
                     "required": ["connection_id", "path"],
                     "properties": {
-                        "connection_id": { "type": "string", "description": "Session ID" },
+                        "connection_id": { "type": "string", "description": "Session ID from session_list" },
                         "path": { "type": "string", "description": "File path to read" },
                         "offset": { "type": "integer", "description": "Optional byte offset (default 0)" },
                         "length": { "type": "integer", "description": format!("Optional max bytes to read (default {DEFAULT_READ_BYTES}, max {MAX_READ_BYTES})") }
                     }
                 }),
+                annotations: read_only("Read a file"),
             },
             McpToolDefinition {
                 name: "fs_write_file".to_string(),
-                description: "Write or replace a file on the target server; every write is recorded in the audit log with the previous and new size and SHA-256".to_string(),
+                description: "Write or replace a file on a connected server. The call waits until the user allows it in the RustSCP window (denied if nobody answers); every write is recorded in the audit log with the previous and new size and SHA-256.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["connection_id", "path", "content"],
                     "properties": {
-                        "connection_id": { "type": "string", "description": "Session ID" },
+                        "connection_id": { "type": "string", "description": "Session ID from session_list" },
                         "path": { "type": "string", "description": "File path to write" },
                         "content": { "type": "string", "description": "File content: text, or base64 when encoding is 'base64'" },
                         "encoding": { "type": "string", "enum": ["utf-8", "base64"], "description": "Encoding of content (default 'utf-8')" }
                     }
                 }),
+                annotations: Some(json!({
+                    "title": "Write a file (needs approval)",
+                    "readOnlyHint": false,
+                    "destructiveHint": true,
+                    "idempotentHint": true
+                })),
             },
             McpToolDefinition {
                 name: "fs_search".to_string(),
@@ -222,21 +439,24 @@ impl McpServer {
                     "type": "object",
                     "required": ["connection_id", "pattern"],
                     "properties": {
-                        "connection_id": { "type": "string", "description": "Session ID" },
+                        "connection_id": { "type": "string", "description": "Session ID from session_list" },
                         "pattern": { "type": "string", "description": "Search pattern (e.g. 'config', '*.rs')" },
                         "root_path": { "type": "string", "description": "Starting directory (default '/')" }
                     }
                 }),
+                annotations: read_only("Search for files"),
             },
             McpToolDefinition {
                 name: "render_smart_action".to_string(),
                 description: "Validate parameters and render the shell command of a pre-vetted smart action (e.g. tar-compress, systemctl-manager, disk-usage). The command is returned for review; it is NOT executed.".to_string(),
                 input_schema: smart_action_schema.clone(),
+                annotations: read_only("Render a smart action"),
             },
             McpToolDefinition {
                 name: "exec_smart_action".to_string(),
                 description: "Deprecated alias of render_smart_action: renders the command for review and does NOT execute anything.".to_string(),
                 input_schema: smart_action_schema,
+                annotations: read_only("Render a smart action (deprecated name)"),
             },
         ]
     }
@@ -255,8 +475,33 @@ impl McpServer {
             .await;
     }
 
-    async fn connection(&self, conn_id: &str) -> Option<Arc<dyn VirtualFileSystem>> {
-        self.connections.read().await.get(conn_id).cloned()
+    async fn connection(
+        &self,
+        conn_id: &str,
+    ) -> Option<(Arc<dyn VirtualFileSystem>, ConnectionInfo)> {
+        self.connections
+            .read()
+            .await
+            .get(conn_id)
+            .map(|c| (c.vfs.clone(), c.info.clone()))
+    }
+
+    /// Registered sessions as agents see them (sorted by id, no credentials).
+    async fn session_summaries(&self) -> Vec<Value> {
+        let conns = self.connections.read().await;
+        let mut ids: Vec<&String> = conns.keys().collect();
+        ids.sort();
+        ids.into_iter()
+            .map(|id| {
+                let info = &conns[id].info;
+                json!({
+                    "connection_id": id,
+                    "name": info.name,
+                    "protocol": info.protocol,
+                    "host": info.host,
+                })
+            })
+            .collect()
     }
 
     pub async fn handle_tool_call(
@@ -265,21 +510,33 @@ impl McpServer {
         tool_name: &str,
         arguments: &Value,
     ) -> McpToolResult {
-        let conn_id = arguments
-            .get("connection_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("local");
         let str_arg = |key: &str| arguments.get(key).and_then(|v| v.as_str());
+        let conn_arg = str_arg("connection_id");
+        let conn_id = conn_arg.unwrap_or("none");
 
         let needs_connection = matches!(
             tool_name,
             "fs_list_dir" | "fs_read_file" | "fs_write_file" | "fs_search"
         );
-        let vfs = if needs_connection {
-            match self.connection(conn_id).await {
-                Some(v) => Some(v),
+        let (vfs, info) = if needs_connection {
+            let summary = str_arg("path").or(str_arg("pattern")).unwrap_or("");
+            let Some(requested) = conn_arg else {
+                self.audit(
+                    agent_id,
+                    tool_name,
+                    conn_id,
+                    summary,
+                    "error: missing connection_id",
+                    None,
+                )
+                .await;
+                return McpToolResult::error_text(
+                    "connection_id is required: call session_list to get the ids of the connected sessions",
+                );
+            };
+            match self.connection(requested).await {
+                Some((v, i)) => (Some(v), i),
                 None => {
-                    let summary = str_arg("path").or(str_arg("pattern")).unwrap_or("");
                     self.audit(
                         agent_id,
                         tool_name,
@@ -290,18 +547,19 @@ impl McpServer {
                     )
                     .await;
                     return McpToolResult::error_text(format!(
-                        "Connection '{}' not found or inactive",
+                        "Connection '{}' not found or inactive (call session_list for the connected sessions)",
                         conn_id
                     ));
                 }
             }
         } else {
-            None
+            (None, ConnectionInfo::default())
         };
 
         match tool_name {
             "session_list" => {
-                let list = self.connection_ids().await;
+                let sessions = self.session_summaries().await;
+                let ids: Vec<&Value> = sessions.iter().map(|s| &s["connection_id"]).collect();
                 self.audit(
                     agent_id,
                     tool_name,
@@ -311,7 +569,13 @@ impl McpServer {
                     None,
                 )
                 .await;
-                McpToolResult::success_text(json!({ "active_sessions": list }).to_string())
+                let mut out = json!({ "sessions": sessions, "active_sessions": ids });
+                if sessions.is_empty() {
+                    out["note"] = json!(
+                        "No server is connected in RustSCP right now. Ask the user to connect one in the RustSCP app, then call session_list again."
+                    );
+                }
+                McpToolResult::success_text(out.to_string())
             }
 
             "fs_list_dir" => {
@@ -455,8 +719,7 @@ impl McpServer {
                     }
                 };
 
-                // Record what the write replaces, for the audit trail.
-                let previous = match vfs.metadata(path).await {
+                let previous_size = match vfs.metadata(path).await {
                     Ok(meta) if meta.is_dir() => {
                         self.audit(
                             agent_id,
@@ -469,47 +732,59 @@ impl McpServer {
                         .await;
                         return McpToolResult::error_text(format!("{} is a directory", path));
                     }
-                    Ok(meta) if meta.size <= MAX_HASHED_PREVIOUS_BYTES => {
-                        match vfs.read_file(path).await {
-                            Ok(old) => format!(
-                                "previous: {} bytes sha256={}",
-                                old.len(),
-                                rustscp_core::disk_cache::sha256_hex(&old)
-                            ),
-                            Err(_) => format!("previous: {} bytes", meta.size),
-                        }
-                    }
-                    Ok(meta) => format!("previous: {} bytes (not hashed)", meta.size),
-                    Err(_) => "previous: none (new file)".to_string(),
+                    Ok(meta) => Some(meta.size),
+                    Err(_) => None,
                 };
-                let diff = format!(
-                    "{previous}; new: {} bytes sha256={}",
-                    data.len(),
-                    rustscp_core::disk_cache::sha256_hex(&data)
-                );
+                let new_sha256 = rustscp_core::disk_cache::sha256_hex(&data);
 
-                let len = data.len();
-                match vfs.write_file(path, Bytes::from(data)).await {
-                    Ok(_) => {
-                        self.audit(agent_id, tool_name, conn_id, path, "success", Some(diff))
-                            .await;
-                        McpToolResult::success_text(format!(
-                            "File written successfully: {} ({} bytes)",
-                            path, len
-                        ))
-                    }
-                    Err(err) => {
-                        self.audit(
-                            agent_id,
-                            tool_name,
-                            conn_id,
-                            path,
-                            &format!("error: {}", err),
-                            Some(diff),
-                        )
-                        .await;
-                        McpToolResult::error_text(format!("Failed to write file: {}", err))
-                    }
+                // A person allows or denies every write before anything is changed.
+                let request = write_approval_request(
+                    agent_id,
+                    tool_name,
+                    conn_id,
+                    &info,
+                    path,
+                    &data,
+                    &new_sha256,
+                    previous_size,
+                );
+                let decision = match self.current_approver() {
+                    Some(approver) => approver.approve(request).await,
+                    None => ApprovalDecision::Denied(
+                        "no RustSCP window is available to approve it".to_string(),
+                    ),
+                };
+                if let ApprovalDecision::Denied(reason) = decision {
+                    let diff = format!("new: {} bytes sha256={new_sha256}", data.len());
+                    self.audit(
+                        agent_id,
+                        tool_name,
+                        conn_id,
+                        path,
+                        &format!("denied: {reason}"),
+                        Some(diff),
+                    )
+                    .await;
+                    return McpToolResult::error_text(format!(
+                        "The write to {path} was not allowed ({reason}). Nothing was changed."
+                    ));
+                }
+
+                // The approved write runs as its own task, so an agent that disconnects
+                // mid-call never leaves a half-written file or a missing audit entry.
+                let task = tokio::spawn(write_and_audit(
+                    self.audit_logger.clone(),
+                    vfs,
+                    agent_id.to_string(),
+                    tool_name.to_string(),
+                    conn_id.to_string(),
+                    path.to_string(),
+                    data,
+                    new_sha256,
+                ));
+                match task.await {
+                    Ok(result) => result,
+                    Err(e) => McpToolResult::error_text(format!("Write task failed: {e}")),
                 }
             }
 
@@ -628,107 +903,83 @@ impl McpServer {
     ///
     /// Without an authenticated transport the caller is recorded as [`DEFAULT_AGENT_ID`];
     /// an `agent_id` claimed in the request is only noted, never trusted.
-    pub async fn handle_rpc(&self, raw_json: &str) -> Option<JsonRpcResponse> {
+    pub async fn handle_rpc(self: &Arc<Self>, raw_json: &str) -> Option<JsonRpcResponse> {
         self.handle_rpc_as(DEFAULT_AGENT_ID, raw_json).await
     }
 
     /// Like [`handle_rpc`](Self::handle_rpc), with the agent identity supplied by the
-    /// transport. Notifications (requests without an `id`) never get a response.
-    pub async fn handle_rpc_as(&self, agent_id: &str, raw_json: &str) -> Option<JsonRpcResponse> {
-        let req: JsonRpcRequest = match serde_json::from_str(raw_json) {
-            Ok(r) => r,
+    /// transport. Notifications (requests without an `id`) never get a response. Stream
+    /// transports keep one [`RpcSession`] per client instead (see [`crate::transport`]).
+    pub async fn handle_rpc_as(
+        self: &Arc<Self>,
+        agent_id: &str,
+        raw_json: &str,
+    ) -> Option<JsonRpcResponse> {
+        let message: Value = match serde_json::from_str(raw_json) {
+            Ok(v) => v,
             Err(e) => {
                 return Some(JsonRpcResponse::error(
                     Value::Null,
-                    -32700,
+                    crate::rpc::PARSE_ERROR,
                     format!("Parse error: {}", e),
                 ));
             }
         };
+        RpcSession::new(self.clone(), agent_id, None)
+            .handle_message(message)
+            .await
+    }
+}
 
-        let Some(req_id) = req.id.clone() else {
-            // JSON-RPC 2.0 notification (e.g. "notifications/initialized"): handle known
-            // ones (nothing to do yet) and never answer.
-            return None;
-        };
-
-        if req.jsonrpc != "2.0" {
-            return Some(JsonRpcResponse::error(
-                req_id,
-                -32600,
-                "Invalid Request: jsonrpc must be \"2.0\"",
-            ));
-        }
-
-        match req.method.as_str() {
-            "initialize" => {
-                let requested = req
-                    .params
-                    .as_ref()
-                    .and_then(|p| p.get("protocolVersion"))
-                    .and_then(|v| v.as_str());
-                let version = match requested {
-                    Some(v) if SUPPORTED_PROTOCOL_VERSIONS.contains(&v) => v,
-                    _ => SUPPORTED_PROTOCOL_VERSIONS
-                        .last()
-                        .copied()
-                        .unwrap_or("2024-11-05"),
-                };
-                Some(JsonRpcResponse::success(
-                    req_id,
-                    json!({
-                        "protocolVersion": version,
-                        "serverInfo": {
-                            "name": "RustSCP MCP Gateway",
-                            "version": env!("CARGO_PKG_VERSION")
-                        },
-                        "capabilities": {
-                            "tools": {}
-                        }
-                    }),
-                ))
-            }
-
-            "tools/list" => {
-                let tools = self.list_tools();
-                Some(JsonRpcResponse::success(req_id, json!({ "tools": tools })))
-            }
-
-            "tools/call" => {
-                let params = req.params.unwrap_or(json!({}));
-                let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                let recorded_agent = match params.get("agent_id").and_then(|v| v.as_str()) {
-                    Some(claimed) if claimed != agent_id => {
-                        format!("{agent_id} (claimed: {claimed})")
-                    }
-                    _ => agent_id.to_string(),
-                };
-
-                let result = self
-                    .handle_tool_call(&recorded_agent, tool_name, &args)
-                    .await;
-                Some(JsonRpcResponse::success(req_id, json!(result)))
-            }
-
-            "ping" => Some(JsonRpcResponse::success(req_id, json!({}))),
-
-            unknown => Some(JsonRpcResponse::error(
-                req_id,
-                -32601,
-                format!("Method '{}' not found", unknown),
-            )),
-        }
+#[async_trait]
+impl ToolBackend for McpServer {
+    async fn call_tool(&self, agent_id: &str, name: &str, arguments: &Value) -> McpToolResult {
+        self.handle_tool_call(agent_id, name, arguments).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustscp_core::LocalFsDriver;
+    use std::sync::Mutex;
+
+    /// Server with the local filesystem registered as "local" (tests only: the app never
+    /// registers it).
+    async fn local_server(audit: AuditLogger) -> Arc<McpServer> {
+        let server = Arc::new(McpServer::new(audit));
+        server
+            .register_connection("local".into(), Arc::new(LocalFsDriver::new()))
+            .await;
+        server
+    }
+
+    /// Answers every approval with a fixed decision and keeps the requests.
+    struct FixedApprover {
+        decision: ApprovalDecision,
+        seen: Mutex<Vec<ApprovalRequest>>,
+    }
+
+    impl FixedApprover {
+        fn new(decision: ApprovalDecision) -> Arc<Self> {
+            Arc::new(Self {
+                decision,
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ToolApprover for FixedApprover {
+        async fn approve(&self, request: ApprovalRequest) -> ApprovalDecision {
+            self.seen.lock().unwrap().push(request);
+            self.decision.clone()
+        }
+    }
 
     #[tokio::test]
     async fn test_mcp_initialize_and_tools_list() {
-        let server = McpServer::new(AuditLogger::new());
+        let server = Arc::new(McpServer::new(AuditLogger::new()));
 
         // Test initialize
         let init_req = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
@@ -744,12 +995,13 @@ mod tests {
         let resp2 = server.handle_rpc(list_req).await.unwrap();
         let tools = resp2.result.unwrap()["tools"].as_array().unwrap().clone();
         assert!(tools.len() >= 5);
-        assert_eq!(server.transport_available(), MCP_TRANSPORT_AVAILABLE);
+        assert!(server.transport_available());
+        assert!(crate::transport_available());
     }
 
     #[tokio::test]
     async fn test_notifications_get_no_response_and_version_is_negotiated() {
-        let server = McpServer::new(AuditLogger::new());
+        let server = Arc::new(McpServer::new(AuditLogger::new()));
         assert!(server
             .handle_rpc(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
             .await
@@ -791,13 +1043,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_local_filesystem_is_not_registered_by_default() {
+        let server = McpServer::new(AuditLogger::new());
+        assert!(server.connection_ids().await.is_empty());
+        let res = server
+            .handle_tool_call(
+                "t",
+                "fs_list_dir",
+                &json!({ "connection_id": "local", "path": "/" }),
+            )
+            .await;
+        assert!(res.is_error);
+        let res = server
+            .handle_tool_call("t", "fs_read_file", &json!({ "path": "/etc/hosts" }))
+            .await;
+        assert!(res.is_error);
+        assert!(text_of(&res, 0).contains("connection_id is required"));
+        let res = server
+            .handle_tool_call("t", "session_list", &json!({}))
+            .await;
+        let v: Value = serde_json::from_str(&text_of(&res, 0)).unwrap();
+        assert_eq!(v["sessions"], json!([]));
+        assert!(v["note"].as_str().unwrap().contains("connect"));
+    }
+
+    #[tokio::test]
+    async fn test_session_list_shows_names_but_no_credentials() {
+        let server = McpServer::new(AuditLogger::new());
+        server
+            .register_session(
+                "prod-1".into(),
+                ConnectionInfo {
+                    name: "Prod VPS".into(),
+                    protocol: "sftp".into(),
+                    host: "203.0.113.7".into(),
+                },
+                Arc::new(LocalFsDriver::new()),
+            )
+            .await;
+        let res = server
+            .handle_tool_call("t", "session_list", &json!({}))
+            .await;
+        let v: Value = serde_json::from_str(&text_of(&res, 0)).unwrap();
+        assert_eq!(v["active_sessions"], json!(["prod-1"]));
+        assert_eq!(v["sessions"][0]["name"], "Prod VPS");
+        assert_eq!(v["sessions"][0]["protocol"], "sftp");
+        let keys: Vec<&String> = v["sessions"][0].as_object().unwrap().keys().collect();
+        assert_eq!(keys.len(), 4, "{keys:?}");
+        assert!(v.get("note").is_none());
+    }
+
+    #[tokio::test]
     async fn test_read_file_is_bounded_and_binary_safe() {
         let dir = tempfile::tempdir().unwrap();
         let text_path = dir.path().join("big.log");
         std::fs::write(&text_path, "a".repeat(200_000)).unwrap();
         let bin_path = dir.path().join("img.bin");
         std::fs::write(&bin_path, [0u8, 159, 146, 150, 255]).unwrap();
-        let server = McpServer::new(AuditLogger::new());
+        let server = local_server(AuditLogger::new()).await;
 
         let res = server
             .handle_tool_call(
@@ -817,7 +1120,7 @@ mod tests {
             .handle_tool_call(
                 "t",
                 "fs_read_file",
-                &json!({ "path": text_path.to_str().unwrap(), "offset": 0, "length": 50_000_000u64 }),
+                &json!({ "connection_id": "local", "path": text_path.to_str().unwrap(), "offset": 0, "length": 50_000_000u64 }),
             )
             .await;
         assert_eq!(text_of(&res, 0).len() as u64, 200_000.min(MAX_READ_BYTES));
@@ -826,7 +1129,7 @@ mod tests {
             .handle_tool_call(
                 "t",
                 "fs_read_file",
-                &json!({ "path": bin_path.to_str().unwrap() }),
+                &json!({ "connection_id": "local", "path": bin_path.to_str().unwrap() }),
             )
             .await;
         let meta: Value = serde_json::from_str(&text_of(&res, 1)).unwrap();
@@ -842,12 +1145,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("utf8.txt");
         std::fs::write(&p, "aé").unwrap(); // 'é' is two bytes
-        let server = McpServer::new(AuditLogger::new());
+        let server = local_server(AuditLogger::new()).await;
         let res = server
             .handle_tool_call(
                 "t",
                 "fs_read_file",
-                &json!({ "path": p.to_str().unwrap(), "length": 2 }),
+                &json!({ "connection_id": "local", "path": p.to_str().unwrap(), "length": 2 }),
             )
             .await;
         assert_eq!(text_of(&res, 0), "a");
@@ -863,12 +1166,14 @@ mod tests {
         let p = dir.path().join("out.bin");
         std::fs::write(&p, b"old").unwrap();
         let audit = AuditLogger::new();
-        let server = McpServer::new(audit.clone());
+        let server = local_server(audit.clone()).await;
+        let approver = FixedApprover::new(ApprovalDecision::Approved);
+        server.set_approver(approver.clone());
         let res = server
             .handle_tool_call(
                 "t",
                 "fs_write_file",
-                &json!({ "path": p.to_str().unwrap(), "content": base64_encode(&[1, 2, 3, 0, 255]), "encoding": "base64" }),
+                &json!({ "connection_id": "local", "path": p.to_str().unwrap(), "content": base64_encode(&[1, 2, 3, 0, 255]), "encoding": "base64" }),
             )
             .await;
         assert!(!res.is_error, "{}", text_of(&res, 0));
@@ -877,22 +1182,115 @@ mod tests {
         let diff = ev.diff.clone().unwrap();
         assert!(diff.contains("previous: 3 bytes sha256="), "{diff}");
         assert!(diff.contains("new: 5 bytes"), "{diff}");
+        {
+            let seen = approver.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].previous_size, Some(3));
+            assert_eq!(seen[0].new_size, 5);
+            assert!(
+                seen[0].preview.is_none(),
+                "binary content has no text preview"
+            );
+        }
 
         let res = server
             .handle_tool_call(
                 "t",
                 "fs_write_file",
-                &json!({ "path": p.to_str().unwrap(), "content": "!!", "encoding": "base64" }),
+                &json!({ "connection_id": "local", "path": p.to_str().unwrap(), "content": "!!", "encoding": "base64" }),
             )
             .await;
         assert!(res.is_error);
         assert_eq!(std::fs::read(&p).unwrap(), vec![1, 2, 3, 0, 255]);
+        assert_eq!(
+            approver.seen.lock().unwrap().len(),
+            1,
+            "invalid input is rejected before asking"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_writes_need_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("conf.txt");
+        std::fs::write(&p, b"keep me").unwrap();
+        let args =
+            json!({ "connection_id": "local", "path": p.to_str().unwrap(), "content": "replaced" });
+        let audit = AuditLogger::new();
+        let server = local_server(audit.clone()).await;
+
+        // Nobody to ask: denied.
+        let res = server
+            .handle_tool_call("agent", "fs_write_file", &args)
+            .await;
+        assert!(res.is_error);
+        assert!(
+            text_of(&res, 0).contains("not allowed"),
+            "{}",
+            text_of(&res, 0)
+        );
+        assert_eq!(std::fs::read(&p).unwrap(), b"keep me");
+        let ev = &audit.get_recent_events(1).await[0];
+        assert!(ev.status.starts_with("denied: "), "{}", ev.status);
+
+        // The person says no.
+        let approver = FixedApprover::new(ApprovalDecision::Denied("rejected by the user".into()));
+        server.set_approver(approver.clone());
+        let res = server
+            .handle_tool_call("agent", "fs_write_file", &args)
+            .await;
+        assert!(res.is_error);
+        assert_eq!(std::fs::read(&p).unwrap(), b"keep me");
+        assert_eq!(
+            audit.get_recent_events(1).await[0].status,
+            "denied: rejected by the user"
+        );
+        let seen = approver.seen.lock().unwrap()[0].clone();
+        assert_eq!(seen.agent_id, "agent");
+        assert_eq!(seen.connection_id, "local");
+        assert_eq!(seen.preview.as_deref(), Some("replaced"));
+        assert!(seen.summary.starts_with("Replace "), "{}", seen.summary);
+
+        // Every tool that is not read-only is gated.
+        for tool in McpServer::tool_definitions() {
+            let read_only = tool.annotations.as_ref().unwrap()["readOnlyHint"] == true;
+            assert_eq!(
+                tool_requires_approval(&tool.name),
+                !read_only,
+                "{}",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_approval_preview_is_bounded_text() {
+        let info = ConnectionInfo::default();
+        let big = "x".repeat(APPROVAL_PREVIEW_BYTES * 2);
+        let req = write_approval_request(
+            "a",
+            "fs_write_file",
+            "c",
+            &info,
+            "/f",
+            big.as_bytes(),
+            "h",
+            None,
+        );
+        assert_eq!(req.preview.as_ref().unwrap().len(), APPROVAL_PREVIEW_BYTES);
+        assert!(req.preview_truncated);
+        assert_eq!(req.connection_name, "c");
+        assert!(req.summary.starts_with("Create /f"));
+        let small =
+            write_approval_request("a", "fs_write_file", "c", &info, "/f", b"hi", "h", Some(1));
+        assert_eq!(small.preview.as_deref(), Some("hi"));
+        assert!(!small.preview_truncated);
     }
 
     #[tokio::test]
     async fn test_failures_are_audited_and_agent_id_is_not_spoofable() {
         let audit = AuditLogger::new();
-        let server = McpServer::new(audit.clone());
+        let server = Arc::new(McpServer::new(audit.clone()));
         let res = server
             .handle_tool_call(
                 "t",

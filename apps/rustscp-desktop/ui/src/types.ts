@@ -116,6 +116,32 @@ export interface McpStatusInfo {
   transport_running?: boolean;
   /** Command an agent uses to register the gateway (e.g. `claude mcp add …`), when there is one. */
   setup_command?: string | null;
+  /** `mcpServers` JSON for clients configured with a file (Cursor, Claude Desktop, …). */
+  setup_json?: string | null;
+  /** Agents connected right now. */
+  connected_agents?: number;
+  /** Why the gateway could not start, when it could not. */
+  gateway_error?: string | null;
+}
+
+/** An AI agent's file write waiting for Allow / Deny (`mcp-approval-request` event). */
+export interface McpApprovalPrompt {
+  id: string;
+  agent_id: string;
+  tool_name: string;
+  connection_id: string;
+  connection_name: string;
+  path: string;
+  summary: string;
+  new_size: number;
+  new_sha256: string;
+  /** Size of the file being replaced; null for a new file. */
+  previous_size: number | null;
+  /** Start of the new content when it is text. */
+  preview: string | null;
+  preview_truncated: boolean;
+  /** Unix time (ms) at which the write is denied if nobody answers. */
+  expires_at_ms: number;
 }
 
 export interface TransferItem {

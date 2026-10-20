@@ -93,13 +93,24 @@ export function getFallbackData<T>(cmd: string, args?: any): T {
     cmd === 'get_actions_catalog' ||
     cmd === 'manage_custom_actions' ||
     cmd === 'get_mcp_audit_logs' ||
+    cmd === 'get_pending_mcp_approvals' ||
     cmd === 'compare_directories_fast'
   ) {
     return [] as unknown as T;
   }
 
   if (cmd === 'get_mcp_status') {
-    return { enabled: true, active_sessions_count: 0, total_audit_events: 0 } as unknown as T;
+    return {
+      enabled: false,
+      active_sessions_count: 0,
+      total_audit_events: 0,
+      transport_available: true,
+      transport_running: false,
+      connected_agents: 0,
+      setup_command: 'claude mcp add rustscp -- /Applications/RustSCP.app/Contents/MacOS/rustscp-desktop --mcp-stdio',
+      setup_json: null,
+      gateway_error: 'Preview mode: the gateway runs in the desktop app.',
+    } as unknown as T;
   }
 
   if (cmd === 'is_continuous_sync_running') {
