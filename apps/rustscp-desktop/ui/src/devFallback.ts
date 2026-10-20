@@ -7,6 +7,9 @@ import type { FileEntry } from './types.ts';
 
 const DEMO_HOME = '/home/demo';
 
+/** The AI gateway switch in preview mode. */
+let previewGatewayOff = false;
+
 export function getFallbackData<T>(cmd: string, args?: any): T {
   if (cmd === 'list_directory') {
     const p: string = args?.path || '/';
@@ -99,7 +102,8 @@ export function getFallbackData<T>(cmd: string, args?: any): T {
     return [] as unknown as T;
   }
 
-  if (cmd === 'get_mcp_status') {
+  if (cmd === 'get_mcp_status' || cmd === 'set_mcp_gateway_enabled') {
+    if (cmd === 'set_mcp_gateway_enabled') previewGatewayOff = args?.enabled === false;
     return {
       enabled: false,
       active_sessions_count: 0,
@@ -109,7 +113,8 @@ export function getFallbackData<T>(cmd: string, args?: any): T {
       connected_agents: 0,
       setup_command: 'claude mcp add rustscp -- /Applications/RustSCP.app/Contents/MacOS/rustscp-desktop --mcp-stdio',
       setup_json: null,
-      gateway_error: 'Preview mode: the gateway runs in the desktop app.',
+      gateway_error: previewGatewayOff ? null : 'Preview mode: the gateway runs in the desktop app.',
+      turned_off: previewGatewayOff,
     } as unknown as T;
   }
 

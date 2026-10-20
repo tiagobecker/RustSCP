@@ -122,6 +122,8 @@ export interface McpStatusInfo {
   connected_agents?: number;
   /** Why the gateway could not start, when it could not. */
   gateway_error?: string | null;
+  /** The user turned the gateway off (it stays off across restarts). */
+  turned_off?: boolean;
 }
 
 /** An AI agent's file write waiting for Allow / Deny (`mcp-approval-request` event). */

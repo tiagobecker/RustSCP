@@ -4,7 +4,8 @@
 //! The app listens on a Unix socket in its config directory (0600, Unix) or on a loopback
 //! TCP port (elsewhere) and writes where, plus a random token, to
 //! [`ENDPOINT_FILE`] (0600). A bridge must send that token before anything else. After
-//! the handshake each line is one tool call (`CallRequest`) or its result (`CallReply`).
+//! the handshake each line is one tool call (`CallRequest`), its result (`CallReply`), or
+//! the bridge withdrawing a call it no longer waits for (`CancelCall`).
 
 use crate::protocol::McpToolResult;
 use serde::{Deserialize, Serialize};
@@ -69,6 +70,9 @@ pub(crate) enum Handshake {
     },
     Welcome {
         app_version: String,
+        /// The app honors [`CancelCall`] lines (older apps disconnect on them).
+        #[serde(default)]
+        cancels: bool,
     },
     Rejected {
         message: String,
@@ -92,6 +96,14 @@ pub(crate) struct CallRequest {
     pub name: String,
     #[serde(default)]
     pub arguments: Value,
+}
+
+/// The bridge no longer waits for call `cancel` (the agent cancelled it), bridge to app.
+/// The app drops the call without replying.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CancelCall {
+    pub cancel: u64,
 }
 
 /// Result of one tool call, app to bridge.
@@ -164,6 +176,26 @@ mod tests {
         assert!(!tokens_match(&b, &a));
         assert!(!tokens_match(&a[..63], &a));
         assert!(!tokens_match("", ""));
+    }
+
+    #[test]
+    fn cancel_lines_are_told_apart_from_calls() {
+        let line = serde_json::to_string(&CancelCall { cancel: 7 }).unwrap();
+        assert_eq!(line, r#"{"cancel":7}"#);
+        assert_eq!(serde_json::from_str::<CancelCall>(&line).unwrap().cancel, 7);
+        let call = serde_json::to_string(&CallRequestRef {
+            id: 7,
+            agent: "a",
+            name: "session_list",
+            arguments: &Value::Null,
+        })
+        .unwrap();
+        assert!(serde_json::from_str::<CancelCall>(&call).is_err());
+
+        // An app that predates cancellation never announces it.
+        let old: Handshake =
+            serde_json::from_str(r#"{"type":"welcome","app_version":"0.1.0"}"#).unwrap();
+        assert!(matches!(old, Handshake::Welcome { cancels: false, .. }));
     }
 
     #[test]

@@ -3,19 +3,21 @@
 
 use crate::ipc::{
     endpoint_file_path, new_token, tokens_match, BoxRead, BoxWrite, CallReply, CallRequest,
-    Endpoint, EndpointInfo, Handshake, ENDPOINT_FORMAT, HANDSHAKE_TIMEOUT, MAX_HANDSHAKE_BYTES,
-    MAX_IPC_MESSAGE_BYTES,
+    CancelCall, Endpoint, EndpointInfo, Handshake, ENDPOINT_FORMAT, HANDSHAKE_TIMEOUT,
+    MAX_HANDSHAKE_BYTES, MAX_IPC_MESSAGE_BYTES,
 };
 use crate::rpc::sanitize_label;
 use crate::server::McpServer;
 use crate::transport::{read_frame, write_lines, Frame, MAX_CONCURRENT_REQUESTS};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, Semaphore};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
 /// Bridges connected at the same time; more are turned away.
 pub const MAX_CLIENTS: usize = 8;
@@ -25,6 +27,53 @@ const MAX_AGENT_LABEL_CHARS: usize = 200;
 /// per-user temp directory.
 #[cfg(unix)]
 const MAX_UNIX_SOCKET_PATH: usize = 100;
+
+/// File in the config directory with the person's on/off choice for the gateway.
+pub const SETTINGS_FILE: &str = "mcp-gateway-settings.json";
+
+/// The person's choices for the gateway. It is on unless they turned it off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GatewaySettings {
+    pub enabled: bool,
+}
+
+impl Default for GatewaySettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+impl GatewaySettings {
+    pub fn file_path(config_dir: &Path) -> PathBuf {
+        config_dir.join(SETTINGS_FILE)
+    }
+
+    /// Saved settings: the defaults when nothing was saved, off when the file cannot be
+    /// read (an unreadable choice is never taken as a yes).
+    pub fn load(config_dir: &Path) -> Self {
+        let path = Self::file_path(config_dir);
+        let unreadable = |e: &dyn std::fmt::Display| {
+            tracing::warn!(
+                "{} is unreadable ({e}); the AI gateway stays off",
+                path.display()
+            );
+            Self { enabled: false }
+        };
+        match std::fs::read(&path) {
+            Ok(data) => serde_json::from_slice(&data).unwrap_or_else(|e| unreadable(&e)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Self::default(),
+            Err(e) => unreadable(&e),
+        }
+    }
+
+    /// Saves atomically, owner-only.
+    pub fn save(&self, config_dir: &Path) -> io::Result<()> {
+        rustscp_core::vault::ensure_private_dir(config_dir)?;
+        let data = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
+        rustscp_core::vault::write_private_file_atomic(&Self::file_path(config_dir), &data)
+    }
+}
 
 /// How the gateway listens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,8 +335,9 @@ impl Drop for ClientGuard {
     }
 }
 
-/// One bridge: token handshake, then tool calls until it disconnects. Calls still
-/// running then are dropped (pending approvals are withdrawn; approved writes finish).
+/// One bridge: token handshake, then tool calls until it disconnects. A call the bridge
+/// cancels, and every call still running when it disconnects, is dropped without a reply
+/// (a pending approval is withdrawn; an approved write still finishes).
 async fn serve_bridge_client(
     read: BoxRead,
     mut write: BoxWrite,
@@ -323,6 +373,7 @@ async fn serve_bridge_client(
         &mut write,
         &Handshake::Welcome {
             app_version: env!("CARGO_PKG_VERSION").to_string(),
+            cancels: true,
         },
     )
     .await
@@ -337,11 +388,21 @@ async fn serve_bridge_client(
     let writer = tokio::spawn(write_lines(write, rx));
     let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
     let mut calls = JoinSet::new();
+    // Running calls by id, for the bridge's cancellations.
+    let mut running: HashMap<u64, AbortHandle> = HashMap::new();
 
     loop {
         while calls.try_join_next().is_some() {}
+        running.retain(|_, call| !call.is_finished());
         match read_frame(&mut reader, &mut buf, MAX_IPC_MESSAGE_BYTES).await {
             Ok(Frame::Line) => {
+                // Rejected at the first key of a call line, so a large write is not parsed twice.
+                if let Ok(CancelCall { cancel }) = serde_json::from_slice(&buf) {
+                    if let Some(call) = running.remove(&cancel) {
+                        call.abort();
+                    }
+                    continue;
+                }
                 let req: CallRequest = match serde_json::from_slice(&buf) {
                     Ok(r) => r,
                     Err(e) => {
@@ -352,9 +413,10 @@ async fn serve_bridge_client(
                 let Ok(permit) = permits.clone().acquire_owned().await else {
                     break;
                 };
+                let id = req.id;
                 let server = server.clone();
                 let tx = tx.clone();
-                calls.spawn(async move {
+                let call = calls.spawn(async move {
                     let mut agent = sanitize_label(&req.agent, MAX_AGENT_LABEL_CHARS);
                     if agent.is_empty() {
                         agent = "mcp-stdio".to_string();
@@ -367,6 +429,7 @@ async fn serve_bridge_client(
                     }
                     drop(permit);
                 });
+                running.insert(id, call);
             }
             Ok(Frame::TooLong) => {
                 tracing::warn!("MCP gateway: a bridge sent an oversized call; disconnecting it");
@@ -380,10 +443,146 @@ async fn serve_bridge_client(
     writer.abort();
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::AuditLogger;
+    use crate::ipc::connect;
+    use crate::server::{ApprovalDecision, ApprovalRequest, ToolApprover};
+    use async_trait::async_trait;
+    use serde_json::{json, Value};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, Lines};
+    use tokio::sync::Notify;
 
+    /// Never answers, like an unanswered dialog; tells when it is asked and withdrawn.
+    #[derive(Default)]
+    struct PendingApprover {
+        asked: Notify,
+        withdrawn: Notify,
+    }
+
+    struct Withdrawn<'a>(&'a Notify);
+
+    impl Drop for Withdrawn<'_> {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+
+    #[async_trait]
+    impl ToolApprover for PendingApprover {
+        async fn approve(&self, _request: ApprovalRequest) -> ApprovalDecision {
+            let _withdrawn = Withdrawn(&self.withdrawn);
+            self.asked.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    async fn within<F: std::future::Future>(what: &str, future: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(5), future)
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+    }
+
+    async fn send_line(write: &mut BoxWrite, message: &impl Serialize) {
+        let mut line = serde_json::to_string(message).unwrap();
+        line.push('\n');
+        write.write_all(line.as_bytes()).await.unwrap();
+        write.flush().await.unwrap();
+    }
+
+    async fn next_line(lines: &mut Lines<BufReader<BoxRead>>) -> Value {
+        let line = within("a line from the app", lines.next_line())
+            .await
+            .unwrap()
+            .expect("a line");
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_call_is_withdrawn_and_never_answered() {
+        let config = tempfile::tempdir().unwrap();
+        let server = Arc::new(McpServer::new(AuditLogger::new()));
+        server
+            .register_connection("local".into(), Arc::new(rustscp_core::LocalFsDriver::new()))
+            .await;
+        let approver = Arc::new(PendingApprover::default());
+        server.set_approver(approver.clone());
+        let gateway = McpGateway::start_with(server, config.path(), EndpointKind::Tcp)
+            .await
+            .unwrap();
+
+        let (read, mut write) = connect(gateway.endpoint()).await.unwrap();
+        let mut lines = BufReader::new(read).lines();
+        send_line(
+            &mut write,
+            &Handshake::Hello {
+                token: gateway.token.clone(),
+                bridge_version: "test".into(),
+            },
+        )
+        .await;
+        let welcome = next_line(&mut lines).await;
+        assert_eq!(welcome["type"], "welcome");
+        assert_eq!(welcome["cancels"], true);
+
+        let target = config.path().join("new.txt");
+        let write_call = json!({
+            "id": 1,
+            "agent": "test",
+            "name": "fs_write_file",
+            "arguments": { "connection_id": "local", "path": target, "content": "x" }
+        });
+        send_line(&mut write, &write_call).await;
+        within("the approval request", approver.asked.notified()).await;
+        send_line(&mut write, &CancelCall { cancel: 1 }).await;
+        within(
+            "the approval to be withdrawn",
+            approver.withdrawn.notified(),
+        )
+        .await;
+
+        // Unknown ids are ignored, and the next reply belongs to the next call: call 1 is
+        // never answered.
+        send_line(&mut write, &CancelCall { cancel: 99 }).await;
+        let list = json!({ "id": 2, "agent": "test", "name": "session_list", "arguments": {} });
+        send_line(&mut write, &list).await;
+        let reply = next_line(&mut lines).await;
+        assert_eq!(reply["id"], 2, "{reply}");
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        assert!(!target.exists());
+        assert_eq!(gateway.connected_clients(), 1);
+    }
+
+    #[test]
+    fn settings_default_to_on_and_round_trip_privately() {
+        let config = tempfile::tempdir().unwrap();
+        assert!(GatewaySettings::load(config.path()).enabled);
+
+        let dir = config.path().join("nested");
+        GatewaySettings { enabled: false }.save(&dir).unwrap();
+        assert!(!GatewaySettings::load(&dir).enabled);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(GatewaySettings::file_path(&dir))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        GatewaySettings { enabled: true }.save(&dir).unwrap();
+        assert!(GatewaySettings::load(&dir).enabled);
+
+        // An unreadable choice keeps the gateway off; fields added later default.
+        std::fs::write(GatewaySettings::file_path(&dir), b"{ not json").unwrap();
+        assert!(!GatewaySettings::load(&dir).enabled);
+        std::fs::write(GatewaySettings::file_path(&dir), b"{}").unwrap();
+        assert!(GatewaySettings::load(&dir).enabled);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn long_config_dirs_get_a_stable_short_socket_path() {
         let short = Path::new("/tmp/rustscp-cfg");

@@ -100,6 +100,7 @@ fn main() {
             get_mcp_status,
             get_pending_mcp_approvals,
             respond_mcp_approval,
+            set_mcp_gateway_enabled,
             execute_script_line,
             execute_script_batch,
             generate_automation_code,

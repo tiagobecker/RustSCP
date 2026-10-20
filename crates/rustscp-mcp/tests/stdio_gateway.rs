@@ -1,17 +1,22 @@
 //! End to end: an MCP client on stdio -> bridge -> app gateway -> a connected session.
 
 use async_trait::async_trait;
-use rustscp_core::LocalFsDriver;
+use bytes::Bytes;
+use rustscp_core::{
+    CoreResult, FileEntry, FileSystemInfo, FindFileMatch, FindFileQuery, LocalFsDriver, Protocol,
+    VirtualFileSystem,
+};
 use rustscp_mcp::ipc::{endpoint_file_path, EndpointInfo};
 use rustscp_mcp::{
-    ApprovalDecision, ApprovalRequest, AuditLogger, ConnectionInfo, EndpointKind, McpGateway,
-    McpServer, ToolApprover,
+    ApprovalDecision, ApprovalRequest, AuditLogger, ConnectionInfo, EndpointKind, GatewaySettings,
+    McpGateway, McpServer, ToolApprover,
 };
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines};
+use tokio::sync::Notify;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -30,6 +35,113 @@ impl ToolApprover for RecordingApprover {
             ApprovalDecision::Denied("rejected by the user".into())
         }
     }
+}
+
+/// Never answers, like an unanswered dialog; tells when it is asked and withdrawn.
+#[derive(Default)]
+struct PendingApprover {
+    asked: Notify,
+    withdrawn: Notify,
+}
+
+struct Withdrawn<'a>(&'a Notify);
+
+impl Drop for Withdrawn<'_> {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
+#[async_trait]
+impl ToolApprover for PendingApprover {
+    async fn approve(&self, _request: ApprovalRequest) -> ApprovalDecision {
+        let _withdrawn = Withdrawn(&self.withdrawn);
+        self.asked.notify_one();
+        std::future::pending().await
+    }
+}
+
+/// Local files whose writes wait for `release`; `writing` fires when one starts.
+#[derive(Debug, Default)]
+struct GatedFs {
+    inner: LocalFsDriver,
+    writing: Notify,
+    release: Notify,
+}
+
+#[async_trait]
+impl VirtualFileSystem for GatedFs {
+    fn protocol(&self) -> Protocol {
+        self.inner.protocol()
+    }
+    async fn list_dir(&self, path: &str) -> CoreResult<Vec<FileEntry>> {
+        self.inner.list_dir(path).await
+    }
+    async fn metadata(&self, path: &str) -> CoreResult<FileEntry> {
+        self.inner.metadata(path).await
+    }
+    async fn read_file(&self, path: &str) -> CoreResult<Bytes> {
+        self.inner.read_file(path).await
+    }
+    async fn read_range(&self, path: &str, offset: u64, length: u64) -> CoreResult<Bytes> {
+        self.inner.read_range(path, offset, length).await
+    }
+    async fn write_file(&self, path: &str, data: Bytes) -> CoreResult<()> {
+        self.writing.notify_one();
+        self.release.notified().await;
+        self.inner.write_file(path, data).await
+    }
+    async fn create_dir(&self, path: &str) -> CoreResult<()> {
+        self.inner.create_dir(path).await
+    }
+    async fn remove_file(&self, path: &str) -> CoreResult<()> {
+        self.inner.remove_file(path).await
+    }
+    async fn remove_dir(&self, path: &str, recursive: bool) -> CoreResult<()> {
+        self.inner.remove_dir(path, recursive).await
+    }
+    async fn rename(&self, from: &str, to: &str) -> CoreResult<()> {
+        self.inner.rename(from, to).await
+    }
+    async fn set_permissions(&self, path: &str, mode: u32) -> CoreResult<()> {
+        self.inner.set_permissions(path, mode).await
+    }
+    async fn exists(&self, path: &str) -> CoreResult<bool> {
+        self.inner.exists(path).await
+    }
+    async fn search(
+        &self,
+        root_path: &str,
+        pattern: &str,
+        max_results: usize,
+    ) -> CoreResult<Vec<FileEntry>> {
+        self.inner.search(root_path, pattern, max_results).await
+    }
+    async fn create_symlink(
+        &self,
+        target: &str,
+        link_path: &str,
+        is_symbolic: bool,
+    ) -> CoreResult<()> {
+        self.inner
+            .create_symlink(target, link_path, is_symbolic)
+            .await
+    }
+    async fn get_filesystem_info(&self, path: &str) -> CoreResult<FileSystemInfo> {
+        self.inner.get_filesystem_info(path).await
+    }
+    async fn calculate_size(&self, path: &str) -> CoreResult<u64> {
+        self.inner.calculate_size(path).await
+    }
+    async fn find_files(&self, query: &FindFileQuery) -> CoreResult<Vec<FindFileMatch>> {
+        self.inner.find_files(query).await
+    }
+}
+
+async fn within<F: std::future::Future>(what: &str, future: F) -> F::Output {
+    tokio::time::timeout(TIMEOUT, future)
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
 }
 
 /// App side: a server with one "connected" session rooted in a temp folder.
@@ -113,6 +225,40 @@ impl<W: AsyncWrite + Unpin> Client<W> {
         self.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
             .await;
         reply
+    }
+}
+
+impl<W: AsyncWrite + Unpin> Client<W> {
+    /// `tools/call` of `fs_write_file` under `id`, without waiting for the reply.
+    async fn start_write(&mut self, id: &str, connection_id: &str, path: &Path, content: &str) {
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "fs_write_file",
+                "arguments": { "connection_id": connection_id, "path": path, "content": content }
+            }
+        }))
+        .await;
+    }
+
+    async fn cancel(&mut self, id: &str) {
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": id, "reason": "the user interrupted the agent" }
+        }))
+        .await;
+    }
+
+    /// Closes stdin and checks that nothing else was ever answered.
+    async fn finish(mut self) {
+        self.write.shutdown().await.unwrap();
+        let rest = within("the bridge to close", self.lines.next_line())
+            .await
+            .unwrap();
+        assert!(rest.is_none(), "unexpected reply: {rest:?}");
     }
 }
 
@@ -278,6 +424,107 @@ async fn writes_go_through_the_app_approval() {
     assert!(!is_error, "{text}");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "changed");
     assert_eq!(audit.get_recent_events(1).await[0].status, "success");
+}
+
+#[tokio::test]
+async fn cancelling_a_write_withdraws_its_approval_and_it_is_never_answered() {
+    let config = tempfile::tempdir().unwrap();
+    let files = tempfile::tempdir().unwrap();
+    let (server, audit) = app_with_session(files.path()).await;
+    let approver = Arc::new(PendingApprover::default());
+    server.set_approver(approver.clone());
+    let _gateway = McpGateway::start(server, config.path()).await.unwrap();
+    let mut agent = start_bridge(config.path());
+    agent.initialize().await;
+
+    let target = files.path().join("hello.txt");
+    agent
+        .start_write("write-1", "demo", &target, "changed")
+        .await;
+    within("the approval request", approver.asked.notified()).await;
+    agent.cancel("write-1").await;
+    // The cancellation crossed the bridge and the app dropped the dialog's request.
+    within(
+        "the approval to be withdrawn",
+        approver.withdrawn.notified(),
+    )
+    .await;
+
+    // The agent keeps working over the same connection; the next reply is its own.
+    let (is_error, text) = agent.call("session_list", json!({})).await;
+    assert!(!is_error, "{text}");
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "hello from the server\n"
+    );
+    assert!(!audit
+        .get_recent_events(10)
+        .await
+        .iter()
+        .any(|e| e.tool_name == "fs_write_file" && e.status == "success"));
+    agent.finish().await;
+}
+
+#[tokio::test]
+async fn an_approved_write_finishes_even_when_the_agent_cancels_it() {
+    let config = tempfile::tempdir().unwrap();
+    let files = tempfile::tempdir().unwrap();
+    let (server, audit) = app_with_session(files.path()).await;
+    let gated = Arc::new(GatedFs::default());
+    server
+        .register_session("gated".into(), ConnectionInfo::default(), gated.clone())
+        .await;
+    server.set_approver(Arc::new(RecordingApprover {
+        allow: true,
+        seen: Mutex::new(Vec::new()),
+    }));
+    let _gateway = McpGateway::start(server, config.path()).await.unwrap();
+    let mut agent = start_bridge(config.path());
+    agent.initialize().await;
+
+    let target = files.path().join("hello.txt");
+    agent
+        .start_write("write-2", "gated", &target, "changed")
+        .await;
+    within("the approved write to start", gated.writing.notified()).await;
+    agent.cancel("write-2").await;
+    // This call reaches the app after the cancellation, so once it is answered the app has
+    // dropped the cancelled call.
+    let (is_error, text) = agent.call("session_list", json!({})).await;
+    assert!(!is_error, "{text}");
+    gated.release.notify_one();
+
+    within("the write to finish", async {
+        while std::fs::read_to_string(&target).unwrap() != "changed" {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    within("the write to be audited", async {
+        while !audit
+            .get_recent_events(10)
+            .await
+            .iter()
+            .any(|e| e.tool_name == "fs_write_file" && e.status == "success")
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    agent.finish().await;
+}
+
+#[tokio::test]
+async fn a_turned_off_gateway_tells_the_agent() {
+    let config = tempfile::tempdir().unwrap();
+    GatewaySettings { enabled: false }
+        .save(config.path())
+        .unwrap();
+    let mut agent = start_bridge(config.path());
+    agent.initialize().await;
+    let (is_error, text) = agent.call("session_list", json!({})).await;
+    assert!(is_error);
+    assert!(text.contains("turned off"), "{text}");
 }
 
 #[tokio::test]

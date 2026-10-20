@@ -74,7 +74,7 @@ RustSCP includes an embedded JSON-RPC 2.0 MCP server (`rustscp-mcp`) acting as a
 claude mcp add rustscp -- /Applications/RustSCP.app/Contents/MacOS/rustscp-desktop --mcp-stdio
 ```
 
-Agents see only the remote sessions connected in the app (never the local disk), every call lands in the activity log (`mcp-audit.log` in the RustSCP config folder), and each `fs_write_file` waits until you click **Allow** in the app (it is denied after 2 minutes without an answer).
+Agents see only the remote sessions connected in the app (never the local disk), every call lands in the activity log (`mcp-audit.log` in the RustSCP config folder), and each `fs_write_file` waits until you click **Allow** in the app (it is denied after 2 minutes without an answer). A write the agent cancels leaves the app's dialog at once. The **Allow AI agents** switch in that window turns the gateway off and on; the choice is kept across restarts.
 
 ### 🔄 3. Dual-Session Proactive SSH Architecture
 Unlike traditional tools that disconnect or force a second login prompt when running terminal operations:

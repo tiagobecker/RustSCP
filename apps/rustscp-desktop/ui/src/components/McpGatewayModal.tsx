@@ -3,13 +3,16 @@ import { useTranslation } from 'react-i18next';
 import { Bot, Check, Copy, Info } from 'lucide-react';
 import { AuditEvent, McpStatusInfo } from '../types.ts';
 import { Modal } from './ui/Modal.tsx';
-import { Button, Disclosure, IconButton } from './ui/controls.tsx';
+import { Button, Disclosure, IconButton, Toggle } from './ui/controls.tsx';
+import { notify } from './ui/toast.tsx';
 
 interface McpGatewayModalProps {
   isOpen: boolean;
   onClose: () => void;
   status: McpStatusInfo | null;
   auditLogs: AuditEvent[];
+  /** Turns the gateway on or off (remembered across restarts). */
+  onSetEnabled?: (enabled: boolean) => Promise<unknown>;
 }
 
 /** Monospaced, selectable snippet with a copy button. */
@@ -39,17 +42,34 @@ const CopyBlock: React.FC<{ label: React.ReactNode; text: string; copyLabel: str
   );
 };
 
-export const McpGatewayModal: React.FC<McpGatewayModalProps> = ({ isOpen, onClose, status, auditLogs }) => {
+export const McpGatewayModal: React.FC<McpGatewayModalProps> = ({ isOpen, onClose, status, auditLogs, onSetEnabled }) => {
   const { i18n } = useTranslation();
   const isPt = i18n.language.startsWith('pt');
+  // The value being applied while the switch is busy.
+  const [switching, setSwitching] = useState<boolean | null>(null);
 
   if (!isOpen) return null;
 
   const s = status;
   const shipsTransport = !!s && s.transport_available === true;
   const running = shipsTransport && s.transport_running === true && !!s.enabled;
+  const turnedOff = shipsTransport && s.turned_off === true;
+  const switchedOn = switching ?? !turnedOff;
   const agents = s?.connected_agents ?? 0;
   const copyLabel = isPt ? 'Copiar' : 'Copy';
+  const allowLabel = isPt ? 'Permitir agentes de IA' : 'Allow AI agents';
+
+  const handleSwitch = async (on: boolean) => {
+    if (!onSetEnabled || switching !== null) return;
+    setSwitching(on);
+    try {
+      await onSetEnabled(on);
+    } catch (e) {
+      notify.error(isPt ? 'Não foi possível alterar o gateway' : 'The gateway could not be changed', e);
+    } finally {
+      setSwitching(null);
+    }
+  };
 
   const badge = !s
     ? { text: isPt ? 'Status indisponível' : 'Status unavailable', cls: 'bg-dark-650/70 text-ink-muted' }
@@ -65,9 +85,11 @@ export const McpGatewayModal: React.FC<McpGatewayModalProps> = ({ isOpen, onClos
                 : 'Running',
           cls: 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400',
         }
-      : shipsTransport
+      : turnedOff
         ? { text: isPt ? 'Desligado' : 'Off', cls: 'bg-dark-650/70 text-ink-muted' }
-        : { text: isPt ? 'Indisponível nesta versão' : 'Not in this build', cls: 'bg-amber-500/10 text-amber-700 dark:text-amber-400' };
+        : shipsTransport
+          ? { text: isPt ? 'Parado' : 'Stopped', cls: 'bg-dark-650/70 text-ink-muted' }
+          : { text: isPt ? 'Indisponível nesta versão' : 'Not in this build', cls: 'bg-amber-500/10 text-amber-700 dark:text-amber-400' };
 
   const formatTime = (iso: string) => {
     const d = new Date(iso);
@@ -123,7 +145,25 @@ export const McpGatewayModal: React.FC<McpGatewayModalProps> = ({ isOpen, onClos
       }
     >
       <div className="space-y-5">
-        {s && !running && (
+        {shipsTransport && (
+          <div className="ui-card flex items-center gap-3 px-3.5 py-2.5">
+            <div className="min-w-0 flex-1">
+              <div className="text-[13px] text-ink">{allowLabel}</div>
+              <div className="text-[12px] text-ink-faint leading-snug mt-0.5">
+                {switchedOn
+                  ? isPt
+                    ? 'Agentes configurados abaixo podem usar as sessões conectadas aqui.'
+                    : 'Agents set up below can use the sessions connected here.'
+                  : isPt
+                    ? 'Nenhum agente consegue se conectar até você ligar de novo.'
+                    : 'No agent can connect until you turn this back on.'}
+              </div>
+            </div>
+            <Toggle checked={switchedOn} onChange={handleSwitch} disabled={!onSetEnabled || switching !== null} label={allowLabel} />
+          </div>
+        )}
+
+        {s && !running && !turnedOff && (
           <div className="flex items-start gap-2.5 rounded-lg bg-amber-500/10 px-3 py-2.5 text-[12.5px] text-amber-800 dark:text-amber-300">
             <Info className="w-4 h-4 mt-0.5 shrink-0" />
             <p className="leading-relaxed">
@@ -132,8 +172,8 @@ export const McpGatewayModal: React.FC<McpGatewayModalProps> = ({ isOpen, onClos
                   ? 'Esta versão não tem um canal de conexão para agentes. Nenhum programa fora do RustSCP consegue usar o gateway.'
                   : 'This build has no connection channel for agents. No program outside RustSCP can use the gateway.'
                 : isPt
-                  ? `O gateway não está aceitando agentes${s.gateway_error ? `: ${s.gateway_error}` : '.'} Reabra o RustSCP para tentar de novo.`
-                  : `The gateway is not accepting agents${s.gateway_error ? `: ${s.gateway_error}` : '.'} Reopen RustSCP to try again.`}
+                  ? `O gateway não está aceitando agentes${s.gateway_error ? `: ${s.gateway_error}` : '.'} Desligue e ligue de novo para tentar outra vez.`
+                  : `The gateway is not accepting agents${s.gateway_error ? `: ${s.gateway_error}` : '.'} Turn it off and on again to retry.`}
             </p>
           </div>
         )}

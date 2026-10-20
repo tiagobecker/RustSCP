@@ -5,13 +5,14 @@
 //! private channel in [`crate::ipc`]. The app runs the call on its own sessions, with its
 //! approvals and audit log; no credential ever reaches this process.
 
+use crate::gateway::GatewaySettings;
 use crate::ipc::{
-    connect, endpoint_file_path, BoxRead, BoxWrite, CallReply, CallRequestRef, EndpointInfo,
+    connect, endpoint_file_path, BoxRead, CallReply, CallRequestRef, CancelCall, EndpointInfo,
     Handshake, ENDPOINT_FORMAT, HANDSHAKE_TIMEOUT, MAX_HANDSHAKE_BYTES, MAX_IPC_MESSAGE_BYTES,
 };
 use crate::protocol::McpToolResult;
 use crate::rpc::{RpcSession, ToolBackend};
-use crate::transport::{read_frame, serve, Frame};
+use crate::transport::{read_frame, serve, write_lines, Frame, MAX_CONCURRENT_REQUESTS};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -20,12 +21,14 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 /// Agent label until the client's `initialize` names it.
 pub const BRIDGE_AGENT_ID: &str = "mcp-stdio";
 
+const TURNED_OFF: &str = "The RustSCP AI gateway is turned off. Ask the user to turn it on in RustSCP (AI gateway window), then try again.";
 const NOT_RUNNING: &str = "RustSCP is not running, so no server sessions are available. Ask the user to open the RustSCP app and connect a server, then try again.";
 const CONNECTION_LOST: &str = "The connection to RustSCP closed before it answered (the app may have quit). Ask the user to open RustSCP, then try again.";
 
@@ -97,19 +100,50 @@ impl Shared {
     fn pending(&self) -> std::sync::MutexGuard<'_, HashMap<u64, oneshot::Sender<McpToolResult>>> {
         self.pending.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// Marks the connection dead, then wakes every waiting call with CONNECTION_LOST (by
+    /// dropping its sender).
+    fn close(&self) {
+        self.alive.store(false, Ordering::SeqCst);
+        self.pending().clear();
+    }
 }
 
 /// One authenticated connection to the app; calls are matched to replies by id.
 pub struct AppConnection {
-    writer: tokio::sync::Mutex<BoxWrite>,
+    /// Lines for the app. The writer task writes each one whole, so a call dropped midway
+    /// never leaves half a line on the socket.
+    outgoing: mpsc::Sender<String>,
     shared: Arc<Shared>,
     next_id: AtomicU64,
+    /// The app drops a call on a [`CancelCall`] line.
+    cancels: bool,
     reader: JoinHandle<()>,
+    writer: JoinHandle<()>,
 }
 
 impl Drop for AppConnection {
     fn drop(&mut self) {
         self.reader.abort();
+        self.writer.abort();
+    }
+}
+
+/// A call waiting for the app. Dropped before the app answers (the agent cancelled it),
+/// it asks the app to drop the call too, which withdraws a pending approval.
+struct Waiting<'a> {
+    conn: &'a AppConnection,
+    id: u64,
+    sent: bool,
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        // Still registered: no answer came, so the app may still be running it.
+        let unanswered = self.conn.shared.pending().remove(&self.id).is_some();
+        if unanswered && self.sent && self.conn.cancels {
+            self.conn.send_cancel(self.id);
+        }
     }
 }
 
@@ -118,7 +152,10 @@ impl AppConnection {
         let path = endpoint_file_path(config_dir);
         let data = match tokio::fs::read(&path).await {
             Ok(d) => d,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(NOT_RUNNING.to_string()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let off = !GatewaySettings::load(config_dir).enabled;
+                return Err(if off { TURNED_OFF } else { NOT_RUNNING }.to_string());
+            }
             Err(e) => return Err(format!("Could not read {}: {e}", path.display())),
         };
         let info: EndpointInfo = serde_json::from_slice(&data)
@@ -162,14 +199,18 @@ impl AppConnection {
                     .to_string(),
             );
         }
-        match serde_json::from_slice::<Handshake>(&buf) {
-            Ok(Handshake::Welcome { app_version }) => {
+        let cancels = match serde_json::from_slice::<Handshake>(&buf) {
+            Ok(Handshake::Welcome {
+                app_version,
+                cancels,
+            }) => {
                 if app_version != env!("CARGO_PKG_VERSION") {
                     tracing::warn!(
                         "RustSCP {app_version} is running; this gateway is {}",
                         env!("CARGO_PKG_VERSION")
                     );
                 }
+                cancels
             }
             Ok(Handshake::Rejected { message }) => {
                 return Err(format!("RustSCP refused the connection: {message}"));
@@ -180,18 +221,28 @@ impl AppConnection {
                         .to_string(),
                 )
             }
-        }
+        };
 
         let shared = Arc::new(Shared {
             pending: Mutex::new(HashMap::new()),
             alive: AtomicBool::new(true),
         });
         let reader = tokio::spawn(read_replies(reader, shared.clone()));
+        let (outgoing, lines) = mpsc::channel(MAX_CONCURRENT_REQUESTS * 2);
+        let writer = tokio::spawn({
+            let shared = shared.clone();
+            async move {
+                let _ = write_lines(write, lines).await;
+                shared.close();
+            }
+        });
         Ok(Self {
-            writer: tokio::sync::Mutex::new(write),
+            outgoing,
             shared,
             next_id: AtomicU64::new(1),
+            cancels,
             reader,
+            writer,
         })
     }
 
@@ -204,10 +255,14 @@ impl AppConnection {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.shared.pending().insert(id, tx);
-        // The reader marks the connection dead before it drops the waiting calls, so a
+        let mut waiting = Waiting {
+            conn: self,
+            id,
+            sent: false,
+        };
+        // A closing connection is marked dead before its waiting calls are dropped, so a
         // call registered after that is caught here.
         if !self.shared.alive.load(Ordering::SeqCst) {
-            self.shared.pending().remove(&id);
             return Err(CONNECTION_LOST.to_string());
         }
 
@@ -217,21 +272,28 @@ impl AppConnection {
             name,
             arguments,
         };
-        let mut line = serde_json::to_string(&request).map_err(|e| e.to_string())?;
-        line.push('\n');
-        let sent = {
-            let mut w = self.writer.lock().await;
-            match w.write_all(line.as_bytes()).await {
-                Ok(()) => w.flush().await,
-                Err(e) => Err(e),
-            }
-        };
-        if sent.is_err() {
-            self.shared.alive.store(false, Ordering::SeqCst);
-            self.shared.pending().remove(&id);
+        let line = serde_json::to_string(&request).map_err(|e| e.to_string())?;
+        if self.outgoing.send(line).await.is_err() {
             return Err(CONNECTION_LOST.to_string());
         }
+        waiting.sent = true;
         rx.await.map_err(|_| CONNECTION_LOST.to_string())
+    }
+
+    /// Queues a [`CancelCall`] behind the call's own line, so the app always sees the call
+    /// first. Runs from a destructor, so it never waits.
+    fn send_cancel(&self, id: u64) {
+        let Ok(line) = serde_json::to_string(&CancelCall { cancel: id }) else {
+            return;
+        };
+        if let Err(TrySendError::Full(line)) = self.outgoing.try_send(line) {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                let outgoing = self.outgoing.clone();
+                runtime.spawn(async move {
+                    let _ = outgoing.send(line).await;
+                });
+            }
+        }
     }
 }
 
@@ -247,7 +309,5 @@ async fn read_replies(mut reader: BufReader<BoxRead>, shared: Arc<Shared>) {
             Err(e) => tracing::warn!("ignoring a malformed reply from RustSCP: {e}"),
         }
     }
-    shared.alive.store(false, Ordering::SeqCst);
-    // Dropping the senders wakes every waiting call with CONNECTION_LOST.
-    shared.pending().clear();
+    shared.close();
 }

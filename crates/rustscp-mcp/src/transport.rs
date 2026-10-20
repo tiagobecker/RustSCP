@@ -2,17 +2,22 @@
 //!
 //! Each message is one line of UTF-8 JSON without embedded newlines. Requests run
 //! concurrently (a write waiting for approval never blocks a `ping` or a read), replies
-//! are written whole, one per line, and nothing else is ever written to the stream.
+//! are written whole, one per line, and nothing else is ever written to the stream. A
+//! `notifications/cancelled` drops the named request, which then gets no reply.
 
 use crate::protocol::JsonRpcResponse;
-use crate::rpc::{RpcSession, ToolBackend, INVALID_REQUEST, PARSE_ERROR};
+use crate::rpc::{
+    cancellable_request, cancelled_requests, parse_message, RpcSession, ToolBackend,
+    INVALID_REQUEST, PARSE_ERROR,
+};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, Semaphore};
-use tokio::task::JoinSet;
+use tokio::task::{AbortHandle, JoinSet};
 
 /// Largest message accepted (a base64 `fs_write_file` of several MiB must fit).
 pub const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
@@ -104,12 +109,15 @@ where
     let mut writer_task = tokio::spawn(write_lines(writer, rx));
     let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
     let mut in_flight = JoinSet::new();
+    // Running requests by JSON-RPC id, for `notifications/cancelled`.
+    let mut cancellable: HashMap<String, AbortHandle> = HashMap::new();
     let mut reader = BufReader::new(reader);
     let mut buf = Vec::new();
 
     let read_result = loop {
-        // Reap finished requests so the set never grows with the session.
+        // Reap finished requests so neither the set nor the map grows with the session.
         while in_flight.try_join_next().is_some() {}
+        cancellable.retain(|_, task| !task.is_finished());
 
         let frame = tokio::select! {
             frame = read_frame(&mut reader, &mut buf, MAX_MESSAGE_BYTES) => frame,
@@ -131,25 +139,41 @@ where
                 }
             }
             Ok(Frame::Line) => {
-                let line = match std::str::from_utf8(&buf) {
-                    Ok(s) => s.to_string(),
-                    Err(_) => {
-                        if tx
-                            .send(error_line(PARSE_ERROR, "Parse error: message is not UTF-8"))
-                            .await
-                            .is_err()
-                        {
+                let Ok(text) = std::str::from_utf8(&buf) else {
+                    if tx
+                        .send(error_line(PARSE_ERROR, "Parse error: message is not UTF-8"))
+                        .await
+                        .is_err()
+                    {
+                        break Ok(());
+                    }
+                    continue;
+                };
+                let text = text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                let message = match parse_message(text) {
+                    Ok(message) => message,
+                    Err(reply) => {
+                        if tx.send(reply).await.is_err() {
                             break Ok(());
                         }
                         continue;
                     }
                 };
-                if line.trim().is_empty() {
-                    continue;
+                // A cancelled request is dropped and never answered: a write waiting for
+                // approval is withdrawn, one already approved still finishes.
+                for id in cancelled_requests(&message) {
+                    if let Some(task) = cancellable.remove(&id) {
+                        task.abort();
+                    }
                 }
-                if !session.is_initialized() {
-                    // Before `initialize` is answered, one message at a time.
-                    if let Some(reply) = session.handle_line(&line).await {
+                let key = cancellable_request(&message);
+                if !session.is_initialized() || (key.is_none() && !message.is_array()) {
+                    // Before `initialize` is answered, one message at a time. Notifications
+                    // and malformed messages are handled at once, never queued.
+                    if let Some(reply) = session.handle_value(message).await {
                         if tx.send(reply).await.is_err() {
                             break Ok(());
                         }
@@ -161,12 +185,15 @@ where
                 };
                 let session = session.clone();
                 let tx = tx.clone();
-                in_flight.spawn(async move {
-                    if let Some(reply) = session.handle_line(&line).await {
+                let task = in_flight.spawn(async move {
+                    if let Some(reply) = session.handle_value(message).await {
                         let _ = tx.send(reply).await;
                     }
                     drop(permit);
                 });
+                if let Some(key) = key {
+                    cancellable.insert(key, task);
+                }
             }
             Err(e) => break Err(e),
         }
@@ -208,6 +235,40 @@ mod tests {
             }
             McpToolResult::success_text(name)
         }
+    }
+
+    /// Notifies when dropped.
+    struct OnDrop<'a>(&'a tokio::sync::Notify);
+
+    impl Drop for OnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+
+    /// `hang` never finishes; `started` and `dropped` track it.
+    #[derive(Default)]
+    struct HangingBackend {
+        started: tokio::sync::Notify,
+        dropped: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl ToolBackend for HangingBackend {
+        async fn call_tool(&self, _agent: &str, name: &str, _args: &Value) -> McpToolResult {
+            if name == "hang" {
+                let _dropped = OnDrop(&self.dropped);
+                self.started.notify_one();
+                std::future::pending::<()>().await;
+            }
+            McpToolResult::success_text(name)
+        }
+    }
+
+    async fn within<F: std::future::Future>(what: &str, future: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(5), future)
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
     }
 
     async fn next_json<R: AsyncBufRead + Unpin>(lines: &mut tokio::io::Lines<R>) -> Value {
@@ -305,6 +366,60 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_requests_are_dropped_and_never_answered() {
+        let backend = Arc::new(HangingBackend::default());
+        let session = Arc::new(RpcSession::new(backend.clone(), "mcp-stdio", Some("stdio")));
+        let (client, server) = duplex(64 * 1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let served = tokio::spawn(serve(server_read, server_write, session));
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut lines = BufReader::new(client_read).lines();
+
+        client_write
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        assert_eq!(next_json(&mut lines).await["id"], 1);
+
+        // Two calls that never finish: id 2 and id "2" are different requests.
+        client_write
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"hang\"}}\n")
+            .await
+            .unwrap();
+        within("call 2", backend.started.notified()).await;
+        client_write
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"2\",\"method\":\"tools/call\",\"params\":{\"name\":\"hang\"}}\n")
+            .await
+            .unwrap();
+        within("call \"2\"", backend.started.notified()).await;
+
+        // Cancelling an unknown id does nothing; cancelling "2" drops only that call.
+        client_write
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":99}}\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"2\",\"reason\":\"user\"}}\n")
+            .await
+            .unwrap();
+        within("call \"2\" to be dropped", backend.dropped.notified()).await;
+        client_write
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}\n")
+            .await
+            .unwrap();
+        assert_eq!(next_json(&mut lines).await["id"], 3);
+
+        // A cancellation inside a batch counts too.
+        client_write
+            .write_all(b"[{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":2}}]\n")
+            .await
+            .unwrap();
+        within("call 2 to be dropped", backend.dropped.notified()).await;
+
+        // Nothing is left running, so closing stdin ends the session at once, and no reply
+        // for either cancelled call was ever written.
+        client_write.shutdown().await.unwrap();
+        within("the session to end", served).await.unwrap().unwrap();
+        assert!(lines.next_line().await.unwrap().is_none());
     }
 
     #[tokio::test]

@@ -9,8 +9,8 @@ use rustscp_core::{
     WebDavServer,
 };
 use rustscp_mcp::{
-    ApprovalDecision, ApprovalRequest, AuditEvent, AuditLogger, ConnectionInfo, McpGateway,
-    McpServer, ToolApprover,
+    ApprovalDecision, ApprovalRequest, AuditEvent, AuditLogger, ConnectionInfo, GatewaySettings,
+    McpGateway, McpServer, ToolApprover,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -44,6 +44,9 @@ pub struct McpStatusInfo {
     /// Why the gateway could not start, when it could not.
     #[serde(default)]
     pub gateway_error: Option<String>,
+    /// The person turned the gateway off (it stays off across restarts).
+    #[serde(default)]
+    pub turned_off: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2147,6 +2150,7 @@ pub async fn get_mcp_status(state: tauri::State<'_, AppState>) -> Result<McpStat
             running: slot.gateway.is_some(),
             connected_agents: slot.gateway.as_ref().map_or(0, |g| g.connected_clients()),
             error: slot.error.clone(),
+            turned_off: slot.turned_off,
         }
     };
     let exe = std::env::current_exe()
@@ -2166,6 +2170,7 @@ struct GatewayStatus {
     running: bool,
     connected_agents: usize,
     error: Option<String>,
+    turned_off: bool,
 }
 
 /// The gateway is only reported as enabled when an external MCP client can actually reach
@@ -2188,6 +2193,7 @@ fn mcp_status_info(
         setup_command: exe.filter(|_| transport_available).map(mcp_setup_command),
         setup_json: exe.filter(|_| transport_available).map(mcp_setup_json),
         gateway_error: gateway.error,
+        turned_off: gateway.turned_off,
     }
 }
 
@@ -2208,7 +2214,12 @@ const MCP_APPROVAL_RESOLVED_EVENT: &str = "mcp-approval-resolved";
 pub struct McpGatewayState {
     pub gateway: Option<McpGateway>,
     pub error: Option<String>,
+    /// The person turned the gateway off ([`GatewaySettings`]).
+    pub turned_off: bool,
 }
+
+/// Serializes turning the gateway on and off (and its start at launch).
+static MCP_GATEWAY_SWITCH: Mutex<()> = Mutex::const_new(());
 
 fn lock_gateway(
     slot: &std::sync::Mutex<McpGatewayState>,
@@ -2248,8 +2259,9 @@ fn mcp_setup_json(exe: &str) -> String {
     serde_json::to_string_pretty(&config).unwrap_or_default()
 }
 
-/// Starts accepting `--mcp-stdio` bridges and routes agent writes to the window for
-/// approval. Called once the window exists; a failure is reported by `get_mcp_status`.
+/// Routes agent writes to the window for approval and, unless the person turned the
+/// gateway off, starts accepting `--mcp-stdio` bridges. Called once the window exists; a
+/// failure is reported by `get_mcp_status`.
 pub async fn start_mcp_gateway(app: tauri::AppHandle) {
     use tauri::Manager;
 
@@ -2258,16 +2270,84 @@ pub async fn start_mcp_gateway(app: tauri::AppHandle) {
         app: app.clone(),
         approvals: state.mcp_approvals.clone(),
     }));
-    let started = McpGateway::start(state.mcp_server.clone(), &get_rustscp_config_dir()).await;
-    let mut slot = lock_gateway(&state.mcp_gateway);
-    match started {
-        Ok(gateway) => {
-            slot.gateway = Some(gateway);
-            slot.error = None;
+    resume_mcp_gateway(
+        &state.mcp_gateway,
+        &state.mcp_server,
+        &get_rustscp_config_dir(),
+    )
+    .await;
+}
+
+/// Turns the AI gateway on or off and remembers the choice across restarts.
+#[tauri::command]
+pub async fn set_mcp_gateway_enabled(
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<McpStatusInfo, String> {
+    turn_mcp_gateway(
+        &state.mcp_gateway,
+        &state.mcp_server,
+        get_rustscp_config_dir(),
+        enabled,
+    )
+    .await?;
+    get_mcp_status(state).await
+}
+
+/// Starts the gateway at launch unless the person turned it off.
+async fn resume_mcp_gateway(
+    slot: &std::sync::Mutex<McpGatewayState>,
+    server: &Arc<McpServer>,
+    config_dir: &std::path::Path,
+) {
+    let _switching = MCP_GATEWAY_SWITCH.lock().await;
+    let on = GatewaySettings::load(config_dir).enabled;
+    switch_mcp_gateway(slot, server, config_dir, on).await;
+}
+
+/// Applies the person's choice, then saves it.
+async fn turn_mcp_gateway(
+    slot: &std::sync::Mutex<McpGatewayState>,
+    server: &Arc<McpServer>,
+    config_dir: std::path::PathBuf,
+    on: bool,
+) -> Result<(), String> {
+    let _switching = MCP_GATEWAY_SWITCH.lock().await;
+    switch_mcp_gateway(slot, server, &config_dir, on).await;
+    tokio::task::spawn_blocking(move || GatewaySettings { enabled: on }.save(&config_dir))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("The AI gateway setting could not be saved: {e}"))
+}
+
+/// Starts the listener (again) or stops it. Stopping disconnects every agent, which
+/// withdraws their pending approvals. Callers hold [`MCP_GATEWAY_SWITCH`].
+async fn switch_mcp_gateway(
+    slot: &std::sync::Mutex<McpGatewayState>,
+    server: &Arc<McpServer>,
+    config_dir: &std::path::Path,
+    on: bool,
+) {
+    let stopped = {
+        let mut state = lock_gateway(slot);
+        state.turned_off = !on;
+        if on && state.gateway.is_some() {
+            return;
         }
+        state.error = None;
+        state.gateway.take()
+    };
+    drop(stopped);
+    if !on {
+        return;
+    }
+    let started = McpGateway::start(server.clone(), config_dir).await;
+    let mut state = lock_gateway(slot);
+    match started {
+        Ok(gateway) => state.gateway = Some(gateway),
         Err(e) => {
             tracing::warn!("the AI gateway could not start: {e}");
-            slot.error = Some(e.to_string());
+            state.error = Some(e.to_string());
         }
     }
 }
@@ -6932,6 +7012,7 @@ mod correctness_tests {
             running,
             connected_agents: 2,
             error: None,
+            turned_off: false,
         }
     }
 
@@ -6957,13 +7038,27 @@ mod correctness_tests {
                 running: false,
                 connected_agents: 0,
                 error: Some("address in use".into()),
+                turned_off: false,
             },
             1,
             0,
             Some(exe),
         );
-        assert!(!stopped.enabled && !stopped.transport_running);
+        assert!(!stopped.enabled && !stopped.transport_running && !stopped.turned_off);
         assert_eq!(stopped.gateway_error.as_deref(), Some("address in use"));
+        let off = mcp_status_info(
+            true,
+            GatewayStatus {
+                running: false,
+                connected_agents: 0,
+                error: None,
+                turned_off: true,
+            },
+            1,
+            0,
+            Some(exe),
+        );
+        assert!(!off.enabled && off.turned_off && off.gateway_error.is_none());
 
         let offline = mcp_status_info(false, gateway(true), 1, 0, Some(exe));
         assert!(!offline.enabled && !offline.transport_available);
@@ -6975,7 +7070,58 @@ mod correctness_tests {
             r#"{"enabled":false,"active_sessions_count":1,"total_audit_events":0}"#,
         )
         .unwrap();
-        assert!(!old.transport_available && old.setup_command.is_none());
+        assert!(!old.transport_available && old.setup_command.is_none() && !old.turned_off);
+    }
+
+    #[tokio::test]
+    async fn mcp_gateway_switch_stops_restarts_and_is_remembered() {
+        let config = Scratch::new("mcp-switch");
+        let endpoint = rustscp_mcp::ipc::endpoint_file_path(&config.0);
+        let server = Arc::new(McpServer::new(AuditLogger::new()));
+        let token = || std::fs::read_to_string(&endpoint).unwrap();
+
+        // First launch: on by default.
+        let slot = std::sync::Mutex::new(McpGatewayState::default());
+        resume_mcp_gateway(&slot, &server, &config.0).await;
+        assert!(lock_gateway(&slot).gateway.is_some());
+        let first = token();
+
+        // Turning it on again keeps the running listener.
+        turn_mcp_gateway(&slot, &server, config.0.clone(), true)
+            .await
+            .unwrap();
+        assert_eq!(token(), first);
+
+        turn_mcp_gateway(&slot, &server, config.0.clone(), false)
+            .await
+            .unwrap();
+        {
+            let state = lock_gateway(&slot);
+            assert!(state.gateway.is_none() && state.turned_off && state.error.is_none());
+        }
+        assert!(!endpoint.exists());
+
+        // The next launch remembers the choice.
+        let relaunched = std::sync::Mutex::new(McpGatewayState::default());
+        resume_mcp_gateway(&relaunched, &server, &config.0).await;
+        {
+            let state = lock_gateway(&relaunched);
+            assert!(state.gateway.is_none() && state.turned_off);
+        }
+        assert!(!endpoint.exists());
+
+        // Back on: a new listener with a new token.
+        turn_mcp_gateway(&relaunched, &server, config.0.clone(), true)
+            .await
+            .unwrap();
+        {
+            let state = lock_gateway(&relaunched);
+            assert!(state.gateway.is_some() && !state.turned_off);
+        }
+        assert_ne!(token(), first);
+        assert!(GatewaySettings::load(&config.0).enabled);
+        drop(relaunched);
+        assert!(!endpoint.exists());
     }
 
     #[test]

@@ -76,14 +76,14 @@ impl<B: ToolBackend + ?Sized> RpcSession<B> {
         if raw.is_empty() {
             return None;
         }
-        let message: Value = match serde_json::from_str(raw) {
-            Ok(v) => v,
-            Err(e) => {
-                let err =
-                    JsonRpcResponse::error(Value::Null, PARSE_ERROR, format!("Parse error: {e}"));
-                return serde_json::to_string(&err).ok();
-            }
-        };
+        match parse_message(raw) {
+            Ok(message) => self.handle_value(message).await,
+            Err(reply) => Some(reply),
+        }
+    }
+
+    /// [`handle_line`](Self::handle_line) for a message that is already parsed.
+    pub async fn handle_value(&self, message: Value) -> Option<String> {
         match message {
             // JSON-RPC batch (MCP 2025-03-26).
             Value::Array(items) => {
@@ -158,8 +158,8 @@ impl<B: ToolBackend + ?Sized> RpcSession<B> {
         };
 
         let Some(req_id) = req.id.clone() else {
-            // Notification ("notifications/initialized", "notifications/cancelled", ...):
-            // nothing to do and never answered.
+            // Notification ("notifications/initialized", ...): never answered. The transport,
+            // which owns the running requests, acts on "notifications/cancelled".
             return None;
         };
 
@@ -265,6 +265,47 @@ impl<B: ToolBackend + ?Sized> RpcSession<B> {
                 format!("Method '{}' not found", unknown),
             )),
         }
+    }
+}
+
+/// `raw` as JSON, or the serialized parse-error reply.
+pub(crate) fn parse_message(raw: &str) -> Result<Value, String> {
+    serde_json::from_str(raw).map_err(|e| {
+        let err = JsonRpcResponse::error(Value::Null, PARSE_ERROR, format!("Parse error: {e}"));
+        serde_json::to_string(&err).unwrap_or_default()
+    })
+}
+
+/// Map key for a JSON-RPC request id (`1` and `"1"` stay distinct).
+pub(crate) fn request_key(id: &Value) -> Option<String> {
+    (id.is_string() || id.is_number()).then(|| id.to_string())
+}
+
+/// Id of the request a single message can be cancelled by, if it is one. Calls inside a
+/// batch are answered together, so they run to completion.
+pub(crate) fn cancellable_request(message: &Value) -> Option<String> {
+    let obj = message.as_object()?;
+    if !obj.get("method").is_some_and(Value::is_string) {
+        return None;
+    }
+    request_key(obj.get("id")?)
+}
+
+/// Requests named by the `notifications/cancelled` messages in `message` (an object or a
+/// batch).
+pub(crate) fn cancelled_requests(message: &Value) -> Vec<String> {
+    let requested = |m: &Value| {
+        let obj = m.as_object()?;
+        if obj.contains_key("id")
+            || obj.get("method").and_then(Value::as_str) != Some("notifications/cancelled")
+        {
+            return None;
+        }
+        request_key(obj.get("params")?.get("requestId")?)
+    };
+    match message {
+        Value::Array(items) => items.iter().filter_map(requested).collect(),
+        single => requested(single).into_iter().collect(),
     }
 }
 
@@ -436,6 +477,37 @@ mod tests {
         ] {
             assert!(session.handle_line(raw).await.is_none(), "{raw}");
         }
+    }
+
+    #[test]
+    fn cancellation_ids_come_from_single_requests_and_cancel_notifications() {
+        let call = |id: Value| json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call" });
+        assert_eq!(cancellable_request(&call(json!(7))).as_deref(), Some("7"));
+        assert_eq!(
+            cancellable_request(&call(json!("7"))).as_deref(),
+            Some("\"7\"")
+        );
+        assert_eq!(cancellable_request(&call(Value::Null)), None);
+        assert_eq!(cancellable_request(&json!([call(json!(1))])), None);
+        assert_eq!(
+            cancellable_request(
+                &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })
+            ),
+            None
+        );
+
+        let cancel = |id: Value| json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": id, "reason": "user" } });
+        assert_eq!(cancelled_requests(&cancel(json!(7))), vec!["7"]);
+        assert_eq!(
+            cancelled_requests(&json!([cancel(json!("a")), call(json!(1))])),
+            vec!["\"a\""]
+        );
+        assert!(cancelled_requests(&cancel(Value::Null)).is_empty());
+        assert!(cancelled_requests(&call(json!(7))).is_empty());
+        // A request (with an id) named like the notification is not a cancellation.
+        let mut not_a_notification = cancel(json!(7));
+        not_a_notification["id"] = json!(3);
+        assert!(cancelled_requests(&not_a_notification).is_empty());
     }
 
     #[tokio::test]

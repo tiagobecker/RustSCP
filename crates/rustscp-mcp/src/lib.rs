@@ -9,7 +9,7 @@ pub mod transport;
 
 pub use audit::{AuditEvent, AuditLogger};
 pub use bridge::run_stdio_bridge;
-pub use gateway::{EndpointKind, McpGateway};
+pub use gateway::{EndpointKind, GatewaySettings, McpGateway};
 pub use protocol::*;
 pub use rpc::{RpcSession, ToolBackend};
 pub use server::{

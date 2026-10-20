@@ -753,6 +753,11 @@ export const App: React.FC = () => {
       });
   }, []);
 
+  const setMcpGatewayEnabled = useCallback(
+    (enabled: boolean) => invokeTauri<McpStatusInfo>('set_mcp_gateway_enabled', { enabled }).then(setMcpStatus),
+    []
+  );
+
   // MCP status and audit log are refreshed while the gateway modal is open
   useEffect(() => {
     if (!isMcpOpen) return;
@@ -2864,7 +2869,13 @@ export const App: React.FC = () => {
 
       {isMcpOpen && (
         <ModalGuard title={tr('Gateway de IA (MCP)', 'AI gateway (MCP)')} onClose={() => setIsMcpOpen(false)}>
-          <McpGatewayModal isOpen={isMcpOpen} onClose={() => setIsMcpOpen(false)} status={mcpStatus} auditLogs={auditLogs} />
+          <McpGatewayModal
+            isOpen={isMcpOpen}
+            onClose={() => setIsMcpOpen(false)}
+            status={mcpStatus}
+            auditLogs={auditLogs}
+            onSetEnabled={setMcpGatewayEnabled}
+          />
         </ModalGuard>
       )}
 
