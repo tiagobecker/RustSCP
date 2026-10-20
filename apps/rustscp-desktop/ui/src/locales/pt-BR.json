@@ -211,7 +211,9 @@
     "externalEditorHelp": "Comando usado em “Abrir no editor externo”. Deixe vazio para usar o padrão do sistema.",
     "nativeTerminal": "Terminal do sistema",
     "nativeTerminalHelp": "“Abrir no Terminal do sistema” abre o terminal do seu SO com a sessão SSH e a pasta atuais.",
-    "done": "OK"
+    "done": "OK",
+    "preferExternalEditor": "Abrir arquivos no editor externo",
+    "preferExternalEditorDesc": "Editar, F4 e clique duplo usam o editor externo em vez do integrado."
   },
   "sessionTabs": {
     "paneLeft": "Painel esquerdo",
@@ -310,7 +312,17 @@
     "ftpsHint": "FTP sobre TLS (explícito): usuário, senha e arquivos trafegam criptografados",
     "tlsFingerprint": "Certificado confiável (SHA-256)",
     "tlsFingerprintHint": "Só para servidores com certificado autoassinado. Certificados em que o sistema confia são sempre aceitos. Se a conexão acusar um certificado não confiável, compare a impressão digital com a do servidor e cole-a aqui.",
-    "errFingerprint": "O certificado confiável deve ser uma impressão digital SHA-256 (64 dígitos hexadecimais)."
+    "errFingerprint": "O certificado confiável deve ser uma impressão digital SHA-256 (64 dígitos hexadecimais).",
+    "folder": "Pasta",
+    "folderHint": "Agrupa esta conexão na lista de sites. Use / para subpastas; deixe vazio para o nível principal.",
+    "folderPlaceholder": "ex.: Produção/Web",
+    "folderSuggestions": "Pastas existentes",
+    "collapseFolders": "Recolher todas as pastas",
+    "expandFolders": "Expandir todas as pastas",
+    "filterHint": "Filtrar por nome, servidor, usuário ou pasta",
+    "clearFilter": "Limpar filtro",
+    "importWinscp": "Importar do WinSCP…",
+    "winscpHint": "Traga os sites, as pastas e as senhas salvas do WinSCP"
   },
   "virtualDisk": {
     "title": "Disco Virtual & Drive Nativo",

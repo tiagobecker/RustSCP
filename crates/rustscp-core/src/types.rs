@@ -225,6 +225,11 @@ pub struct ConnectionConfig {
     /// unset, so other sites serialize exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_fingerprint: Option<String>,
+    /// Folder the site is filed under in the site list, as a `/`-separated path
+    /// ("Production/Web"); `None` for sites at the top level. Vaults written before
+    /// folders existed have no such field, and ungrouped sites do not write one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 impl ConnectionConfig {
@@ -239,8 +244,43 @@ impl ConnectionConfig {
             auth: AuthMethod::None,
             remote_root: "/".to_string(),
             tls_fingerprint: None,
+            group: None,
         }
     }
+}
+
+/// Longest folder path a saved site keeps (in characters).
+pub const MAX_SITE_GROUP_LEN: usize = 255;
+
+/// Cleans a site folder path: segments are split on `/`, trimmed, stripped of control
+/// characters and dropped when empty (`" A // B/ "` becomes `"A/B"`). Whole segments
+/// beyond [`MAX_SITE_GROUP_LEN`] characters are dropped. `None` when nothing is left.
+pub fn normalize_site_group(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut out_len = 0usize;
+    for segment in raw.split('/') {
+        let cleaned: String = segment.chars().filter(|c| !c.is_control()).collect();
+        let cleaned = cleaned.trim();
+        if cleaned.is_empty() {
+            continue;
+        }
+        let seg_len = cleaned.chars().count();
+        let needed = seg_len + usize::from(out_len > 0);
+        if out_len + needed > MAX_SITE_GROUP_LEN {
+            if out_len == 0 {
+                // A single over-long folder name: keep its beginning.
+                out = cleaned.chars().take(MAX_SITE_GROUP_LEN).collect();
+                out = out.trim_end().to_string();
+            }
+            break;
+        }
+        if out_len > 0 {
+            out.push('/');
+        }
+        out.push_str(cleaned);
+        out_len += needed;
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 fn whoami() -> String {
@@ -397,6 +437,54 @@ mod tests {
         .unwrap();
         assert!(!entry.is_hidden);
         assert_eq!(entry.permissions, Permissions::default());
+    }
+
+    #[test]
+    fn site_group_is_optional_and_only_written_when_set() {
+        // Old vaults: no field at all.
+        let old: ConnectionConfig =
+            serde_json::from_str(r#"{"id":"a","name":"A","host":"h","username":"u"}"#).unwrap();
+        assert_eq!(old.group, None);
+        // Vaults written by the September build: an explicit null, or a folder.
+        let null: ConnectionConfig =
+            serde_json::from_str(r#"{"id":"a","host":"h","group":null}"#).unwrap();
+        assert_eq!(null.group, None);
+        let grouped: ConnectionConfig =
+            serde_json::from_str(r#"{"id":"a","host":"h","group":"Production/Web"}"#).unwrap();
+        assert_eq!(grouped.group.as_deref(), Some("Production/Web"));
+
+        // Ungrouped sites serialize exactly as before; grouped ones keep the folder.
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(!json.contains("group"), "{json}");
+        let json = serde_json::to_string(&grouped).unwrap();
+        let back: ConnectionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.group.as_deref(), Some("Production/Web"));
+        assert_eq!(ConnectionConfig::local().group, None);
+    }
+
+    #[test]
+    fn site_groups_are_normalized() {
+        assert_eq!(normalize_site_group(""), None);
+        assert_eq!(normalize_site_group(" / // "), None);
+        assert_eq!(
+            normalize_site_group(" Production // Web/ ").as_deref(),
+            Some("Production/Web")
+        );
+        assert_eq!(
+            normalize_site_group("A\u{0}B/\tC\n").as_deref(),
+            Some("AB/C")
+        );
+        assert_eq!(
+            normalize_site_group("Clientes/São Paulo").as_deref(),
+            Some("Clientes/São Paulo")
+        );
+        let long = format!("{}/{}", "a".repeat(200), "b".repeat(100));
+        assert_eq!(normalize_site_group(&long), Some("a".repeat(200)));
+        let huge = "x".repeat(1000);
+        assert_eq!(
+            normalize_site_group(&huge).map(|g| g.chars().count()),
+            Some(MAX_SITE_GROUP_LEN)
+        );
     }
 
     #[test]

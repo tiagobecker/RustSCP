@@ -268,9 +268,22 @@
   animation: ui-pop-in 140ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
 }
 
+/* Spring-loaded tab: a bar fills while files rest on a tab that is about to open
+   (the duration is set inline from SPRING_DELAY_MS). */
+@keyframes ui-spring-fill {
+  from { transform: scaleX(0); }
+  to { transform: scaleX(1); }
+}
+
+.animate-spring-fill {
+  transform-origin: left center;
+  animation: ui-spring-fill 700ms linear both;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .animate-in,
   .animate-pop,
+  .animate-spring-fill,
   .animate-pulse,
   .animate-spin,
   .animate-shimmer,
@@ -327,6 +340,25 @@
   color: var(--token-function);
 }
 .token.regex, .token.important, .token.variable {
+  color: var(--token-variable);
+}
+.token.delimiter {
+  color: var(--token-keyword);
+  font-weight: 600;
+}
+.token.package {
+  color: var(--token-function);
+}
+.token.type-casting {
+  color: var(--token-keyword);
+  font-style: italic;
+}
+.token.function-definition,
+.token.class-name-definition {
+  color: var(--token-function);
+  font-weight: 600;
+}
+.token.parameter {
   color: var(--token-variable);
 }
 

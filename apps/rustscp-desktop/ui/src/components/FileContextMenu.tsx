@@ -53,6 +53,8 @@ export interface FileContextMenuProps {
   onDuplicate?: (path: string) => void;
   /** Optional: rename the item (shown for a single target only). */
   onRename?: (file: FileEntry) => void;
+  /** The name is edited in place in the list (label without "…", which would announce a dialog). */
+  renameInPlace?: boolean;
   onGoHome?: () => void;
   onOpenAiAssistant?: () => void;
   onRequestCompress?: (paths: string[]) => void;
@@ -301,6 +303,7 @@ export const FileContextMenu: React.FC<FileContextMenuProps> = ({
   onPaste,
   onDuplicate,
   onRename,
+  renameInPlace = false,
   onGoHome,
   onOpenAiAssistant,
   onRequestCompress,
@@ -625,7 +628,13 @@ export const FileContextMenu: React.FC<FileContextMenuProps> = ({
           <Item icon={<SquarePen className="w-4 h-4" />} label={isPt ? 'Editar arquivo' : 'Edit file'} shortcut="F4" onSelect={run(() => onEditFile(f))} onHover={closeSubmenusOnHover} />
         )}
         {canRename && (
-          <Item icon={<TextCursorInput className="w-4 h-4" />} label={isPt ? 'Renomear…' : 'Rename…'} shortcut="F2" onSelect={run(() => onRename!(f))} onHover={closeSubmenusOnHover} />
+          <Item
+            icon={<TextCursorInput className="w-4 h-4" />}
+            label={renameInPlace ? (isPt ? 'Renomear' : 'Rename') : isPt ? 'Renomear…' : 'Rename…'}
+            shortcut="F2"
+            onSelect={run(() => onRename!(f))}
+            onHover={closeSubmenusOnHover}
+          />
         )}
         {renderTerminalItems()}
         {(hasOpenGroup || canRename) && <Separator />}

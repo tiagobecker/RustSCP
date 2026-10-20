@@ -1,16 +1,17 @@
 import React, { useEffect, useId, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, Check, CheckCircle2, Copy, Eye, EyeOff, FileText, X } from 'lucide-react';
+import { AlertTriangle, Check, CheckCircle2, Copy, Eye, EyeOff, FileText, Loader2, Search, X } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
-import { ConnectionConfig, VaultSecurityInfo } from '../types.ts';
+import { ConnectionConfig, VaultSecurityInfo, WinScpImportResult } from '../types.ts';
 import { Modal } from './ui/Modal.tsx';
-import { Button, Disclosure, Field, IconButton, Segmented, TextArea, TextInput } from './ui/controls.tsx';
+import { Button, Disclosure, Field, IconButton, Segmented, Select, TextArea, TextInput } from './ui/controls.tsx';
 import { notify } from './ui/toast.tsx';
 import { ConfirmDialogModal } from './ConfirmDialogModal.tsx';
 import { copyText, useCopyFeedback } from './copyToClipboard.ts';
 
-export type VaultTab = 'export' | 'import';
+/** 'winscp' imports the sites of a WinSCP.ini (WinSCP's Tools › Export/Backup Configuration). */
+export type VaultTab = 'export' | 'import' | 'winscp';
 
 interface VaultModalProps {
   isOpen: boolean;
@@ -19,6 +20,26 @@ interface VaultModalProps {
   onSitesUpdated: (newSites: ConnectionConfig[]) => void;
   /** Tab shown when the dialog opens. Defaults to 'import' when there are no saved sites, otherwise 'export'. */
   initialTab?: VaultTab;
+  /**
+   * "View connections" after a WinSCP import: receives the imported folder paths (parents included) so the
+   * caller can show them. The dialog closes right after.
+   */
+  onViewConnections?: (folders: string[]) => void;
+}
+
+/** What the last WinSCP import saved, shown until the next preview or import. */
+interface WinscpImportSummary {
+  imported: number;
+  folders: number;
+  passwords: number;
+  keys: number;
+  mode: 'merge' | 'replace';
+  /** Saved connections after the import (Local not counted) */
+  total: number;
+  /** Folder paths of the imported sites, parents included */
+  folderPaths: string[];
+  /** Set when the import read a path: "Import again" reads it again. File contents are dropped after saving, so a chosen file is chosen again. */
+  path: string | null;
 }
 
 /** The backend trims passphrases on export and import, so the length is checked on the trimmed value. */
@@ -64,6 +85,67 @@ function formatKb(bytes: number): string {
   return bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
 }
 
+/* ------------------------------------------------------------------ WinSCP */
+
+/** Same cap as the backend (`MAX_WINSCP_INI_BYTES`); a real WinSCP.ini stays far below it. */
+const MAX_WINSCP_FILE_BYTES = 16 * 1024 * 1024;
+/** Preview rows rendered at once; the search narrows the rest. */
+const MAX_WINSCP_PREVIEW_ROWS = 200;
+
+const PROTOCOL_LABEL: Record<string, string> = { sftp: 'SFTP', scp: 'SCP', ftp: 'FTP', ftps: 'FTPS', s3: 'S3', webdav: 'WebDAV', local: 'Local' };
+
+/** WinSCP writes UTF-8 (with or without BOM), UTF-16 with BOM, or the Windows ANSI code page in older versions. */
+function decodeIniBytes(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) return new TextDecoder('utf-16le').decode(bytes);
+  if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) return new TextDecoder('utf-16be').decode(bytes);
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    return new TextDecoder('windows-1252').decode(bytes);
+  }
+}
+
+/** '/'-separated folder path without blank segments. */
+const normalizeFolder = (raw?: string | null): string =>
+  (raw ?? '')
+    .split('/')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .join('/');
+
+const isPuttyKey = (site: ConnectionConfig) => site.auth?.type === 'PrivateKey' && /\.ppk$/i.test(String(site.auth?.value?.path ?? '').trim());
+
+function describeWinscpError(err: unknown, tr: (pt: string, en: string) => string): string {
+  const text = String((err as any)?.message ?? err ?? '');
+  const lower = text.toLowerCase();
+  if (lower.includes('command') && lower.includes('not found')) {
+    return tr('Esta versão do RustSCP não importa do WinSCP. Atualize o aplicativo.', 'This version of RustSCP cannot import from WinSCP. Update the app.');
+  }
+  if (/nenhuma sess|no winscp sites|no (valid )?sessions?\b/.test(lower)) return winscpNoSessionsMessage(tr);
+  if (lower.includes('choose the winscp.ini')) return tr('Informe o caminho do WinSCP.ini.', 'Enter the path to WinSCP.ini.');
+  if (/n[ãa]o encontrad|not found|no such file/.test(lower)) return tr('Arquivo não encontrado. Confira o caminho.', 'File not found. Check the path.');
+  if (lower.includes('is not a file')) return tr('Esse caminho não é um arquivo.', 'That path is not a file.');
+  if (/grande demais|muito grande|too large|too big|larger than/.test(lower)) {
+    return tr('O arquivo é grande demais para ser uma configuração do WinSCP.', 'The file is too large to be a WinSCP configuration.');
+  }
+  return text || tr('Erro desconhecido.', 'Unknown error.');
+}
+
+function winscpImportedMessage(imported: number, total: number, tr: (pt: string, en: string) => string): string {
+  const saved = total === 1 ? tr('Você tem 1 conexão salva.', 'You have 1 saved connection.') : tr(`Você tem ${total} conexões salvas.`, `You have ${total} saved connections.`);
+  return imported === 1
+    ? `${tr('1 conexão importada do WinSCP.', 'Imported 1 connection from WinSCP.')} ${saved}`
+    : `${tr(`${imported} conexões importadas do WinSCP.`, `Imported ${imported} connections from WinSCP.`)} ${saved}`;
+}
+
+function winscpNoSessionsMessage(tr: (pt: string, en: string) => string): string {
+  return tr(
+    'Nenhuma sessão do WinSCP foi encontrada neste arquivo. No WinSCP, use Ferramentas › Exportar/Backup da configuração para gerar o WinSCP.ini.',
+    'No WinSCP sessions were found in this file. In WinSCP, use Tools › Export/Backup Configuration to create WinSCP.ini.'
+  );
+}
+
 const PasswordInput = React.forwardRef<
   HTMLInputElement,
   {
@@ -105,7 +187,7 @@ const PasswordInput = React.forwardRef<
 ));
 PasswordInput.displayName = 'PasswordInput';
 
-export const VaultModal = ({ isOpen, onClose, siteCount, onSitesUpdated, initialTab }: VaultModalProps) => {
+export const VaultModal = ({ isOpen, onClose, siteCount, onSitesUpdated, initialTab, onViewConnections }: VaultModalProps) => {
   const { i18n } = useTranslation();
   const isPt = (i18n.language || '').startsWith('pt');
   const tr = (pt: string, en: string) => (isPt ? pt : en);
@@ -143,12 +225,38 @@ export const VaultModal = ({ isOpen, onClose, siteCount, onSitesUpdated, initial
   const [importSuccess, setImportSuccess] = useState<string | null>(null);
   const [confirmReplace, setConfirmReplace] = useState(false);
 
+  // --- WinSCP state ---
+  const winscpInputRef = useRef<HTMLInputElement>(null);
+  // Bumped by every file read / preview; late results of an older one are ignored
+  const winscpRequestRef = useRef(0);
+  const [winscpFileName, setWinscpFileName] = useState<string | null>(null);
+  const [winscpFileSize, setWinscpFileSize] = useState(0);
+  const [winscpPath, setWinscpPath] = useState('');
+  // Exactly what the preview was read from; the import sends the same thing, so it saves what was shown
+  const [winscpSource, setWinscpSource] = useState<{ value: string; isPath: boolean } | null>(null);
+  const [winscpPreview, setWinscpPreview] = useState<WinScpImportResult | null>(null);
+  const [isWinscpPreviewing, setIsWinscpPreviewing] = useState(false);
+  const [isWinscpImporting, setIsWinscpImporting] = useState(false);
+  const [winscpError, setWinscpError] = useState<string | null>(null);
+  const [winscpSummary, setWinscpSummary] = useState<WinscpImportSummary | null>(null);
+  const [winscpMergeMode, setWinscpMergeMode] = useState<'merge' | 'replace'>('merge');
+  const [winscpQuery, setWinscpQuery] = useState('');
+  // 'all', 'none' (top level) or `f:<folder path>`
+  const [winscpFolder, setWinscpFolder] = useState('all');
+  const [confirmWinscpReplace, setConfirmWinscpReplace] = useState(false);
+  const viewConnectionsRef = useRef<HTMLButtonElement>(null);
+
   useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
     };
   }, []);
+
+  // The import button that had focus is gone once the summary shows: move focus to its next step
+  useEffect(() => {
+    if (winscpSummary) viewConnectionsRef.current?.focus();
+  }, [winscpSummary]);
 
   // Fresh dialog on every open (callers may keep it mounted)
   useEffect(() => {
@@ -169,6 +277,19 @@ export const VaultModal = ({ isOpen, onClose, siteCount, onSitesUpdated, initial
     setImportError(null);
     setImportSuccess(null);
     setConfirmReplace(false);
+    winscpRequestRef.current++;
+    setWinscpFileName(null);
+    setWinscpFileSize(0);
+    setWinscpPath('');
+    setWinscpSource(null);
+    setWinscpPreview(null);
+    setIsWinscpPreviewing(false);
+    setWinscpError(null);
+    setWinscpSummary(null);
+    setWinscpMergeMode('merge');
+    setWinscpQuery('');
+    setWinscpFolder('all');
+    setConfirmWinscpReplace(false);
     let cancelled = false;
     invoke<VaultSecurityInfo>('get_vault_security_info')
       .then((info) => {
@@ -392,6 +513,164 @@ export const VaultModal = ({ isOpen, onClose, siteCount, onSitesUpdated, initial
   };
 
   const canImport = !!importJson.trim() && !!importPassword.trim() && !isImporting;
+
+  // ------------------------------------------------------------------ WinSCP
+  const runWinscpPreview = async (source: { value: string; isPath: boolean }) => {
+    const request = ++winscpRequestRef.current;
+    setWinscpSource(source);
+    setWinscpPreview(null);
+    setWinscpError(null);
+    setWinscpSummary(null);
+    setWinscpQuery('');
+    setWinscpFolder('all');
+    setIsWinscpPreviewing(true);
+    try {
+      // Nothing is saved here; passwords come back as the stored-secret marker
+      const result = await invoke<WinScpImportResult>('preview_winscp_ini', { pathOrContent: source.value, isPath: source.isPath });
+      if (!mountedRef.current || request !== winscpRequestRef.current) return;
+      if (!result || !Array.isArray(result.sites) || result.sites.length === 0) {
+        setWinscpError(winscpNoSessionsMessage(tr));
+        return;
+      }
+      setWinscpPreview({ ...result, folders: Array.isArray(result.folders) ? result.folders : [] });
+    } catch (err) {
+      if (mountedRef.current && request === winscpRequestRef.current) setWinscpError(describeWinscpError(err, tr));
+    } finally {
+      if (mountedRef.current && request === winscpRequestRef.current) setIsWinscpPreviewing(false);
+    }
+  };
+
+  const handleWinscpFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const input = e.target;
+    const file = input.files?.[0];
+    // Reset so choosing the same file again fires onChange
+    input.value = '';
+    if (!file) return;
+    setWinscpError(null);
+    setWinscpSummary(null);
+    if (file.size === 0) {
+      setWinscpError(tr(`O arquivo ${file.name} está vazio.`, `${file.name} is empty.`));
+      return;
+    }
+    if (file.size > MAX_WINSCP_FILE_BYTES) {
+      setWinscpError(tr(`${file.name} é grande demais para ser uma configuração do WinSCP.`, `${file.name} is too large to be a WinSCP configuration.`));
+      return;
+    }
+    const request = ++winscpRequestRef.current;
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (!mountedRef.current || request !== winscpRequestRef.current) return;
+      const content = reader.result instanceof ArrayBuffer ? decodeIniBytes(reader.result) : '';
+      if (!content.trim()) {
+        setWinscpError(tr(`O arquivo ${file.name} está vazio.`, `${file.name} is empty.`));
+        return;
+      }
+      setWinscpFileName(file.name);
+      setWinscpFileSize(file.size);
+      void runWinscpPreview({ value: content, isPath: false });
+    };
+    reader.onerror = () => {
+      if (mountedRef.current && request === winscpRequestRef.current) setWinscpError(tr(`Não foi possível ler ${file.name}.`, `Could not read ${file.name}.`));
+    };
+    reader.readAsArrayBuffer(file);
+  };
+
+  const previewWinscpPath = () => {
+    const path = winscpPath.trim();
+    if (!path || isWinscpImporting) return;
+    setWinscpFileName(null);
+    setWinscpFileSize(0);
+    void runWinscpPreview({ value: path, isPath: true });
+  };
+
+  const clearWinscp = () => {
+    winscpRequestRef.current++;
+    setWinscpFileName(null);
+    setWinscpFileSize(0);
+    setWinscpSource(null);
+    setWinscpPreview(null);
+    setIsWinscpPreviewing(false);
+    setWinscpError(null);
+  };
+
+  const runWinscpImport = async () => {
+    if (isWinscpImporting || !winscpSource || !winscpPreview) return;
+    const source = winscpSource;
+    const preview = winscpPreview;
+    const mode = winscpMergeMode;
+    const imported = preview.sites.length;
+    setIsWinscpImporting(true);
+    setWinscpError(null);
+    setWinscpSummary(null);
+    try {
+      const updatedSites = await invoke<ConnectionConfig[]>('import_winscp_ini', {
+        pathOrContent: source.value,
+        isPath: source.isPath,
+        mergeMode: mode,
+      });
+      onSitesUpdated(updatedSites);
+      const total = updatedSites.filter((s) => s.id !== 'local').length;
+      notify.success(tr('Conexões importadas', 'Connections imported'), winscpImportedMessage(imported, total, tr));
+      if (!mountedRef.current) return;
+      const folderPaths = new Set<string>();
+      for (const raw of [...preview.folders, ...preview.sites.map((s) => s.group)]) {
+        const parts = normalizeFolder(raw).split('/').filter(Boolean);
+        parts.forEach((_, i) => folderPaths.add(parts.slice(0, i + 1).join('/')));
+      }
+      // Drop the file contents (they hold the WinSCP passwords) as soon as they are saved
+      winscpRequestRef.current++;
+      setWinscpSummary({
+        imported,
+        folders: preview.folders.length,
+        passwords: preview.decrypted_passwords,
+        keys: preview.key_auth_sessions,
+        mode,
+        total,
+        folderPaths: [...folderPaths],
+        path: source.isPath ? source.value : null,
+      });
+      setWinscpSource(null);
+      setWinscpPreview(null);
+      setWinscpFileName(null);
+      setWinscpFileSize(0);
+      setWinscpMergeMode('merge');
+    } catch (err) {
+      if (mountedRef.current) setWinscpError(describeWinscpError(err, tr));
+    } finally {
+      if (mountedRef.current) setIsWinscpImporting(false);
+    }
+  };
+
+  const handleWinscpImport = async () => {
+    if (!winscpPreview || !winscpSource) return;
+    // Replacing removes every saved connection except Local: confirm first
+    if (winscpMergeMode === 'replace' && siteCount > 0) {
+      setConfirmWinscpReplace(true);
+      return;
+    }
+    await runWinscpImport();
+  };
+
+  const canWinscpImport = !!winscpPreview && !!winscpSource && winscpPreview.sites.length > 0 && !isWinscpImporting && !isWinscpPreviewing;
+
+  /** Starts over from the same WinSCP.ini: a path is read again; a chosen file is chosen again (its contents were dropped). */
+  const reimportWinscp = () => {
+    if (isWinscpPreviewing || isWinscpImporting) return;
+    const path = winscpSummary?.path;
+    if (path) {
+      setWinscpPath(path);
+      setWinscpFileName(null);
+      setWinscpFileSize(0);
+      void runWinscpPreview({ value: path, isPath: true });
+    } else {
+      winscpInputRef.current?.click();
+    }
+  };
+
+  const viewImportedConnections = () => {
+    onViewConnections?.(winscpSummary?.folderPaths ?? []);
+    onClose();
+  };
 
   // ------------------------------------------------------------------ Render
   const errorBox = (msg: string) => (
@@ -646,8 +925,378 @@ export const VaultModal = ({ isOpen, onClose, siteCount, onSitesUpdated, initial
     </form>
   );
 
+  // WinSCP preview: folder filter, search and capped list
+  const locale = isPt ? 'pt-BR' : 'en-US';
+  const winscpSites = winscpPreview?.sites ?? [];
+  const winscpFolderOptions = (() => {
+    const set = new Set<string>();
+    for (const f of winscpPreview?.folders ?? []) {
+      const parts = normalizeFolder(f).split('/').filter(Boolean);
+      parts.forEach((_, i) => set.add(parts.slice(0, i + 1).join('/')));
+    }
+    for (const s of winscpSites) {
+      const parts = normalizeFolder(s.group).split('/').filter(Boolean);
+      parts.forEach((_, i) => set.add(parts.slice(0, i + 1).join('/')));
+    }
+    return [...set].sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+  })();
+  const winscpQueryLower = winscpQuery.trim().toLowerCase();
+  const winscpFiltered = winscpSites.filter((s) => {
+    const folder = normalizeFolder(s.group);
+    if (winscpFolder === 'none' && folder) return false;
+    if (winscpFolder.startsWith('f:')) {
+      const wanted = winscpFolder.slice(2);
+      if (folder !== wanted && !folder.startsWith(`${wanted}/`)) return false;
+    }
+    if (!winscpQueryLower) return true;
+    return `${s.name} ${s.host} ${s.username} ${folder}`.toLowerCase().includes(winscpQueryLower);
+  });
+  const winscpShown = winscpFiltered.slice(0, MAX_WINSCP_PREVIEW_ROWS);
+  const winscpKeySites = winscpSites.filter((s) => s.auth?.type === 'PrivateKey').length;
+  const winscpPuttyKeys = winscpPreview?.ppk_key_sessions ?? winscpSites.filter(isPuttyKey).length;
+  // undefined when the backend does not check key files: a general note is shown instead
+  const winscpMissingKeys = winscpPreview?.missing_key_files;
+  const winscpUndecrypted = winscpPreview?.undecrypted_passwords ?? 0;
+  const winscpSkipped = winscpPreview?.skipped_sessions ?? 0;
+  const winscpMasterPassword = !!winscpPreview?.master_password_protected;
+
+  const winscpNote = (text: string, warning = false) => (
+    <p className={`flex items-start gap-2 text-[12px] leading-snug ${warning ? 'text-amber-700 dark:text-amber-400' : 'text-ink-faint'}`}>
+      {warning && <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-px" aria-hidden="true" />}
+      <span>{text}</span>
+    </p>
+  );
+
+  const winscpAuthLabel = (site: ConnectionConfig) => {
+    if (site.auth?.type === 'Password') return tr('Senha', 'Password');
+    if (site.auth?.type === 'PrivateKey') return isPuttyKey(site) ? tr('Chave PuTTY', 'PuTTY key') : tr('Chave', 'Key file');
+    return tr('Sem senha', 'No password');
+  };
+
+  const winscpStats = winscpPreview
+    ? [
+        { key: 'sessions', value: winscpPreview.total_sessions, label: tr('Conexões', 'Connections') },
+        { key: 'folders', value: winscpPreview.folders.length, label: tr('Pastas', 'Folders') },
+        { key: 'passwords', value: winscpPreview.decrypted_passwords, label: tr('Senhas', 'Passwords') },
+        { key: 'keys', value: winscpPreview.key_auth_sessions, label: tr('Chaves', 'Key files') },
+      ]
+    : [];
+
+  const winscpBusy = isWinscpPreviewing || isWinscpImporting;
+
+  // After an import: what was saved, and the way back to the connections
+  const winscpSummaryCard = winscpSummary && (
+    <section className="ui-card p-4 space-y-3.5" aria-label={tr('Resumo da importação do WinSCP', 'WinSCP import summary')}>
+      <div role="status" className="flex items-start gap-2.5">
+        <CheckCircle2 className="w-5 h-5 shrink-0 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
+        <div className="min-w-0 space-y-0.5">
+          <p className="text-[13px] font-medium text-ink">{tr('Importação concluída', 'Import complete')}</p>
+          <p className="text-[12.5px] text-ink-muted leading-relaxed">
+            {winscpImportedMessage(winscpSummary.imported, winscpSummary.total, tr)}{' '}
+            {tr('Tudo fica no cofre cifrado deste computador.', 'Everything is kept in the encrypted vault on this computer.')}
+          </p>
+        </div>
+      </div>
+
+      <dl className="grid grid-cols-4 gap-2">
+        {[
+          { key: 'sites', value: winscpSummary.imported, label: tr('Conexões', 'Connections'), hint: tr('Conexões salvas', 'Connections saved') },
+          { key: 'folders', value: winscpSummary.folders, label: tr('Pastas', 'Folders'), hint: tr('Pastas do WinSCP', 'WinSCP folders') },
+          { key: 'passwords', value: winscpSummary.passwords, label: tr('Senhas', 'Passwords'), hint: tr('Senhas salvas', 'Passwords saved') },
+          { key: 'keys', value: winscpSummary.keys, label: tr('Chaves', 'Key files'), hint: tr('Conexões com arquivo de chave', 'Connections using a key file') },
+        ].map((stat) => (
+          <div key={stat.key} className="flex flex-col-reverse rounded-lg bg-surface-sunken px-3 py-2 min-w-0" title={stat.hint}>
+            <dt className="text-[11.5px] text-ink-faint truncate">{stat.label}</dt>
+            <dd className="text-[17px] font-semibold text-ink tabular-nums leading-tight">{stat.value.toLocaleString(locale)}</dd>
+          </div>
+        ))}
+      </dl>
+
+      <p className="text-[12px] text-ink-faint leading-snug">
+        {winscpSummary.mode === 'replace'
+          ? tr('Substituição: as conexões salvas antes foram removidas. O site Local continua.', 'Replaced: the connections saved before were removed. The Local site stays.')
+          : tr(
+              'Mesclagem: as novas foram adicionadas, as que já estavam salvas foram atualizadas e as demais continuam como estavam.',
+              'Merged: new connections were added, ones already saved were updated, and the rest stay as they were.'
+            )}
+      </p>
+    </section>
+  );
+
+  const winscpBody = (
+    <div className="space-y-4">
+      {/* Outside the picker so "Import again" can open it from the summary too */}
+      <input ref={winscpInputRef} type="file" accept=".ini,.txt,text/plain" onChange={handleWinscpFile} className="hidden" hidden tabIndex={-1} />
+      {winscpSummaryCard || (
+        <>
+          <p className="text-[13px] text-ink-muted leading-relaxed">
+            {tr(
+              'Traga as sessões salvas no WinSCP, com as pastas e as senhas, para o RustSCP. Nada é salvo antes de você confirmar.',
+              'Bring the sessions saved in WinSCP, with their folders and passwords, into RustSCP. Nothing is saved until you confirm.'
+            )}
+          </p>
+
+          <div>
+            <div className="ui-label">{tr('Arquivo de configuração do WinSCP', 'WinSCP configuration file')}</div>
+            {winscpFileName ? (
+              <div className="flex items-center gap-2.5 rounded-lg border border-line bg-surface-sunken px-3 h-10">
+                <FileText className="w-4 h-4 shrink-0 text-ink-muted" aria-hidden="true" />
+                <span className="flex-1 min-w-0 truncate text-[13px] text-ink" title={winscpFileName}>
+                  {winscpFileName}
+                </span>
+                <span className="text-[11.5px] text-ink-faint tabular-nums">{formatKb(winscpFileSize)}</span>
+                <IconButton size="sm" label={tr('Remover arquivo', 'Remove file')} onClick={clearWinscp} disabled={isWinscpImporting} className="-mr-1.5">
+                  <X className="w-3.5 h-3.5" />
+                </IconButton>
+              </div>
+            ) : (
+              <Button variant="secondary" data-autofocus="" onClick={() => winscpInputRef.current?.click()} disabled={winscpBusy} icon={<FileText className="w-3.5 h-3.5" />}>
+                {tr('Escolher WinSCP.ini…', 'Choose WinSCP.ini…')}
+              </Button>
+            )}
+            <span className="ui-hint">
+              {tr('No WinSCP, use Ferramentas › Exportar/Backup da configuração para gerar o arquivo.', 'In WinSCP, use Tools › Export/Backup Configuration to create this file.')}
+            </span>
+          </div>
+
+          <Disclosure label={tr('Usar o caminho do arquivo', 'Use a file path instead')} defaultOpen={false}>
+            <div className="flex items-center gap-2">
+              <TextInput
+                mono
+                value={winscpPath}
+                onChange={(e) => setWinscpPath(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    previewWinscpPath();
+                  }
+                }}
+                placeholder="~/Downloads/WinSCP.ini"
+                aria-label={tr('Caminho do WinSCP.ini', 'Path to WinSCP.ini')}
+              />
+              <Button onClick={previewWinscpPath} disabled={!winscpPath.trim() || winscpBusy}>
+                {tr('Ler arquivo', 'Read file')}
+              </Button>
+            </div>
+          </Disclosure>
+        </>
+      )}
+
+      {isWinscpPreviewing && (
+        <div role="status" className="flex items-center gap-2 text-[12.5px] text-ink-muted">
+          <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+          {tr('Lendo as sessões do WinSCP…', 'Reading the WinSCP sessions…')}
+        </div>
+      )}
+
+      {winscpPreview && (
+        <div className="space-y-3">
+          <div className="grid grid-cols-4 gap-2">
+            {winscpStats.map((stat) => (
+              <div key={stat.key} className="rounded-lg border border-line px-3 py-2 min-w-0">
+                <div className="text-[17px] font-semibold text-ink tabular-nums leading-tight">{stat.value.toLocaleString(locale)}</div>
+                <div className="text-[11.5px] text-ink-faint truncate">{stat.label}</div>
+              </div>
+            ))}
+          </div>
+
+          <div className="flex items-center gap-2">
+            <div className="relative flex-1 min-w-0">
+              <Search className="w-3.5 h-3.5 text-ink-faint absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" aria-hidden="true" />
+              <TextInput
+                value={winscpQuery}
+                onChange={(e) => setWinscpQuery(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && e.preventDefault()}
+                placeholder={tr('Buscar', 'Search')}
+                aria-label={tr('Buscar conexões do WinSCP', 'Search the WinSCP connections')}
+                className="h-7 pl-7 text-[12.5px]"
+              />
+            </div>
+            {winscpFolderOptions.length > 0 && (
+              <Select
+                value={winscpFolder}
+                onChange={(e) => setWinscpFolder(e.target.value)}
+                aria-label={tr('Pasta', 'Folder')}
+                className="!w-auto max-w-[45%] !h-7 text-[12.5px]"
+              >
+                <option value="all">{tr('Todas as pastas', 'All folders')}</option>
+                <option value="none">{tr('Sem pasta', 'No folder')}</option>
+                {winscpFolderOptions.map((folder) => (
+                  <option key={folder} value={`f:${folder}`}>
+                    {folder}
+                  </option>
+                ))}
+              </Select>
+            )}
+          </div>
+
+          <ul className="ui-card divide-y divide-line max-h-56 overflow-y-auto" aria-label={tr('Conexões do WinSCP', 'WinSCP connections')}>
+            {winscpShown.map((site, i) => {
+              const folder = normalizeFolder(site.group);
+              return (
+                <li key={`${site.id}-${i}`} className="flex items-center gap-3 px-3 py-2">
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[13px] text-ink truncate" title={site.name}>
+                      {site.name}
+                    </div>
+                    <div className="text-[11.5px] text-ink-faint truncate">
+                      {PROTOCOL_LABEL[site.protocol] ?? site.protocol}
+                      {' · '}
+                      {site.username ? `${site.username}@` : ''}
+                      {site.host}
+                      {site.port ? `:${site.port}` : ''}
+                      {folder ? ` · ${folder}` : ''}
+                    </div>
+                  </div>
+                  <span className="shrink-0 text-[11.5px] text-ink-faint">{winscpAuthLabel(site)}</span>
+                </li>
+              );
+            })}
+            {winscpShown.length === 0 && (
+              <li className="px-3 py-6 text-center text-[12px] text-ink-faint">{tr('Nenhuma conexão encontrada', 'No matching connections')}</li>
+            )}
+          </ul>
+          {winscpFiltered.length > winscpShown.length && (
+            <span className="ui-hint !mt-1">
+              {tr(
+                `Mostrando ${winscpShown.length} de ${winscpFiltered.length}. Refine a busca para ver as demais. Todas serão importadas.`,
+                `Showing ${winscpShown.length} of ${winscpFiltered.length}. Refine the search to see the rest. All of them will be imported.`
+              )}
+            </span>
+          )}
+
+          {winscpMasterPassword
+            ? winscpNote(
+                tr(
+                  'O WinSCP protege as senhas com uma senha mestra, então nenhuma senha foi importada. Você digita a senha ao conectar.',
+                  'WinSCP protects its passwords with a master password, so no password was imported. You will type the password when connecting.'
+                ),
+                true
+              )
+            : winscpUndecrypted > 0 &&
+              winscpNote(
+                winscpUndecrypted === 1
+                  ? tr('1 senha salva não pôde ser recuperada; essa conexão é importada sem senha.', '1 saved password could not be recovered; that connection is imported without one.')
+                  : tr(
+                      `${winscpUndecrypted} senhas salvas não puderam ser recuperadas; essas conexões são importadas sem senha.`,
+                      `${winscpUndecrypted} saved passwords could not be recovered; those connections are imported without one.`
+                    )
+              )}
+          {winscpPuttyKeys > 0 &&
+            winscpNote(
+              winscpPuttyKeys === 1
+                ? tr(
+                    '1 conexão usa uma chave do PuTTY (.ppk), que o RustSCP não lê. Converta a chave no PuTTYgen (Conversions › Export OpenSSH key) e escolha o arquivo novo na conexão.',
+                    '1 connection uses a PuTTY key (.ppk), which RustSCP cannot read. Convert the key in PuTTYgen (Conversions › Export OpenSSH key) and choose the new file in the connection.'
+                  )
+                : tr(
+                    `${winscpPuttyKeys} conexões usam chaves do PuTTY (.ppk), que o RustSCP não lê. Converta as chaves no PuTTYgen (Conversions › Export OpenSSH key) e escolha os arquivos novos nas conexões.`,
+                    `${winscpPuttyKeys} connections use PuTTY keys (.ppk), which RustSCP cannot read. Convert the keys in PuTTYgen (Conversions › Export OpenSSH key) and choose the new files in the connections.`
+                  ),
+              true
+            )}
+          {winscpMissingKeys === undefined
+            ? winscpKeySites > 0 &&
+              winscpNote(
+                tr(
+                  'As chaves mantêm o caminho salvo no WinSCP. Se uma chave não estiver nesse caminho neste computador, edite a conexão e escolha a chave de novo.',
+                  'Key files keep the path saved in WinSCP. If a key is not at that path on this computer, edit the connection and choose the key again.'
+                )
+              )
+            : winscpMissingKeys > 0 &&
+              winscpNote(
+                winscpMissingKeys === 1
+                  ? tr('1 arquivo de chave não está neste computador: edite essa conexão e escolha a chave de novo.', '1 key file is not on this computer: edit that connection and choose the key again.')
+                  : tr(
+                      `${winscpMissingKeys} arquivos de chave não estão neste computador: edite essas conexões e escolha as chaves de novo.`,
+                      `${winscpMissingKeys} key files are not on this computer: edit those connections and choose the keys again.`
+                    )
+              )}
+          {winscpSkipped > 0 &&
+            winscpNote(
+              winscpSkipped === 1
+                ? tr('1 entrada foi deixada de fora (atalho de workspace para um site salvo, ou acima do limite de importação).', '1 entry was left out (a workspace shortcut to a saved site, or beyond the import limit).')
+                : tr(
+                    `${winscpSkipped} entradas foram deixadas de fora (atalhos de workspace para sites salvos, ou acima do limite de importação).`,
+                    `${winscpSkipped} entries were left out (workspace shortcuts to saved sites, or beyond the import limit).`
+                  )
+            )}
+
+          <Disclosure label={tr('Avançado', 'Advanced')} defaultOpen={winscpMergeMode === 'replace'}>
+            <label className="flex items-start gap-2.5 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                className="w-3.5 h-3.5 mt-0.5 accent-red-600"
+                checked={winscpMergeMode === 'replace'}
+                disabled={isWinscpImporting}
+                onChange={(e) => setWinscpMergeMode(e.target.checked ? 'replace' : 'merge')}
+              />
+              <span className="min-w-0">
+                <span className="block text-[13px] text-ink">{tr('Substituir todas as conexões salvas', 'Replace all saved connections')}</span>
+                <span className="block text-[11.5px] text-ink-faint leading-snug">
+                  {winscpMergeMode === 'replace' ? (
+                    <span className="text-red-600 dark:text-red-400">
+                      {siteCount === 1
+                        ? tr('A conexão salva será removida e trocada pelas do WinSCP. O site Local continua.', 'Your saved connection will be removed and replaced by the ones from WinSCP. The Local site stays.')
+                        : tr(
+                            `As ${siteCount} conexões salvas serão removidas e trocadas pelas do WinSCP. O site Local continua.`,
+                            `Your ${siteCount} saved connections will be removed and replaced by the ones from WinSCP. The Local site stays.`
+                          )}
+                    </span>
+                  ) : (
+                    tr(
+                      'Por padrão as conexões são mescladas: as do WinSCP são adicionadas (ou atualizadas, se já estiverem salvas) e as demais ficam como estão.',
+                      'By default connections are merged: the ones from WinSCP are added (or updated if already saved) and the rest stay as they are.'
+                    )
+                  )}
+                </span>
+              </span>
+            </label>
+          </Disclosure>
+        </div>
+      )}
+
+      {winscpError && errorBox(winscpError)}
+    </div>
+  );
+
+  const winscpImportCount = winscpPreview?.sites.length ?? 0;
+
   const footer =
-    activeTab === 'export' ? (
+    activeTab === 'winscp' && winscpSummary ? (
+      <>
+        <Button
+          variant="secondary"
+          onClick={reimportWinscp}
+          disabled={winscpBusy}
+          title={
+            winscpSummary.path
+              ? tr('Ler o mesmo WinSCP.ini de novo', 'Read the same WinSCP.ini again')
+              : tr('Escolha o WinSCP.ini de novo: o conteúdo do arquivo não fica guardado depois da importação.', 'Choose the WinSCP.ini again: its contents are not kept after the import.')
+          }
+        >
+          {winscpSummary.path ? tr('Importar de novo', 'Import again') : tr('Importar de novo…', 'Import again…')}
+        </Button>
+        <Button ref={viewConnectionsRef} variant="primary" onClick={viewImportedConnections}>
+          {tr('Ver conexões', 'View connections')}
+        </Button>
+      </>
+    ) : activeTab === 'winscp' ? (
+      <>
+        <Button variant="secondary" onClick={onClose}>
+          {tr('Fechar', 'Close')}
+        </Button>
+        <Button variant={winscpMergeMode === 'replace' ? 'danger' : 'primary'} onClick={() => void handleWinscpImport()} loading={isWinscpImporting} disabled={!canWinscpImport}>
+          {winscpMergeMode === 'replace'
+            ? tr('Substituir e importar', 'Replace and import')
+            : winscpImportCount === 0
+              ? tr('Importar', 'Import')
+              : winscpImportCount === 1
+                ? tr('Importar 1 conexão', 'Import 1 connection')
+                : tr(`Importar ${winscpImportCount.toLocaleString(locale)} conexões`, `Import ${winscpImportCount.toLocaleString(locale)} connections`)}
+        </Button>
+      </>
+    ) : activeTab === 'export' ? (
       <>
         <Button variant="secondary" onClick={onClose}>
           {tr('Fechar', 'Close')}
@@ -680,7 +1329,11 @@ export const VaultModal = ({ isOpen, onClose, siteCount, onSitesUpdated, initial
         onClose={onClose}
         size="lg"
         title={tr('Exportar e importar conexões', 'Export and import connections')}
-        subtitle={tr('Backup cifrado das conexões salvas, para este ou outro computador.', 'An encrypted backup of your saved connections, for this or another computer.')}
+        subtitle={
+          activeTab === 'winscp'
+            ? tr('Importe as sessões, pastas e senhas salvas no WinSCP.', 'Import the sessions, folders and saved passwords from WinSCP.')
+            : tr('Backup cifrado das conexões salvas, para este ou outro computador.', 'An encrypted backup of your saved connections, for this or another computer.')
+        }
         dismissOnBackdrop={false}
         footer={footer}
       >
@@ -693,9 +1346,10 @@ export const VaultModal = ({ isOpen, onClose, siteCount, onSitesUpdated, initial
             options={[
               { value: 'export', label: tr('Exportar', 'Export') },
               { value: 'import', label: tr('Importar', 'Import') },
+              { value: 'winscp', label: tr('Do WinSCP', 'From WinSCP'), title: tr('Importar do WinSCP (WinSCP.ini)', 'Import from WinSCP (WinSCP.ini)') },
             ]}
           />
-          {activeTab === 'export' ? exportBody : importBody}
+          {activeTab === 'export' ? exportBody : activeTab === 'import' ? importBody : winscpBody}
         </div>
       </Modal>
 
@@ -718,6 +1372,28 @@ export const VaultModal = ({ isOpen, onClose, siteCount, onSitesUpdated, initial
         onConfirm={async () => {
           setConfirmReplace(false);
           await runImport();
+        }}
+      />
+
+      <ConfirmDialogModal
+        isOpen={confirmWinscpReplace}
+        variant="danger"
+        title={
+          siteCount === 1
+            ? tr('Substituir a conexão salva?', 'Replace your saved connection?')
+            : tr(`Substituir as ${siteCount} conexões salvas?`, `Replace all ${siteCount} saved connections?`)
+        }
+        message={tr(
+          'As conexões salvas neste computador serão removidas e trocadas pelas do WinSCP. O site Local continua.',
+          'The saved connections on this computer will be removed and replaced by the ones from WinSCP. The Local site stays.'
+        )}
+        subMessage={tr('Esta ação não pode ser desfeita. Para manter as atuais, desmarque “Substituir” e importe mesclando.', 'This cannot be undone. To keep your current connections, turn off “Replace” and import with merge.')}
+        confirmText={tr('Substituir tudo', 'Replace all')}
+        cancelText={tr('Cancelar', 'Cancel')}
+        onClose={() => setConfirmWinscpReplace(false)}
+        onConfirm={async () => {
+          setConfirmWinscpReplace(false);
+          await runWinscpImport();
         }}
       />
     </>,

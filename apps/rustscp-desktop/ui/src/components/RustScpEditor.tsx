@@ -17,8 +17,22 @@ import {
   MoreHorizontal,
   CaseSensitive,
   AlertTriangle,
+  Hash,
+  Keyboard,
+  CopyPlus,
+  Trash2,
+  ArrowUp,
+  ArrowDown,
+  IndentIncrease,
+  IndentDecrease,
+  ClipboardCopy,
+  MessageSquareCode,
 } from 'lucide-react';
 import Prism from 'prismjs';
+// Base grammars other languages extend (Prism core already ships markup, css, clike, javascript)
+import 'prismjs/components/prism-clike';
+import 'prismjs/components/prism-markup';
+import 'prismjs/components/prism-css';
 import 'prismjs/components/prism-rust';
 import 'prismjs/components/prism-python';
 import 'prismjs/components/prism-javascript';
@@ -30,8 +44,6 @@ import 'prismjs/components/prism-yaml';
 import 'prismjs/components/prism-toml';
 import 'prismjs/components/prism-bash';
 import 'prismjs/components/prism-sql';
-import 'prismjs/components/prism-markup';
-import 'prismjs/components/prism-css';
 import 'prismjs/components/prism-markdown';
 import 'prismjs/components/prism-docker';
 import 'prismjs/components/prism-ini';
@@ -42,12 +54,29 @@ import 'prismjs/components/prism-go';
 // Without this import every Prism.highlight call (for every language) throws.
 import 'prismjs/components/prism-markup-templating';
 import 'prismjs/components/prism-php';
+import 'prismjs/components/prism-csharp';
+import 'prismjs/components/prism-java';
+import 'prismjs/components/prism-kotlin';
+import 'prismjs/components/prism-swift';
+import 'prismjs/components/prism-dart';
+import 'prismjs/components/prism-ruby';
+import 'prismjs/components/prism-lua';
+import 'prismjs/components/prism-perl';
+import 'prismjs/components/prism-scss';
+import 'prismjs/components/prism-sass';
+import 'prismjs/components/prism-less';
+import 'prismjs/components/prism-powershell';
+import 'prismjs/components/prism-nginx';
+import 'prismjs/components/prism-apacheconf';
+import 'prismjs/components/prism-graphql';
+import 'prismjs/components/prism-diff';
 
 import { EditorTab } from '../types.ts';
 import { Modal } from './ui/Modal.tsx';
-import { Button, IconButton } from './ui/controls.tsx';
+import { Button, IconButton, Kbd } from './ui/controls.tsx';
 import { Menu, MenuItem, MenuLabel, MenuSeparator, MenuToggleItem } from './ui/Menu.tsx';
 import { notify } from './ui/toast.tsx';
+import { copyText } from './copyToClipboard.ts';
 import { plainTextInputProps } from '../utils/inputHardening.ts';
 
 interface RustScpEditorProps {
@@ -88,11 +117,14 @@ interface ViewState {
 const EXT_TO_LANG: Record<string, string> = {
   rs: 'rust',
   py: 'python',
+  pyw: 'python',
   js: 'javascript',
   mjs: 'javascript',
   cjs: 'javascript',
   jsx: 'jsx',
   ts: 'typescript',
+  mts: 'typescript',
+  cts: 'typescript',
   tsx: 'tsx',
   json: 'json',
   yaml: 'yaml',
@@ -102,49 +134,103 @@ const EXT_TO_LANG: Record<string, string> = {
   bash: 'bash',
   zsh: 'bash',
   env: 'bash',
+  ps1: 'powershell',
+  psm1: 'powershell',
+  psd1: 'powershell',
   sql: 'sql',
   html: 'markup',
   htm: 'markup',
   xml: 'markup',
   svg: 'markup',
+  vue: 'markup',
+  svelte: 'markup',
   css: 'css',
-  scss: 'css',
+  scss: 'scss',
+  sass: 'sass',
+  less: 'less',
   md: 'markdown',
   markdown: 'markdown',
   dockerfile: 'docker',
   conf: 'ini',
   ini: 'ini',
   cfg: 'ini',
+  properties: 'ini',
+  nginx: 'nginx',
+  apacheconf: 'apacheconf',
   c: 'c',
   h: 'c',
   cpp: 'cpp',
   hpp: 'cpp',
+  cc: 'cpp',
+  cxx: 'cpp',
+  cs: 'csharp',
+  csx: 'csharp',
+  java: 'java',
+  kt: 'kotlin',
+  kts: 'kotlin',
+  swift: 'swift',
+  dart: 'dart',
   go: 'go',
   php: 'php',
+  phtml: 'php',
+  php3: 'php',
+  php4: 'php',
+  php5: 'php',
+  php7: 'php',
+  php8: 'php',
+  phps: 'php',
+  inc: 'php',
+  rb: 'ruby',
+  erb: 'ruby',
+  gemspec: 'ruby',
+  lua: 'lua',
+  pl: 'perl',
+  pm: 'perl',
+  graphql: 'graphql',
+  gql: 'graphql',
+  diff: 'diff',
+  patch: 'diff',
 };
 
-const SUPPORTED_LANGUAGES = [
-  { id: 'plain', name: 'Plain Text' },
-  { id: 'rust', name: 'Rust' },
-  { id: 'python', name: 'Python' },
-  { id: 'javascript', name: 'JavaScript' },
-  { id: 'typescript', name: 'TypeScript' },
-  { id: 'jsx', name: 'JSX' },
-  { id: 'tsx', name: 'TSX' },
-  { id: 'json', name: 'JSON' },
-  { id: 'yaml', name: 'YAML' },
-  { id: 'toml', name: 'TOML' },
+/** `pt` is the Portuguese name for descriptive entries; proper names (Go, Rust, JSON…) stay as they are. */
+const SUPPORTED_LANGUAGES: ReadonlyArray<{ id: string; name: string; pt?: string }> = [
+  { id: 'plain', name: 'Plain text', pt: 'Texto simples' },
+  { id: 'apacheconf', name: 'Apache config', pt: 'Configuração do Apache' },
   { id: 'bash', name: 'Bash / Shell' },
-  { id: 'sql', name: 'SQL' },
-  { id: 'markup', name: 'HTML / XML' },
-  { id: 'css', name: 'CSS' },
-  { id: 'markdown', name: 'Markdown' },
-  { id: 'docker', name: 'Dockerfile' },
-  { id: 'ini', name: 'Config / INI' },
   { id: 'c', name: 'C' },
+  { id: 'csharp', name: 'C#' },
   { id: 'cpp', name: 'C++' },
+  { id: 'ini', name: 'Config / INI', pt: 'Configuração / INI' },
+  { id: 'css', name: 'CSS' },
+  { id: 'dart', name: 'Dart' },
+  { id: 'diff', name: 'Diff / Patch', pt: 'Diferenças (diff)' },
+  { id: 'docker', name: 'Dockerfile' },
   { id: 'go', name: 'Go' },
+  { id: 'graphql', name: 'GraphQL' },
+  { id: 'markup', name: 'HTML / XML' },
+  { id: 'java', name: 'Java' },
+  { id: 'javascript', name: 'JavaScript' },
+  { id: 'json', name: 'JSON' },
+  { id: 'jsx', name: 'JSX' },
+  { id: 'kotlin', name: 'Kotlin' },
+  { id: 'less', name: 'Less' },
+  { id: 'lua', name: 'Lua' },
+  { id: 'markdown', name: 'Markdown' },
+  { id: 'nginx', name: 'Nginx' },
+  { id: 'perl', name: 'Perl' },
   { id: 'php', name: 'PHP' },
+  { id: 'powershell', name: 'PowerShell' },
+  { id: 'python', name: 'Python' },
+  { id: 'ruby', name: 'Ruby' },
+  { id: 'rust', name: 'Rust' },
+  { id: 'sass', name: 'Sass' },
+  { id: 'scss', name: 'SCSS' },
+  { id: 'sql', name: 'SQL' },
+  { id: 'swift', name: 'Swift' },
+  { id: 'toml', name: 'TOML' },
+  { id: 'tsx', name: 'TSX' },
+  { id: 'typescript', name: 'TypeScript' },
+  { id: 'yaml', name: 'YAML' },
 ];
 
 /** Above these sizes the editor shows plain text so typing stays responsive. */
@@ -181,8 +267,15 @@ function writePref(key: string, value: string) {
 
 function detectLanguage(fileName: string): string {
   const lower = fileName.toLowerCase();
-  if (lower === 'dockerfile' || lower.startsWith('dockerfile.')) return 'docker';
+  if (lower === 'dockerfile' || lower.startsWith('dockerfile.') || lower.endsWith('.dockerfile')) return 'docker';
+  if (lower === '.env' || lower.startsWith('.env.')) return 'bash';
+  if (lower === '.htaccess' || lower === 'httpd.conf' || lower === 'apache2.conf') return 'apacheconf';
+  if (lower === 'nginx.conf') return 'nginx';
+  if (lower === 'gemfile' || lower === 'rakefile') return 'ruby';
   const ext = lower.split('.').pop() || '';
+  // Server configs named after the daemon (e.g. "nginx-site.conf", "apache-vhost.conf")
+  if (ext === 'conf' && lower.includes('nginx')) return 'nginx';
+  if (ext === 'conf' && (lower.includes('apache') || lower.includes('httpd'))) return 'apacheconf';
   return EXT_TO_LANG[ext] || 'plain';
 }
 
@@ -339,6 +432,213 @@ function formatBytes(bytes: number): string {
 
 const IS_MAC = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/i.test(navigator.platform || navigator.userAgent || '');
 const MOD = IS_MAC ? '⌘' : 'Ctrl+';
+const SHIFT = IS_MAC ? '⇧' : 'Shift+';
+
+const lineHeightOf = (fontSize: number) => Math.round(fontSize * 1.55);
+
+// ---------------------------------------------------------------------------
+// Line-based editing helpers (offsets are into text that uses \n only)
+// ---------------------------------------------------------------------------
+
+/** Offset where the line containing `pos` starts. */
+function lineStartOf(text: string, pos: number): number {
+  return pos <= 0 ? 0 : text.lastIndexOf('\n', pos - 1) + 1;
+}
+
+/**
+ * The whole lines touched by the selection [s, en): `start` is the first line's start, `end` the
+ * last line's end (before its \n). A selection ending at column 0 does not include that line.
+ */
+function lineBlock(text: string, s: number, en: number): { start: number; end: number } {
+  const start = lineStartOf(text, s);
+  const last = en > s && text[en - 1] === '\n' ? en - 1 : en;
+  const nl = text.indexOf('\n', Math.max(last, start));
+  return { start, end: nl === -1 ? text.length : nl };
+}
+
+/** Calls `fn(lineStart, lineEnd)` for every line in [start, end] (as returned by lineBlock). */
+function forEachLine(text: string, start: number, end: number, fn: (ls: number, le: number) => void) {
+  let ls = start;
+  for (;;) {
+    const nl = text.indexOf('\n', ls);
+    const le = nl === -1 || nl >= end ? end : nl;
+    fn(ls, le);
+    if (le >= end) break;
+    ls = le + 1;
+  }
+}
+
+/** A replacement of `remove` characters at `at` (offsets into the original text). */
+interface TextEdit {
+  at: number;
+  remove: number;
+  insert: string;
+}
+
+/** New text of [from, to) after applying `edits` (sorted, non-overlapping, all inside the range). */
+function applyEdits(text: string, from: number, to: number, edits: TextEdit[]): string {
+  const parts: string[] = [];
+  let pos = from;
+  for (const ed of edits) {
+    parts.push(text.slice(pos, ed.at), ed.insert);
+    pos = ed.at + ed.remove;
+  }
+  parts.push(text.slice(pos, to));
+  return parts.join('');
+}
+
+/**
+ * Where offset `p` lands after `edits`. `stickLeft` keeps a position that sits exactly where text
+ * is inserted before that text (used for the start of a selection, so it includes the insertion).
+ */
+function mapOffset(p: number, edits: TextEdit[], stickLeft: boolean): number {
+  let delta = 0;
+  for (const ed of edits) {
+    if (p < ed.at) break;
+    if (p === ed.at && ed.remove === 0) {
+      if (stickLeft) break;
+      delta += ed.insert.length;
+      continue;
+    }
+    if (p < ed.at + ed.remove) return ed.at + delta;
+    delta += ed.insert.length - ed.remove;
+  }
+  return p + delta;
+}
+
+type CommentStyle = { line: string; alt?: string[] } | { open: string; close: string };
+
+const SLASH_COMMENT_LANGS = new Set([
+  'rust', 'javascript', 'typescript', 'jsx', 'tsx', 'json', 'c', 'cpp', 'go', 'php', 'csharp', 'java',
+  'kotlin', 'swift', 'dart', 'scss', 'sass', 'less',
+]);
+const HASH_COMMENT_LANGS = new Set([
+  'plain', 'python', 'bash', 'powershell', 'ruby', 'perl', 'yaml', 'toml', 'docker', 'nginx', 'apacheconf', 'graphql',
+]);
+
+/** Line comment syntax for a language; null when it has none (e.g. diff). */
+function commentStyleFor(language: string, fileName: string): CommentStyle | null {
+  if (SLASH_COMMENT_LANGS.has(language)) return { line: '//' };
+  // Most server config files (sshd_config, crontab, hosts, *.conf) use '#'
+  if (HASH_COMMENT_LANGS.has(language)) return { line: '#' };
+  if (language === 'ini') return fileName.toLowerCase().endsWith('.ini') ? { line: ';', alt: ['#'] } : { line: '#', alt: [';'] };
+  if (language === 'sql' || language === 'lua') return { line: '--' };
+  if (language === 'css') return { open: '/*', close: '*/' };
+  if (language === 'markup' || language === 'markdown') return { open: '<!--', close: '-->' };
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard shortcuts (⌘ on macOS, Ctrl elsewhere)
+// ---------------------------------------------------------------------------
+type EditorCommand =
+  | 'goToLine'
+  | 'toggleComment'
+  | 'duplicateDown'
+  | 'duplicateUp'
+  | 'deleteLine'
+  | 'moveUp'
+  | 'moveDown'
+  | 'indent'
+  | 'outdent'
+  | 'zoomIn'
+  | 'zoomOut'
+  | 'zoomReset'
+  | 'toggleWrap'
+  | 'help';
+
+/** Commands that change the text; their shortcuts only act while the text area has focus. */
+const TEXT_COMMANDS = new Set<EditorCommand>(['toggleComment', 'duplicateDown', 'duplicateUp', 'deleteLine', 'moveUp', 'moveDown', 'indent', 'outdent']);
+
+/**
+ * True when the key is `char`, or (on non-Latin layouts, where the key produced no ASCII
+ * character) when the physical key is `code`.
+ */
+function keyIs(e: KeyboardEvent, char: string, code: string): boolean {
+  const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  if (k === char) return true;
+  const ascii = k.length === 1 && k.charCodeAt(0) >= 0x20 && k.charCodeAt(0) < 0x7f;
+  return e.code === code && !ascii;
+}
+
+function matchCommand(e: KeyboardEvent): EditorCommand | null {
+  const primary = IS_MAC ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+  if (e.key === 'F1' && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) return 'help';
+  if (primary && !e.altKey) {
+    // Zoom first: on some layouts (e.g. German) "+" and "-" sit where US "]" and "/" are
+    if (e.key === '=' || e.key === '+' || e.code === 'NumpadAdd') return 'zoomIn';
+    if (e.key === '-' || e.key === '_' || e.code === 'NumpadSubtract') return 'zoomOut';
+    if (!e.shiftKey && (keyIs(e, '0', 'Digit0') || e.code === 'Numpad0')) return 'zoomReset';
+    if (e.key === '/' || (!e.shiftKey && keyIs(e, '/', 'Slash'))) return 'toggleComment';
+    // ⌘; / Ctrl+; as well: on ABNT2 (Brazilian) and similar layouts ";" sits where US "/" is
+    if (e.key === ';' || (!e.shiftKey && keyIs(e, ';', 'Semicolon'))) return 'toggleComment';
+    if (e.shiftKey && keyIs(e, 'd', 'KeyD')) return 'duplicateDown';
+    if (e.shiftKey && keyIs(e, 'k', 'KeyK')) return 'deleteLine';
+    if (!e.shiftKey && keyIs(e, 'l', 'KeyL')) return 'goToLine';
+    if (!e.shiftKey && keyIs(e, ']', 'BracketRight')) return 'indent';
+    if (!e.shiftKey && keyIs(e, '[', 'BracketLeft')) return 'outdent';
+    return null;
+  }
+  if (e.altKey && !e.metaKey && !e.ctrlKey) {
+    if (e.key === 'ArrowUp') return e.shiftKey ? 'duplicateUp' : 'moveUp';
+    if (e.key === 'ArrowDown') return e.shiftKey ? 'duplicateDown' : 'moveDown';
+    // ⌥Z types "Ω" on US/ABNT Mac layouts; letters such as Polish "ż" are left alone
+    if (!e.shiftKey && (e.key === 'z' || e.key === 'Z' || e.key === 'Ω')) return 'toggleWrap';
+  }
+  return null;
+}
+
+/** Shortcut labels shown in tooltips, the "…" menu and the shortcut help. */
+const KEYS = IS_MAC
+  ? {
+      save: '⌘S',
+      find: '⌘F',
+      next: '⌘G',
+      prev: '⇧⌘G',
+      goTo: '⌘L',
+      comment: '⌘/',
+      commentAlt: '⌘;',
+      duplicate: '⇧⌘D',
+      duplicateAlt: '⇧⌥↓ / ⇧⌥↑',
+      deleteLine: '⇧⌘K',
+      moveUp: '⌥↑',
+      moveDown: '⌥↓',
+      indent: '⌘]',
+      outdent: '⌘[',
+      zoomIn: '⌘+',
+      zoomOut: '⌘−',
+      zoomReset: '⌘0',
+      wrap: '⌥Z',
+      undo: '⌘Z',
+      redo: '⇧⌘Z',
+      help: 'F1',
+    }
+  : {
+      save: 'Ctrl+S',
+      find: 'Ctrl+F',
+      next: 'F3',
+      prev: 'Shift+F3',
+      goTo: 'Ctrl+L',
+      comment: 'Ctrl+/',
+      commentAlt: 'Ctrl+;',
+      duplicate: 'Ctrl+Shift+D',
+      duplicateAlt: 'Shift+Alt+↓ / ↑',
+      deleteLine: 'Ctrl+Shift+K',
+      moveUp: 'Alt+↑',
+      moveDown: 'Alt+↓',
+      indent: 'Ctrl+]',
+      outdent: 'Ctrl+[',
+      zoomIn: 'Ctrl+=',
+      zoomOut: 'Ctrl+−',
+      zoomReset: 'Ctrl+0',
+      wrap: 'Alt+Z',
+      undo: 'Ctrl+Z',
+      redo: 'Ctrl+Shift+Z',
+      help: 'F1',
+    };
+
+/** Above this size (wrapped lines) the go-to-line scroll position is estimated instead of measured. */
+const MEASURE_WRAP_MAX_CHARS = 1_000_000;
 
 let tabSeq = 0;
 
@@ -383,11 +683,23 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({ isOpen, onClose, i
   /** Bumped to re-apply the stored caret/scroll of the active tab (e.g. after its content was re-read). */
   const [viewResetKey, setViewResetKey] = useState<number>(0);
 
+  // Go to line + shortcut help
+  const [showGoTo, setShowGoTo] = useState<boolean>(false);
+  const [goToValue, setGoToValue] = useState<string>('');
+  const [goToError, setGoToError] = useState<boolean>(false);
+  const [showHelp, setShowHelp] = useState<boolean>(false);
+
   // Refs
   const wrapperRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const preRef = useRef<HTMLPreElement>(null);
   const gutterRef = useRef<HTMLDivElement>(null);
+  /** Current-line band behind the text; follows the textarea's vertical scroll. */
+  const lineBandRef = useRef<HTMLDivElement>(null);
+  const scrollTopRef = useRef(0);
+  const findBarRef = useRef<HTMLDivElement>(null);
+  const goToInputRef = useRef<HTMLInputElement>(null);
+  const focusGoToOnOpenRef = useRef(false);
   const findInputRef = useRef<HTMLInputElement>(null);
   const confirmSaveRef = useRef<HTMLButtonElement>(null);
   const lastFileRef = useRef<RustScpEditorProps['initialFile']>(null);
@@ -421,6 +733,8 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({ isOpen, onClose, i
       preRef.current.scrollLeft = ta.scrollLeft;
     }
     if (gutterRef.current) gutterRef.current.scrollTop = ta.scrollTop;
+    scrollTopRef.current = ta.scrollTop;
+    if (lineBandRef.current) lineBandRef.current.style.transform = `translateY(${-ta.scrollTop}px)`;
   };
 
   const scheduleCursorUpdate = () => {
@@ -636,35 +950,270 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({ isOpen, onClose, i
     scheduleCursorUpdate();
   };
 
+  /** Applies per-line `edits` inside the block [start, end) as one undoable step, keeping the selection on the same text. */
+  const applyBlockEdits = (ta: HTMLTextAreaElement, start: number, end: number, edits: TextEdit[]) => {
+    if (!edits.length) return;
+    const s = ta.selectionStart;
+    const en = ta.selectionEnd;
+    const next = applyEdits(ta.value, start, end, edits);
+    replaceRange(start, end, next, [mapOffset(s, edits, s !== en), mapOffset(en, edits, false)]);
+  };
+
+  /** Indents (two spaces) or outdents (up to two spaces or one tab) every line touched by the selection. */
+  const shiftLines = (outdent: boolean) => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    const value = ta.value;
+    const { start, end } = lineBlock(value, ta.selectionStart, ta.selectionEnd);
+    const edits: TextEdit[] = [];
+    forEachLine(value, start, end, (ls, le) => {
+      if (!outdent) {
+        edits.push({ at: ls, remove: 0, insert: '  ' });
+        return;
+      }
+      const m = /^(?: {1,2}|\t)/.exec(value.slice(ls, Math.min(le, ls + 2)));
+      if (m) edits.push({ at: ls, remove: m[0].length, insert: '' });
+    });
+    applyBlockEdits(ta, start, end, edits);
+  };
+
+  /** Comments or uncomments the touched lines with the language's comment syntax. */
+  const toggleLineComment = () => {
+    const ta = textareaRef.current;
+    const tab = activeTabRef.current;
+    if (!ta || !tab) return;
+    const style = commentStyleFor(tab.language, tab.name);
+    if (!style) {
+      notify.info(tr('Esta linguagem não tem comentários de linha', 'This language has no line comments'));
+      return;
+    }
+    const value = ta.value;
+    const { start, end } = lineBlock(value, ta.selectionStart, ta.selectionEnd);
+    const lines: Array<{ ls: number; le: number; textStart: number; blank: boolean }> = [];
+    forEachLine(value, start, end, (ls, le) => {
+      let i = ls;
+      while (i < le && (value[i] === ' ' || value[i] === '\t')) i++;
+      lines.push({ ls, le, textStart: i, blank: i === le });
+    });
+    // Blank lines are left alone unless every touched line is blank
+    const targets = lines.some((l) => !l.blank) ? lines.filter((l) => !l.blank) : lines;
+    const edits: TextEdit[] = [];
+
+    if ('line' in style) {
+      const tokens = [style.line, ...(style.alt ?? [])];
+      const tokenAt = (l: (typeof lines)[number]) => tokens.find((t) => value.startsWith(t, l.textStart));
+      if (targets.every((l) => !l.blank && tokenAt(l))) {
+        for (const l of targets) {
+          const t = tokenAt(l) as string;
+          const space = value[l.textStart + t.length] === ' ' ? 1 : 0;
+          edits.push({ at: l.textStart, remove: t.length + space, insert: '' });
+        }
+      } else {
+        // Comment markers line up at the smallest indentation of the block
+        let col = Infinity;
+        for (const l of targets) col = Math.min(col, l.textStart - l.ls);
+        for (const l of targets) edits.push({ at: l.ls + Math.min(col, l.le - l.ls), remove: 0, insert: `${style.line} ` });
+      }
+    } else {
+      const { open, close } = style;
+      const contentEnd = (l: (typeof lines)[number]) => {
+        let e = l.le;
+        while (e > l.textStart && (value[e - 1] === ' ' || value[e - 1] === '\t')) e--;
+        return e;
+      };
+      const isWrapped = (l: (typeof lines)[number]) => {
+        const e = contentEnd(l);
+        return e - l.textStart >= open.length + close.length && value.startsWith(open, l.textStart) && value.slice(e - close.length, e) === close;
+      };
+      if (targets.every((l) => !l.blank && isWrapped(l))) {
+        for (const l of targets) {
+          const e = contentEnd(l);
+          const openLen = open.length + (value[l.textStart + open.length] === ' ' && l.textStart + open.length < e - close.length ? 1 : 0);
+          let closeAt = e - close.length;
+          let closeLen = close.length;
+          if (value[closeAt - 1] === ' ' && closeAt - 1 >= l.textStart + openLen) {
+            closeAt--;
+            closeLen++;
+          }
+          edits.push({ at: l.textStart, remove: openLen, insert: '' }, { at: closeAt, remove: closeLen, insert: '' });
+        }
+      } else {
+        for (const l of targets) {
+          const e = contentEnd(l);
+          edits.push({ at: l.textStart, remove: 0, insert: `${open} ` }, { at: e, remove: 0, insert: ` ${close}` });
+        }
+      }
+    }
+    applyBlockEdits(ta, start, end, edits);
+  };
+
+  /** Copies the touched lines below (or above) themselves; the selection follows the copy. */
+  const duplicateLines = (up: boolean) => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    const value = ta.value;
+    const s = ta.selectionStart;
+    const en = ta.selectionEnd;
+    const { start, end } = lineBlock(value, s, en);
+    const block = value.slice(start, end);
+    if (up) {
+      replaceRange(start, start, `${block}\n`, [s, en]);
+    } else {
+      const shift = block.length + 1;
+      replaceRange(end, end, `\n${block}`, [s + shift, en + shift]);
+    }
+  };
+
+  /** Removes the touched lines; the caret keeps its column on the line that takes their place. */
+  const deleteLines = () => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    const value = ta.value;
+    const s = ta.selectionStart;
+    const { start, end } = lineBlock(value, s, ta.selectionEnd);
+    const col = s - start;
+    if (end < value.length) {
+      const nextEnd = value.indexOf('\n', end + 1);
+      const nextLen = (nextEnd === -1 ? value.length : nextEnd) - (end + 1);
+      const caret = start + Math.min(col, nextLen);
+      replaceRange(start, end + 1, '', [caret, caret]);
+    } else if (start > 0) {
+      const prevStart = lineStartOf(value, start - 1);
+      const caret = prevStart + Math.min(col, start - 1 - prevStart);
+      replaceRange(start - 1, end, '', [caret, caret]);
+    } else if (end > 0) {
+      replaceRange(0, end, '', [0, 0]);
+    }
+  };
+
+  /** Swaps the touched lines with the line above or below them. */
+  const moveLines = (up: boolean) => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    const value = ta.value;
+    const s = ta.selectionStart;
+    const en = ta.selectionEnd;
+    const { start, end } = lineBlock(value, s, en);
+    const block = value.slice(start, end);
+    if (up) {
+      if (start === 0) return;
+      const prevStart = lineStartOf(value, start - 1);
+      const prev = value.slice(prevStart, start - 1);
+      const shift = prev.length + 1;
+      replaceRange(prevStart, end, `${block}\n${prev}`, [s - shift, en - shift]);
+    } else {
+      if (end >= value.length) return;
+      const nl = value.indexOf('\n', end + 1);
+      const nextEnd = nl === -1 ? value.length : nl;
+      const next = value.slice(end + 1, nextEnd);
+      const shift = next.length + 1;
+      replaceRange(start, nextEnd, `${next}\n${block}`, [s + shift, en + shift]);
+    }
+  };
+
+  /** Vertical position (inside the textarea's scroll area) of the line starting at `lineStart`. */
+  const lineTop = (ta: HTMLTextAreaElement, lineStart: number, lineIndex: number): number => {
+    const lh = lineHeightOf(fontSize);
+    if (!wordWrap) return TEXT_PADDING + lineIndex * lh;
+    const value = ta.value;
+    if (value.length > MEASURE_WRAP_MAX_CHARS) {
+      return value.length ? (lineStart / value.length) * ta.scrollHeight : 0;
+    }
+    // Wrapped lines: lay the preceding text out in an invisible copy of the textarea and measure it
+    const cs = window.getComputedStyle(ta);
+    const probe = document.createElement('div');
+    probe.setAttribute('aria-hidden', 'true');
+    const st = probe.style;
+    st.position = 'absolute';
+    st.visibility = 'hidden';
+    st.pointerEvents = 'none';
+    st.left = '0';
+    st.top = '0';
+    st.boxSizing = 'border-box';
+    st.width = `${ta.clientWidth}px`;
+    st.padding = `${TEXT_PADDING}px`;
+    st.fontFamily = cs.fontFamily;
+    st.fontSize = cs.fontSize;
+    st.lineHeight = cs.lineHeight;
+    st.letterSpacing = cs.letterSpacing;
+    st.whiteSpace = 'pre-wrap';
+    st.overflowWrap = 'break-word';
+    st.wordBreak = 'normal';
+    st.setProperty('tab-size', cs.getPropertyValue('tab-size') || '4');
+    probe.textContent = value.slice(0, lineStart);
+    (ta.parentElement ?? document.body).appendChild(probe);
+    const top = probe.offsetHeight - TEXT_PADDING;
+    probe.remove();
+    return top;
+  };
+
+  /** Moves the caret to `line` (1-based, clamped) and column `col`, scrolling it into view. */
+  const goToLine = (line: number, col = 1) => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    const value = ta.value;
+    const target = Math.max(1, Math.min(Math.floor(line) || 1, countLines(value)));
+    let ls = 0;
+    for (let n = 1; n < target; n++) {
+      const nl = value.indexOf('\n', ls);
+      if (nl === -1) break;
+      ls = nl + 1;
+    }
+    const nl = value.indexOf('\n', ls);
+    const le = nl === -1 ? value.length : nl;
+    const pos = Math.min(ls + Math.max(0, Math.floor(col) - 1), le);
+    ta.focus();
+    ta.setSelectionRange(pos, pos);
+    const lh = lineHeightOf(fontSize);
+    const top = lineTop(ta, ls, target - 1);
+    if (top < ta.scrollTop || top + lh > ta.scrollTop + ta.clientHeight) {
+      ta.scrollTop = Math.max(0, top - ta.clientHeight / 3);
+    }
+    if (!wordWrap && pos === ls) ta.scrollLeft = 0;
+    syncScroll();
+    scheduleCursorUpdate();
+  };
+
   const handleTextareaKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key !== 'Tab' || e.altKey || e.ctrlKey || e.metaKey || e.nativeEvent.isComposing) return;
     e.preventDefault();
     const ta = e.currentTarget;
-    const value = ta.value;
     const s = ta.selectionStart;
     const en = ta.selectionEnd;
-    const multiLine = value.slice(s, en).includes('\n');
+    const multiLine = ta.value.slice(s, en).includes('\n');
 
     if (!e.shiftKey && !multiLine) {
       replaceRange(s, en, '  ');
       return;
     }
-
     // Indent / dedent every line touched by the selection
-    const blockStart = value.lastIndexOf('\n', s - 1) + 1;
-    const lastChar = multiLine && en > s && value[en - 1] === '\n' ? en - 1 : en;
-    const lineEnd = value.indexOf('\n', lastChar);
-    const blockEnd = lineEnd === -1 ? value.length : lineEnd;
-    const block = value.slice(blockStart, blockEnd);
-    const lines = block.split('\n');
-    const newBlock = e.shiftKey ? lines.map((l) => l.replace(/^(?: {1,2}|\t)/, '')).join('\n') : lines.map((l) => `  ${l}`).join('\n');
-    if (newBlock === block) return;
-    if (multiLine) {
-      replaceRange(blockStart, blockEnd, newBlock, [blockStart, blockStart + newBlock.length]);
-    } else {
-      const removed = lines[0].length - newBlock.length;
-      const caret = Math.max(blockStart, s - removed);
-      replaceRange(blockStart, blockEnd, newBlock, [caret, caret]);
+    shiftLines(e.shiftKey);
+  };
+
+  /** Runs an editing command; from a menu, focus returns to the text first so the selection is kept. */
+  const runTextCommand = (cmd: EditorCommand) => {
+    if (textareaRef.current && document.activeElement !== textareaRef.current) textareaRef.current.focus();
+    switch (cmd) {
+      case 'toggleComment':
+        toggleLineComment();
+        break;
+      case 'duplicateDown':
+      case 'duplicateUp':
+        duplicateLines(cmd === 'duplicateUp');
+        break;
+      case 'deleteLine':
+        deleteLines();
+        break;
+      case 'moveUp':
+      case 'moveDown':
+        moveLines(cmd === 'moveUp');
+        break;
+      case 'indent':
+      case 'outdent':
+        shiftLines(cmd === 'outdent');
+        break;
+      default:
+        break;
     }
   };
 
@@ -702,6 +1251,36 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({ isOpen, onClose, i
     await saveTab(tab);
   };
 
+  /**
+   * Saves the active file (when it has edits) and puts its contents, with the file's line
+   * endings, on the clipboard. The copy happens first, while the click still counts as a user
+   * gesture (WKWebView refuses clipboard writes after a slow network save).
+   */
+  const handleSaveAndCopy = async () => {
+    const tab = activeTabRef.current;
+    if (!tab || savingTabId) return;
+    // Run from the "…" menu, whose item disappears with the menu: keep typing in the text afterwards
+    textareaRef.current?.focus();
+    const copied = await copyText(applyEol(tab.content, tab.eol));
+    const needsSave = tab.isDirty;
+    if (needsSave && !(await saveTab(tab))) {
+      // saveTab already reported the error
+      if (copied) notify.info(tr('O conteúdo foi copiado, mas o arquivo não foi salvo', 'The contents were copied, but the file was not saved'));
+      return;
+    }
+    if (copied) {
+      notify.success(
+        needsSave ? tr('Salvo e copiado', 'Saved and copied') : tr('Copiado para a área de transferência', 'Copied to the clipboard'),
+        tab.name
+      );
+    } else {
+      notify.warning(
+        needsSave ? tr('Salvo, mas não copiado', 'Saved, but not copied') : tr('Não foi possível copiar', 'Could not copy'),
+        tr('A área de transferência não está disponível.', 'The clipboard is not available.')
+      );
+    }
+  };
+
   // ---------------------------------------------------------------------------
   // Closing
   // ---------------------------------------------------------------------------
@@ -726,6 +1305,8 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({ isOpen, onClose, i
     rememberViewState();
     setShowSearch(false);
     setShowReplace(false);
+    setShowGoTo(false);
+    setShowHelp(false);
     setReplaceInfo('');
     setConfirmCloseAll(false);
     setDirtyTabToClose(null);
@@ -882,6 +1463,46 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({ isOpen, onClose, i
     scheduleCursorUpdate();
   };
 
+  // ---------------------------------------------------------------------------
+  // Go to line
+  // ---------------------------------------------------------------------------
+  const openGoTo = () => {
+    setGoToValue(String(cursor.line));
+    setGoToError(false);
+    if (goToInputRef.current) {
+      goToInputRef.current.focus();
+      goToInputRef.current.select();
+    } else {
+      focusGoToOnOpenRef.current = true;
+      setShowGoTo(true);
+    }
+  };
+
+  useLayoutEffect(() => {
+    if (!showGoTo || !focusGoToOnOpenRef.current) return;
+    focusGoToOnOpenRef.current = false;
+    goToInputRef.current?.focus();
+    goToInputRef.current?.select();
+  }, [showGoTo]);
+
+  const closeGoTo = () => {
+    setShowGoTo(false);
+    setGoToError(false);
+    textareaRef.current?.focus();
+  };
+
+  /** Accepts "120" or "120:8" (line:column). */
+  const submitGoTo = () => {
+    const m = /^\s*(\d{1,9})\s*(?:[:,]\s*(\d{1,9})\s*)?$/.exec(goToValue);
+    if (!m) {
+      setGoToError(true);
+      return;
+    }
+    setShowGoTo(false);
+    setGoToError(false);
+    goToLine(Number(m[1]), m[2] ? Number(m[2]) : 1);
+  };
+
   const handleReplaceCurrent = () => {
     if (!activeTab || !matches.length) return;
     const pos = matches[matchIdx];
@@ -975,17 +1596,66 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({ isOpen, onClose, i
   // ---------------------------------------------------------------------------
   // Keyboard shortcuts (only while the editor is the top-most dialog)
   // ---------------------------------------------------------------------------
+  // Appearance (persisted per viewer)
+  const setFont = (size: number) => {
+    const v = Math.max(FONT_MIN, Math.min(FONT_MAX, size));
+    setFontSize(v);
+    writePref(PREF_FONT, String(v));
+  };
+
+  const toggleWrap = () => {
+    setWordWrap((w) => {
+      writePref(PREF_WRAP, String(!w));
+      return !w;
+    });
+  };
+
+  /** Runs any editor command (keyboard shortcut or menu). */
+  const runCommand = (cmd: EditorCommand) => {
+    switch (cmd) {
+      case 'goToLine':
+        openGoTo();
+        break;
+      case 'zoomIn':
+        setFont(fontSize + 1);
+        break;
+      case 'zoomOut':
+        setFont(fontSize - 1);
+        break;
+      case 'zoomReset':
+        setFont(FONT_DEFAULT);
+        break;
+      case 'toggleWrap':
+        toggleWrap();
+        break;
+      case 'help':
+        setShowHelp(true);
+        break;
+      default:
+        runTextCommand(cmd);
+    }
+  };
+
   const shortcutHandlers = useRef({
     save: () => {},
     find: () => {},
     step: (_dir: 1 | -1) => {},
     escape: () => {},
+    command: (_cmd: EditorCommand) => {},
   });
   shortcutHandlers.current = {
     save: () => void handleSaveActive(),
     find: openFind,
     step: stepMatch,
-    escape: () => (showSearch ? closeFind() : requestClose()),
+    escape: () => {
+      // Close the bar that has focus first, then the other bar, then the editor
+      const active = document.activeElement;
+      if (showSearch && findBarRef.current?.contains(active)) closeFind();
+      else if (showGoTo) closeGoTo();
+      else if (showSearch) closeFind();
+      else requestClose();
+    },
+    command: runCommand,
   };
 
   useEffect(() => {
@@ -1010,6 +1680,13 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({ isOpen, onClose, i
       } else if (e.key === 'Escape') {
         e.preventDefault();
         shortcutHandlers.current.escape();
+      } else if (!e.defaultPrevented) {
+        const cmd = matchCommand(e);
+        if (!cmd) return;
+        // Text commands act on the text area only (⌥↑ in the find field keeps its usual meaning)
+        if (TEXT_COMMANDS.has(cmd) && e.target !== textareaRef.current) return;
+        e.preventDefault();
+        shortcutHandlers.current.command(cmd);
       }
     };
     window.addEventListener('keydown', onKey);
@@ -1018,7 +1695,7 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({ isOpen, onClose, i
 
   if (!isOpen || !activeTab) return null;
 
-  const lineHeightPx = Math.round(fontSize * 1.55);
+  const lineHeightPx = lineHeightOf(fontSize);
   const textStyle: React.CSSProperties = {
     fontSize: `${fontSize}px`,
     lineHeight: `${lineHeightPx}px`,
@@ -1033,19 +1710,23 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({ isOpen, onClose, i
   const justSaved = savedTabId === activeTab.id && !activeTab.isDirty;
   const dirtyTabs = tabs.filter((t) => t.isDirty);
   const tabToClose = dirtyTabToClose ? tabs.find((t) => t.id === dirtyTabToClose) : null;
-  const languageName = SUPPORTED_LANGUAGES.find((l) => l.id === activeTab.language)?.name || activeTab.language;
+  const languageLabel = (lang: { name: string; pt?: string }) => (isPt && lang.pt ? lang.pt : lang.name);
+  const knownLanguage = SUPPORTED_LANGUAGES.find((l) => l.id === activeTab.language);
+  // Plain text first, then the rest sorted by the name the viewer reads
+  const languageOptions = SUPPORTED_LANGUAGES.map((l) => ({ id: l.id, label: languageLabel(l) })).sort((a, b) =>
+    a.id === 'plain' ? -1 : b.id === 'plain' ? 1 : a.label.localeCompare(b.label, isPt ? 'pt-BR' : 'en', { sensitivity: 'base' })
+  );
+  const activeLine = Math.min(cursor.line, lineCount);
 
-  const setFont = (size: number) => {
-    const v = Math.max(FONT_MIN, Math.min(FONT_MAX, size));
-    setFontSize(v);
-    writePref(PREF_FONT, String(v));
-  };
-
-  const toggleWrap = () => {
-    setWordWrap((w) => {
-      writePref(PREF_WRAP, String(!w));
-      return !w;
-    });
+  /** Clicking a line number puts the caret at the start of that line. */
+  const handleGutterMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    e.preventDefault(); // keep focus (and the selection) in the text area
+    const gutter = gutterRef.current;
+    if (!gutter) return;
+    const y = e.clientY - gutter.getBoundingClientRect().top + gutter.scrollTop - TEXT_PADDING;
+    const line = Math.floor(y / lineHeightPx) + 1;
+    if (line >= 1 && line <= lineCount) goToLine(line);
   };
 
   const handleOpenExternal = async () => {
@@ -1087,6 +1768,51 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({ isOpen, onClose, i
 
   const quietSelect =
     'bg-transparent border-0 p-0 pr-0.5 text-[11.5px] text-ink-muted hover:text-ink cursor-pointer appearance-none focus:outline-none focus-visible:ring-2 focus-visible:ring-rust-500/30 rounded';
+
+  const menuOnly = tr('Menu …', '… menu');
+  const shortcutSections: Array<{ title: string; rows: Array<[string, string]> }> = [
+    {
+      title: tr('Arquivo', 'File'),
+      rows: [
+        [tr('Salvar', 'Save'), KEYS.save],
+        [tr('Salvar e copiar o conteúdo', 'Save and copy to clipboard'), menuOnly],
+        [tr('Fechar a busca ou o editor', 'Close find or the editor'), 'Esc'],
+      ],
+    },
+    {
+      title: tr('Busca e navegação', 'Find and navigate'),
+      rows: [
+        [tr('Localizar e substituir', 'Find and replace'), KEYS.find],
+        [tr('Próximo resultado', 'Next match'), `${KEYS.next} · Enter`],
+        [tr('Resultado anterior', 'Previous match'), `${KEYS.prev} · ${SHIFT}Enter`],
+        [tr('Ir para a linha', 'Go to line'), KEYS.goTo],
+      ],
+    },
+    {
+      title: tr('Edição', 'Editing'),
+      rows: [
+        [tr('Comentar ou descomentar', 'Toggle line comment'), `${KEYS.comment} · ${KEYS.commentAlt}`],
+        [tr('Duplicar linha', 'Duplicate line'), `${KEYS.duplicate} · ${KEYS.duplicateAlt}`],
+        [tr('Excluir linha', 'Delete line'), KEYS.deleteLine],
+        [tr('Mover linha para cima', 'Move line up'), KEYS.moveUp],
+        [tr('Mover linha para baixo', 'Move line down'), KEYS.moveDown],
+        [tr('Aumentar recuo', 'Indent'), `${KEYS.indent} · Tab`],
+        [tr('Diminuir recuo', 'Outdent'), `${KEYS.outdent} · ${SHIFT}Tab`],
+        [tr('Desfazer', 'Undo'), KEYS.undo],
+        [tr('Refazer', 'Redo'), KEYS.redo],
+      ],
+    },
+    {
+      title: tr('Exibição', 'View'),
+      rows: [
+        [tr('Aumentar texto', 'Larger text'), KEYS.zoomIn],
+        [tr('Diminuir texto', 'Smaller text'), KEYS.zoomOut],
+        [tr('Tamanho padrão', 'Default size'), KEYS.zoomReset],
+        [tr('Quebrar linhas longas', 'Wrap long lines'), KEYS.wrap],
+        [tr('Atalhos de teclado', 'Keyboard shortcuts'), KEYS.help],
+      ],
+    },
+  ];
 
   return (
     <>
@@ -1160,26 +1886,42 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({ isOpen, onClose, i
 
               <Menu
                 align="right"
-                width="w-64"
+                width="w-72"
                 trigger={({ open, toggle, ref }) => (
-                  <IconButton ref={ref} size="sm" label={tr('Opções de visualização', 'View options')} active={open} onClick={toggle} aria-haspopup="menu" aria-expanded={open}>
+                  <IconButton ref={ref} size="sm" label={tr('Mais opções', 'More options')} active={open} onClick={toggle} aria-haspopup="menu" aria-expanded={open}>
                     <MoreHorizontal className="w-4 h-4" />
                   </IconButton>
                 )}
               >
                 {(close) => (
-                  <>
+                  // Scrolls on short windows instead of being clipped by the dialog
+                  <div className="max-h-[calc(100vh-9rem)] overflow-y-auto">
                     <MenuLabel>{tr('Tamanho do texto', 'Text size')}</MenuLabel>
                     <div className="flex items-center gap-1 px-2.5 pb-1.5">
-                      <IconButton size="sm" label={tr('Diminuir texto', 'Smaller text')} onClick={() => setFont(fontSize - 1)} disabled={fontSize <= FONT_MIN}>
+                      <IconButton
+                        size="sm"
+                        label={`${tr('Diminuir texto', 'Smaller text')} (${KEYS.zoomOut})`}
+                        onClick={() => setFont(fontSize - 1)}
+                        disabled={fontSize <= FONT_MIN}
+                      >
                         <Minus className="w-3.5 h-3.5" />
                       </IconButton>
                       <span className="w-12 text-center text-[12px] tabular-nums text-ink-muted">{fontSize}px</span>
-                      <IconButton size="sm" label={tr('Aumentar texto', 'Larger text')} onClick={() => setFont(fontSize + 1)} disabled={fontSize >= FONT_MAX}>
+                      <IconButton
+                        size="sm"
+                        label={`${tr('Aumentar texto', 'Larger text')} (${KEYS.zoomIn})`}
+                        onClick={() => setFont(fontSize + 1)}
+                        disabled={fontSize >= FONT_MAX}
+                      >
                         <Plus className="w-3.5 h-3.5" />
                       </IconButton>
                       {fontSize !== FONT_DEFAULT && (
-                        <button type="button" onClick={() => setFont(FONT_DEFAULT)} className="ml-auto text-[12px] text-ink-muted hover:text-ink">
+                        <button
+                          type="button"
+                          onClick={() => setFont(FONT_DEFAULT)}
+                          title={`${tr('Tamanho padrão', 'Default size')} (${KEYS.zoomReset})`}
+                          className="ml-auto text-[12px] text-ink-muted hover:text-ink"
+                        >
                           {tr('Padrão', 'Reset')}
                         </button>
                       )}
@@ -1202,18 +1944,93 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({ isOpen, onClose, i
                         {tr('Os números de linha ficam ocultos enquanto as linhas são quebradas.', 'Line numbers are hidden while lines wrap.')}
                       </p>
                     )}
+                    <MenuSeparator />
+                    <MenuLabel>{tr('Edição', 'Editing')}</MenuLabel>
+                    <MenuItem
+                      icon={<Hash className="w-4 h-4" />}
+                      label={tr('Ir para a linha…', 'Go to line…')}
+                      shortcut={KEYS.goTo}
+                      onSelect={() => runCommand('goToLine')}
+                      close={close}
+                    />
+                    <MenuItem
+                      icon={<MessageSquareCode className="w-4 h-4" />}
+                      label={tr('Comentar ou descomentar', 'Toggle line comment')}
+                      shortcut={KEYS.comment}
+                      onSelect={() => runCommand('toggleComment')}
+                      close={close}
+                    />
+                    <MenuItem
+                      icon={<CopyPlus className="w-4 h-4" />}
+                      label={tr('Duplicar linha', 'Duplicate line')}
+                      shortcut={KEYS.duplicate}
+                      onSelect={() => runCommand('duplicateDown')}
+                      close={close}
+                    />
+                    <MenuItem
+                      icon={<Trash2 className="w-4 h-4" />}
+                      label={tr('Excluir linha', 'Delete line')}
+                      shortcut={KEYS.deleteLine}
+                      onSelect={() => runCommand('deleteLine')}
+                      close={close}
+                    />
+                    <MenuItem
+                      icon={<ArrowUp className="w-4 h-4" />}
+                      label={tr('Mover linha para cima', 'Move line up')}
+                      shortcut={KEYS.moveUp}
+                      onSelect={() => runCommand('moveUp')}
+                      close={close}
+                    />
+                    <MenuItem
+                      icon={<ArrowDown className="w-4 h-4" />}
+                      label={tr('Mover linha para baixo', 'Move line down')}
+                      shortcut={KEYS.moveDown}
+                      onSelect={() => runCommand('moveDown')}
+                      close={close}
+                    />
+                    <MenuItem
+                      icon={<IndentIncrease className="w-4 h-4" />}
+                      label={tr('Aumentar recuo', 'Indent')}
+                      shortcut={KEYS.indent}
+                      onSelect={() => runCommand('indent')}
+                      close={close}
+                    />
+                    <MenuItem
+                      icon={<IndentDecrease className="w-4 h-4" />}
+                      label={tr('Diminuir recuo', 'Outdent')}
+                      shortcut={KEYS.outdent}
+                      onSelect={() => runCommand('outdent')}
+                      close={close}
+                    />
+                    <MenuSeparator />
+                    <MenuItem
+                      icon={<ClipboardCopy className="w-4 h-4" />}
+                      label={tr('Salvar e copiar o conteúdo', 'Save and copy to clipboard')}
+                      onSelect={() => void handleSaveAndCopy()}
+                      close={close}
+                      disabled={!!savingTabId}
+                    />
                     {onOpenExternal && (
-                      <>
-                        <MenuSeparator />
-                        <MenuItem
-                          icon={<ExternalLink className="w-4 h-4" />}
-                          label={tr('Abrir no editor externo', 'Open in external editor')}
-                          onSelect={() => void handleOpenExternal()}
-                          close={close}
-                        />
-                      </>
+                      <MenuItem
+                        icon={<ExternalLink className="w-4 h-4" />}
+                        label={tr('Abrir no editor externo', 'Open in external editor')}
+                        onSelect={() => void handleOpenExternal()}
+                        close={close}
+                      />
                     )}
-                  </>
+                    <MenuSeparator />
+                    <MenuItem
+                      icon={<Keyboard className="w-4 h-4" />}
+                      label={tr('Atalhos de teclado', 'Keyboard shortcuts')}
+                      shortcut={KEYS.help}
+                      onSelect={() => {
+                        // Focus the text first so closing the help returns there (the menu item goes away)
+                        textareaRef.current?.focus();
+                        setShowHelp(true);
+                      }}
+                      close={close}
+                    />
+                  </div>
                 )}
               </Menu>
 
@@ -1291,9 +2108,49 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({ isOpen, onClose, i
             </div>
           )}
 
+          {/* Go to line */}
+          {showGoTo && (
+            <div className="flex flex-wrap items-center gap-1.5 px-3 py-2 border-b border-line bg-surface shrink-0 select-none">
+              <Hash className="w-4 h-4 text-ink-faint shrink-0 mx-1.5" aria-hidden="true" />
+              <input
+                ref={goToInputRef}
+                type="text"
+                inputMode="numeric"
+                {...plainTextInputProps}
+                value={goToValue}
+                onChange={(e) => {
+                  setGoToValue(e.target.value);
+                  if (goToError) setGoToError(false);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    submitGoTo();
+                  }
+                }}
+                placeholder={tr('Linha ou linha:coluna', 'Line or line:column')}
+                aria-label={tr('Ir para a linha', 'Go to line')}
+                aria-invalid={goToError || undefined}
+                aria-describedby="rustscp-editor-goto-hint"
+                className={`ui-input h-7 w-44 max-w-full text-[12.5px] tabular-nums ${goToError ? '!border-red-500/70' : ''}`}
+              />
+              <span id="rustscp-editor-goto-hint" className={`text-[11.5px] ${goToError ? 'text-red-600 dark:text-red-400' : 'text-ink-faint'}`} aria-live="polite">
+                {goToError
+                  ? tr('Digite um número de linha, por exemplo 120 ou 120:8.', 'Enter a line number, for example 120 or 120:8.')
+                  : tr(`de ${lineCount.toLocaleString()} linhas`, `of ${lineCount.toLocaleString()} lines`)}
+              </span>
+              <Button size="sm" variant="secondary" onClick={submitGoTo} className="ml-auto">
+                {tr('Ir', 'Go')}
+              </Button>
+              <IconButton size="sm" label={tr('Fechar (Esc)', 'Close (Esc)')} onClick={closeGoTo}>
+                <X className="w-3.5 h-3.5" />
+              </IconButton>
+            </div>
+          )}
+
           {/* Find & replace */}
           {showSearch && (
-            <div className="flex items-start gap-1.5 px-3 py-2 border-b border-line bg-surface shrink-0 select-none">
+            <div ref={findBarRef} className="flex items-start gap-1.5 px-3 py-2 border-b border-line bg-surface shrink-0 select-none">
               <IconButton
                 size="sm"
                 label={showReplace ? tr('Ocultar substituir', 'Hide replace') : tr('Mostrar substituir', 'Show replace')}
@@ -1379,15 +2236,16 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({ isOpen, onClose, i
               <div
                 ref={gutterRef}
                 aria-hidden="true"
-                className="relative shrink-0 overflow-hidden select-none border-r border-line bg-surface text-ink-faint text-right font-mono"
+                onMouseDown={handleGutterMouseDown}
+                className="relative shrink-0 overflow-hidden select-none border-r border-line bg-surface text-ink-faint text-right font-mono cursor-default"
                 style={{ fontSize: `${fontSize}px`, lineHeight: `${lineHeightPx}px`, width: `calc(${gutterDigits}ch + 24px)` }}
               >
                 <div className="relative" style={{ paddingTop: TEXT_PADDING, paddingBottom: TEXT_PADDING * 4 }}>
                   <div
                     className="absolute left-0 right-0 pr-3 bg-dark-650 text-ink"
-                    style={{ top: TEXT_PADDING + (Math.min(cursor.line, lineCount) - 1) * lineHeightPx, height: lineHeightPx }}
+                    style={{ top: TEXT_PADDING + (activeLine - 1) * lineHeightPx, height: lineHeightPx }}
                   >
-                    {Math.min(cursor.line, lineCount)}
+                    {activeLine}
                   </div>
                   <pre className="m-0 pr-3 pl-2 font-mono whitespace-pre" style={{ font: 'inherit' }}>
                     {gutterText}
@@ -1397,6 +2255,20 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({ isOpen, onClose, i
             )}
 
             <div className="flex-1 min-w-0 relative">
+              {showGutter && (
+                // Faint band behind the caret's line (line positions are only exact without wrapping)
+                <div aria-hidden="true" className="absolute inset-0 overflow-hidden pointer-events-none">
+                  <div
+                    ref={lineBandRef}
+                    className="absolute inset-x-0 bg-dark-650/40"
+                    style={{
+                      top: TEXT_PADDING + (activeLine - 1) * lineHeightPx,
+                      height: lineHeightPx,
+                      transform: `translateY(${-scrollTopRef.current}px)`,
+                    }}
+                  />
+                </div>
+              )}
               {highlightOn && (
                 <pre
                   ref={preRef}
@@ -1428,9 +2300,14 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({ isOpen, onClose, i
 
           {/* Status bar */}
           <div className="flex items-center gap-4 h-7 px-3 border-t border-line shrink-0 text-[11.5px] text-ink-faint select-none">
-            <span className="tabular-nums">
+            <button
+              type="button"
+              onClick={openGoTo}
+              title={`${tr('Ir para a linha', 'Go to line')} (${KEYS.goTo})`}
+              className="tabular-nums rounded hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-rust-500/30"
+            >
               {tr('Ln', 'Ln')} {cursor.line.toLocaleString()}, {tr('Col', 'Col')} {cursor.col.toLocaleString()}
-            </span>
+            </button>
             <span className="tabular-nums hidden sm:inline">
               {lineCount.toLocaleString()} {lineCount === 1 ? tr('linha', 'line') : tr('linhas', 'lines')}
             </span>
@@ -1460,12 +2337,12 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({ isOpen, onClose, i
               title={tr('Linguagem do realce de sintaxe', 'Syntax highlighting language')}
               className={quietSelect}
             >
-              {SUPPORTED_LANGUAGES.map((lang) => (
+              {languageOptions.map((lang) => (
                 <option key={lang.id} value={lang.id}>
-                  {lang.name}
+                  {lang.label}
                 </option>
               ))}
-              {!SUPPORTED_LANGUAGES.some((l) => l.id === activeTab.language) && <option value={activeTab.language}>{languageName}</option>}
+              {!knownLanguage && <option value={activeTab.language}>{activeTab.language}</option>}
             </select>
           </div>
         </div>
@@ -1531,6 +2408,36 @@ export const RustScpEditor: React.FC<RustScpEditorProps> = ({ isOpen, onClose, i
               ))}
             </ul>
           )}
+        </div>
+      </Modal>
+
+      {/* Keyboard shortcut help */}
+      <Modal
+        isOpen={showHelp}
+        onClose={() => setShowHelp(false)}
+        size="md"
+        icon={<Keyboard className="w-4 h-4" />}
+        title={tr('Atalhos do editor', 'Editor shortcuts')}
+        footer={
+          <Button variant="secondary" onClick={() => setShowHelp(false)} data-autofocus="">
+            {tr('Fechar', 'Close')}
+          </Button>
+        }
+      >
+        <div className="space-y-4">
+          {shortcutSections.map((section) => (
+            <section key={section.title}>
+              <h3 className="text-[12px] font-medium text-ink-faint mb-1">{section.title}</h3>
+              <ul className="divide-y divide-line">
+                {section.rows.map(([label, keys]) => (
+                  <li key={label} className="flex items-center gap-3 py-1.5 text-[13px] text-ink">
+                    <span className="min-w-0 truncate">{label}</span>
+                    <Kbd>{keys}</Kbd>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          ))}
         </div>
       </Modal>
     </>

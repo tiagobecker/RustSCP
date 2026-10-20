@@ -174,6 +174,15 @@ interface FileTarget {
   pane?: PaneId;
 }
 
+/** What a rename works on: the session, the item, its folder and the naming rules there. */
+interface RenameSubject {
+  sid: string;
+  file: FileEntry;
+  oldName: string;
+  dir: string;
+  windowsStyle: boolean;
+}
+
 interface SyncSide {
   sid: string;
   path: string;
@@ -417,6 +426,14 @@ export const App: React.FC = () => {
       return localStorage.getItem('rustscp_external_editor_command') || '';
     } catch {
       return '';
+    }
+  });
+  // Open files (Edit / F4 / double-click) in the external editor instead of the built-in one
+  const [preferExternalEditor, setPreferExternalEditor] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('rustscp_prefer_external_editor') === 'true';
+    } catch {
+      return false;
     }
   });
   const [remoteSystemInfo, setRemoteSystemInfo] = useState<RemoteSystemInfo | null>(null);
@@ -1505,6 +1522,10 @@ export const App: React.FC = () => {
   const handleEditFile = (file: FileEntry, sessionId?: string, pane?: PaneId) => {
     const sid = sessionForPane(sessionId, pane);
     if (sessionSwitching(sid, pane)) return;
+    if (preferExternalEditor && file.file_type !== 'directory' && sid) {
+      handleOpenExternal(file.path, sid);
+      return;
+    }
     openInEditor(file, sid, pane);
   };
 
@@ -1677,15 +1698,101 @@ export const App: React.FC = () => {
     return null;
   };
 
-  /** Rename (F2 / context menu): in-app dialog prefilled with the current name, stem selected. */
-  const handleRenameFile = (file: FileEntry, sessionId?: string, pane?: PaneId, currentDir?: string) => {
+  /** The rename subject for `file`, or null when it cannot be renamed now ('.', '..', a pane mid-switch). */
+  const renameSubjectOf = (file: FileEntry, sessionId?: string, pane?: PaneId, currentDir?: string): RenameSubject | null => {
     const sid = sessionForPane(sessionId, pane);
-    if (!sid || !file?.path || sessionSwitching(sid, pane)) return;
+    if (!sid || !file?.path || sessionSwitching(sid, pane)) return null;
     const oldName = file.name || basename(file.path);
-    if (!oldName || oldName === '.' || oldName === '..') return;
+    if (!oldName || oldName === '.' || oldName === '..') return null;
     const dir = dirname(file.path) || currentDir || (pane ? panes[pane].pathRef.current : '');
-    if (!dir) return;
+    if (!dir) return null;
     const windowsStyle = !isRemoteSession(sid) && (detectSep(dir) === '\\' || /^[A-Za-z]:/.test(dir));
+    return { sid, file, oldName, dir, windowsStyle };
+  };
+
+  /**
+   * Checks a new name before renaming: the naming rules, and never another item's name (local and
+   * S3 renames would overwrite it silently). 'invalid' means the name must be fixed (a toast says why).
+   */
+  const checkRenameName = async (rs: RenameSubject, name: string): Promise<'invalid' | 'unchanged' | { target: string }> => {
+    const problem = renameProblem(name, rs.windowsStyle);
+    if (problem) {
+      notify.warning(tr('Nome inválido', 'Invalid name'), problem);
+      return 'invalid';
+    }
+    if (name === rs.oldName) return 'unchanged';
+    const target = joinPath(rs.dir, name);
+    // A case-only change ("readme" -> "README") is the same item on case-insensitive disks.
+    if (name.toLowerCase() !== rs.oldName.toLowerCase()) {
+      let exists = (directoryCache.get(rs.sid, rs.dir) ?? []).some((f) => f.name === name);
+      if (!exists) {
+        try {
+          const meta = await invokeTauri<FileEntry>('get_file_properties', { sessionId: rs.sid, path: target });
+          exists = !!meta && typeof meta.name === 'string' && meta.name !== '';
+        } catch (_e) {
+          // not found: the name is free
+        }
+      }
+      if (exists) {
+        notify.warning(tr('Já existe um item com esse nome', 'An item with that name already exists'), `${name}\n${tr('Escolha outro nome.', 'Choose another name.')}`);
+        return 'invalid';
+      }
+    }
+    return { target };
+  };
+
+  /**
+   * Renames through `rename_item`, then refreshes the folder and keeps the renamed item selected.
+   * `onSettled` runs as soon as the rename itself finished (success or failure). False on failure
+   * (an error toast was shown).
+   */
+  const applyRename = async (rs: RenameSubject, name: string, target: string, onSettled?: () => void): Promise<boolean> => {
+    const { sid, file, dir } = rs;
+    try {
+      await invokeTauri('rename_item', { sessionId: sid, from: file.path, to: target });
+    } catch (e) {
+      onSettled?.();
+      notify.error(tr('Não foi possível renomear', 'Could not rename'), e);
+      return false;
+    }
+    onSettled?.();
+    // Paths below the old name are gone: drop them from the cache and the clipboard
+    directoryCache.invalidateTree(sid, file.path);
+    setClipboard((c) =>
+      c && c.sourceSession === sid && c.paths.some((p) => samePath(p, file.path) || isInside(p, file.path)) ? null : c
+    );
+    await refreshSession(sid, [dir]);
+    // Keep the renamed item selected in the pane(s) showing that folder
+    const renamed = (directoryCache.get(sid, dir) ?? []).find((f) => f.name === name)?.path;
+    if (renamed) {
+      for (const p of PANES) {
+        const api = panes[p];
+        if (api.activeRef.current === sid && samePath(api.pathRef.current, dir)) api.setSelected([renamed]);
+      }
+    }
+    return true;
+  };
+
+  /**
+   * Rename in place in a file list (F2, context menu, slow second click): same checks as the
+   * dialog. Resolves false only when the name must be fixed (the field stays open).
+   */
+  const handleRenameInline = async (file: FileEntry, newName: string, sessionId?: string, pane?: PaneId, currentDir?: string): Promise<boolean> => {
+    const rs = renameSubjectOf(file, sessionId, pane, currentDir);
+    if (!rs) return true;
+    const name = (newName || '').trim();
+    const check = await checkRenameName(rs, name);
+    if (check === 'invalid') return false;
+    if (check === 'unchanged') return true;
+    await applyRename(rs, name, check.target);
+    return true;
+  };
+
+  /** Rename in a dialog prefilled with the current name, stem selected (used where inline renaming is not possible). */
+  const handleRenameFile = (file: FileEntry, sessionId?: string, pane?: PaneId, currentDir?: string) => {
+    const rs = renameSubjectOf(file, sessionId, pane, currentDir);
+    if (!rs) return;
+    const { oldName } = rs;
     // Select the name without its extension (like Finder); folders and dotfiles select everything
     const dot = file.file_type === 'directory' ? -1 : oldName.lastIndexOf('.');
     const stemLength = dot > 0 ? dot : oldName.length;
@@ -1700,57 +1807,13 @@ export const App: React.FC = () => {
       cancelText: tr('Cancelar', 'Cancel'),
       onConfirm: async (value) => {
         const name = (value || '').trim();
-        const problem = renameProblem(name, windowsStyle);
-        if (problem) {
-          notify.warning(tr('Nome inválido', 'Invalid name'), problem); // the dialog stays open to fix it
-          return;
-        }
-        if (name === oldName) {
+        const check = await checkRenameName(rs, name);
+        if (check === 'invalid') return; // the dialog stays open to fix it
+        if (check === 'unchanged') {
           setInputDialog(null);
           return;
         }
-        const target = joinPath(dir, name);
-
-        // Never replace another item: local and S3 renames would overwrite it silently.
-        // A case-only change ("readme" -> "README") is the same item on case-insensitive disks.
-        if (name.toLowerCase() !== oldName.toLowerCase()) {
-          let exists = (directoryCache.get(sid, dir) ?? []).some((f) => f.name === name);
-          if (!exists) {
-            try {
-              const meta = await invokeTauri<FileEntry>('get_file_properties', { sessionId: sid, path: target });
-              exists = !!meta && typeof meta.name === 'string' && meta.name !== '';
-            } catch (_e) {
-              // not found: the name is free
-            }
-          }
-          if (exists) {
-            notify.warning(tr('Já existe um item com esse nome', 'An item with that name already exists'), `${name}\n${tr('Escolha outro nome.', 'Choose another name.')}`);
-            return;
-          }
-        }
-
-        try {
-          await invokeTauri('rename_item', { sessionId: sid, from: file.path, to: target });
-        } catch (e) {
-          setInputDialog(null);
-          notify.error(tr('Não foi possível renomear', 'Could not rename'), e);
-          return;
-        }
-        setInputDialog(null);
-        // Paths below the old name are gone: drop them from the cache and the clipboard
-        directoryCache.invalidateTree(sid, file.path);
-        setClipboard((c) =>
-          c && c.sourceSession === sid && c.paths.some((p) => samePath(p, file.path) || isInside(p, file.path)) ? null : c
-        );
-        await refreshSession(sid, [dir]);
-        // Keep the renamed item selected in the pane(s) showing that folder
-        const renamed = (directoryCache.get(sid, dir) ?? []).find((f) => f.name === name)?.path;
-        if (renamed) {
-          for (const p of PANES) {
-            const api = panes[p];
-            if (api.activeRef.current === sid && samePath(api.pathRef.current, dir)) api.setSelected([renamed]);
-          }
-        }
+        await applyRename(rs, name, check.target, () => setInputDialog(null));
       },
     });
 
@@ -1790,6 +1853,15 @@ export const App: React.FC = () => {
     setRemoteTrashEnabled(enabled);
     try {
       localStorage.setItem('rustscp_remote_trash_enabled', enabled ? 'true' : 'false');
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleTogglePreferExternalEditor = (enabled: boolean) => {
+    setPreferExternalEditor(enabled);
+    try {
+      localStorage.setItem('rustscp_prefer_external_editor', String(enabled));
     } catch {
       // ignore
     }
@@ -1886,6 +1958,21 @@ export const App: React.FC = () => {
   // ---------------------------------------------------------------------------------------------
   // Transfers
   // ---------------------------------------------------------------------------------------------
+  /** Same session: `src` dropped into `destDir` would land on itself or inside itself. */
+  const isSelfTransfer = (src: string, destDir: string) => {
+    const dst = joinPath(destDir, basename(src));
+    return samePath(src, dst) || samePath(src, destDir) || isInside(destDir, src);
+  };
+
+  const notifySkippedSelf = (skipped: number) =>
+    notify.info(
+      tr(`${skipped} item(ns) ignorado(s)`, `Skipped ${skipped} item(s)`),
+      tr(
+        'O destino é a própria origem (ou fica dentro dela). Para copiar na mesma pasta, use Duplicar.',
+        'The destination is the source itself (or inside it). To copy within the same folder, use Duplicate.'
+      )
+    );
+
   /**
    * Queues copies/moves of `paths` into `destDir`. Items whose destination is the source itself
    * (same session and same folder) or lies inside the source folder are skipped: the worker would
@@ -1898,7 +1985,7 @@ export const App: React.FC = () => {
     const failures: string[] = [];
     for (const src of paths) {
       const dst = joinPath(destDir, basename(src));
-      if (sourceSession === destSession && (samePath(src, dst) || samePath(src, destDir) || isInside(destDir, src))) {
+      if (sourceSession === destSession && isSelfTransfer(src, destDir)) {
         skipped++;
         continue;
       }
@@ -1915,15 +2002,7 @@ export const App: React.FC = () => {
         failures.push(`${basename(src)}: ${errText(e)}`);
       }
     }
-    if (skipped > 0) {
-      notify.info(
-        tr(`${skipped} item(ns) ignorado(s)`, `Skipped ${skipped} item(s)`),
-        tr(
-          'O destino é a própria origem (ou fica dentro dela). Para copiar na mesma pasta, use Duplicar.',
-          'The destination is the source itself (or inside it). To copy within the same folder, use Duplicate.'
-        )
-      );
-    }
+    if (skipped > 0) notifySkippedSelf(skipped);
     if (failures.length > 0) {
       notify.error(tr('Algumas transferências não foram enfileiradas', 'Some transfers could not be queued'), failures.slice(0, 6).join('\n'));
     }
@@ -1932,9 +2011,66 @@ export const App: React.FC = () => {
   };
 
   /**
+   * Move inside one session through `move_items`: renames, instant, no data copied. Same guards as
+   * the queue (never onto or into itself). `move_items` never replaces anything, so names that
+   * already exist in `destDir` (the user confirmed Replace in the pane or for F6 first) keep the
+   * queue's replace semantics, and so do items on another disk. Returns how many items were moved
+   * or queued.
+   */
+  const moveWithinSession = async (sid: string, paths: string[], destDir: string): Promise<number> => {
+    if (!sid || !paths || paths.length === 0 || !destDir) return 0;
+    const candidates = paths.filter((src) => !isSelfTransfer(src, destDir));
+    if (candidates.length < paths.length) notifySkippedSelf(paths.length - candidates.length);
+    if (candidates.length === 0) return 0;
+
+    let existing: Set<string> | null = null;
+    try {
+      const list = await invokeTauri<FileEntry[]>('list_directory', { sessionId: sid, path: destDir, bypassCache: true });
+      existing = new Set((Array.isArray(list) ? list : []).map((f) => f.name));
+    } catch (_e) {
+      existing = null;
+    }
+    // The destination cannot be listed: the queue handles (and reports) it, as before
+    if (!existing) return enqueueTransfers(candidates, sid, sid, destDir, true);
+    const taken = existing;
+    const replacing = candidates.filter((p) => taken.has(basename(p)));
+    const renames = candidates.filter((p) => !taken.has(basename(p)));
+
+    let count = 0;
+    if (renames.length > 0) {
+      let touched = true;
+      try {
+        const moved = await invokeTauri<string[]>('move_items', { sessionId: sid, sources: renames, destDir });
+        count += Array.isArray(moved) ? moved.length : renames.length;
+      } catch (e) {
+        const msg = errText(e);
+        if (msg.startsWith('RUSTSCP_E_CROSS_DEVICE') || /\bmove_items\b.*\bnot found\b/i.test(msg)) {
+          // Another disk (a rename cannot cross it), or an older backend: copy, then delete, in the queue
+          touched = false;
+          count += await enqueueTransfers(renames, sid, sid, destDir, true);
+        } else {
+          // Nothing is ever replaced; items moved before the error stay moved (the message says how many)
+          notify.error(tr('Não foi possível mover', 'Could not move'), msg.replace(/^RUSTSCP_E_[A-Z_]+:\s*/, ''));
+        }
+      }
+      if (touched) {
+        // Moved items (and everything cached below a moved folder) left their folders
+        for (const p of renames) directoryCache.invalidateTree(sid, p);
+        setClipboard((c) =>
+          c && c.sourceSession === sid && c.paths.some((p) => renames.some((r) => samePath(p, r) || isInside(p, r))) ? null : c
+        );
+        await refreshSession(sid, [destDir, ...Array.from(new Set(renames.map((p) => dirname(p))))]);
+      }
+    }
+    if (replacing.length > 0) count += await enqueueTransfers(replacing, sid, sid, destDir, true);
+    return count;
+  };
+
+  /**
    * F5 / arrow buttons (copy) and F6 (move) from one pane into the other pane's folder. F5/F6 are
    * confirmed by the pane itself (DualPane gives it the destination label), so nothing is asked here.
-   * A move removes each source only after its copy finished (transfer queue).
+   * Between sessions a move removes each source only after its copy finished (transfer queue);
+   * inside one session it is a rename (moveWithinSession).
    */
   const handleTransferToOtherPane = (from: PaneId, isMove: boolean) => {
     const src = panes[from];
@@ -1953,14 +2089,18 @@ export const App: React.FC = () => {
       notify.info(tr('A pasta ainda está abrindo', 'The folder is still opening'), tr('Tente de novo quando a lista aparecer.', 'Try again when the list appears.'));
       return;
     }
-    const run = () =>
-      enqueueTransfers(paths, srcSid, dstSid, destDir, isMove).then((queued) => {
-        // Moved items leave the source pane: do not keep them selected
-        if (isMove && queued > 0 && src.activeRef.current === srcSid) {
-          const moved = new Set(paths);
-          src.setSelected((prev) => prev.filter((p) => !moved.has(p)));
-        }
-      });
+    const run = async () => {
+      // F6 inside one session is a rename (instant); between sessions it goes through the queue
+      const queued =
+        isMove && srcSid === dstSid
+          ? await moveWithinSession(srcSid, paths, destDir)
+          : await enqueueTransfers(paths, srcSid, dstSid, destDir, isMove);
+      // Moved items leave the source pane: do not keep them selected
+      if (isMove && queued > 0 && src.activeRef.current === srcSid) {
+        const moved = new Set(paths);
+        src.setSelected((prev) => prev.filter((p) => !moved.has(p)));
+      }
+    };
     // Never replace same-named items in the destination without asking
     const existing = new Set((directoryCache.get(dstSid, destDir) || []).map((f) => f.name));
     const collisions = paths.filter((p) => existing.has(basename(p)));
@@ -1983,9 +2123,14 @@ export const App: React.FC = () => {
     });
   };
 
-  // HTML5 drag & drop between panes / folders
+  // Drops (row drags, Finder/Explorer, session tabs) after the pane's own checks (self-target, Replace/Skip)
   const handleDropItems = async (sourceSessionId: string, paths: string[], destSessionId: string, destDir: string, isCopy: boolean) => {
     if (sessionSwitching(sourceSessionId) || sessionSwitching(destSessionId)) return;
+    // A move inside one session is a rename (instant); everything else goes through the queue
+    if (!isCopy && sourceSessionId === destSessionId) {
+      await moveWithinSession(sourceSessionId, paths, destDir);
+      return;
+    }
     await enqueueTransfers(paths, sourceSessionId, destSessionId, destDir, !isCopy);
   };
 
@@ -2000,8 +2145,13 @@ export const App: React.FC = () => {
   const handlePaste = async (destSessionId: string, destDir: string) => {
     const clip = clipboard;
     if (!clip || clip.paths.length === 0 || sessionSwitching(destSessionId)) return;
-    const queued = await enqueueTransfers(clip.paths, clip.sourceSession, destSessionId, destDir, clip.action === 'cut');
-    if (clip.action === 'cut' && queued > 0) setClipboard(null);
+    const isCut = clip.action === 'cut';
+    // Cut and paste inside one session is a rename (instant); otherwise the queue copies/moves
+    const queued =
+      isCut && clip.sourceSession === destSessionId
+        ? await moveWithinSession(destSessionId, clip.paths, destDir)
+        : await enqueueTransfers(clip.paths, clip.sourceSession, destSessionId, destDir, isCut);
+    if (isCut && queued > 0) setClipboard(null);
   };
 
   const handleDuplicate = async (sessionId: string, path: string) => {
@@ -2362,6 +2512,7 @@ export const App: React.FC = () => {
     focusPane: (pane: PaneId) => setFocusedPane(pane),
     editFile: handleEditFile,
     rename: handleRenameFile,
+    renameInline: handleRenameInline,
     showProperties: (file: FileEntry, sessionId?: string, pane?: PaneId) => {
       const sid = sessionForPane(sessionId, pane);
       if (!sessionSwitching(sid, pane)) setPropertiesTarget({ file, sessionId: sid, pane });
@@ -2552,6 +2703,7 @@ export const App: React.FC = () => {
         onFocusPane={dp.focusPane}
         onEditFile={dp.editFile}
         onRenameFile={dp.rename}
+        onRenameInline={dp.renameInline}
         onShowProperties={dp.showProperties}
         onCalculateChecksum={dp.checksum}
         onCalculateSize={dp.size}
@@ -2915,6 +3067,8 @@ export const App: React.FC = () => {
           onToggleRememberLastRemoteDir={handleToggleRememberLastRemoteDir}
           externalEditorCmd={externalEditorCmd}
           onSaveExternalEditorCmd={handleSaveExternalEditorCmd}
+          preferExternalEditor={preferExternalEditor}
+          onTogglePreferExternalEditor={handleTogglePreferExternalEditor}
           onOpenRemoteTrashModal={() => {
             setIsSettingsOpen(false);
             openTrash();

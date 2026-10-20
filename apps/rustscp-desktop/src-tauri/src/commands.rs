@@ -6,7 +6,7 @@ use rustscp_core::{
     ManagedDiskCache, Protocol, QueueTransferTask, RemoteSystemInfo, RemoteTrashItem,
     RemoteTrashStatus, S3Config, S3Driver, ScriptCommandOutput, ScriptInterpreter, SftpDriver,
     SyncEngine, SyncItem, SyncOptions, TransferQueueManager, VirtualDiskInfo, VirtualFileSystem,
-    WebDavServer,
+    WebDavServer, WinScpImportResult,
 };
 use rustscp_mcp::{
     ApprovalDecision, ApprovalRequest, AuditEvent, AuditLogger, ConnectionInfo, GatewaySettings,
@@ -1182,6 +1182,10 @@ pub async fn save_site(
     ensure_vault_writable(&state)?;
     let mut config = config;
     config.id = normalize_site_id(&config.id);
+    config.group = config
+        .group
+        .as_deref()
+        .and_then(rustscp_core::normalize_site_group);
     // The write guard serializes saves (the newest list is always the one on disk); the
     // PBKDF2 + file write run on a blocking thread, and memory is only updated once the
     // vault on disk has the new list.
@@ -1255,20 +1259,12 @@ pub async fn import_sites_vault(
 
     // Imported ids become session ids and cache directory names: re-id anything that is
     // not `[A-Za-z0-9_-]{1,64}`. A secret that is literally the marker is dropped.
-    let mut seen_ids = std::collections::HashSet::new();
-    let imported_sites: Vec<ConnectionConfig> = imported_sites
-        .into_iter()
-        .filter(|s| s.id != "local")
-        .map(|mut s| {
-            s.id = normalize_site_id(&s.id);
-            if s.id == "local" || !seen_ids.insert(s.id.clone()) {
-                s.id = normalize_site_id("");
-                seen_ids.insert(s.id.clone());
-            }
-            restore_stored_secret(&mut s, None);
-            s
-        })
-        .collect();
+    let imported_sites = normalize_imported_sites(
+        imported_sites
+            .into_iter()
+            .filter(|s| s.id != "local")
+            .collect(),
+    );
 
     let mut sites = state.saved_sites.write().await;
     let local_cfg = ConnectionConfig::local();
@@ -1302,6 +1298,288 @@ pub async fn import_sites_vault(
         .await
         .map_err(|e| e.to_string())?;
     *sites = updated;
+    Ok(redact_sites(&sites))
+}
+
+// ---------------------- WINSCP IMPORT ----------------------
+
+/// Gives imported sites ids that are valid session ids (`^[A-Za-z0-9_-]{1,64}$`), unique
+/// within the import and never `local`; drops a secret that is literally the
+/// stored-secret marker; cleans the folder path.
+fn normalize_imported_sites(sites: Vec<ConnectionConfig>) -> Vec<ConnectionConfig> {
+    let mut seen_ids = std::collections::HashSet::new();
+    sites
+        .into_iter()
+        .map(|mut s| {
+            s.id = normalize_site_id(&s.id);
+            if s.id == "local" || !seen_ids.insert(s.id.clone()) {
+                s.id = normalize_site_id("");
+                seen_ids.insert(s.id.clone());
+            }
+            restore_stored_secret(&mut s, None);
+            s.group = s
+                .group
+                .as_deref()
+                .and_then(rustscp_core::normalize_site_group);
+            s
+        })
+        .collect()
+}
+
+/// `merge_mode` of an import: `false` for "merge" (the default), `true` for "replace".
+fn parse_import_mode(merge_mode: &str) -> Result<bool, String> {
+    match merge_mode.trim() {
+        "" | "merge" => Ok(false),
+        "replace" => Ok(true),
+        other => Err(format!(
+            "Unknown import mode '{}' (expected \"merge\" or \"replace\")",
+            other.escape_default()
+        )),
+    }
+}
+
+/// Whether an imported WinSCP site is the same site as a saved one that has another id
+/// (saved before WinSCP ids were stable, or imported by the September build).
+fn same_imported_site(saved: &ConnectionConfig, imported: &ConnectionConfig) -> bool {
+    saved.id != "local"
+        && saved.name == imported.name
+        && saved.group == imported.group
+        && saved.username == imported.username
+        && comparable_host(&saved.host) == comparable_host(&imported.host)
+        && effective_port(saved) == effective_port(imported)
+}
+
+/// Whether a saved site and the imported site that updates it reach the same account on
+/// the same server over a transport at least as safe: the same user, host and port, and
+/// the same protocol (or FTP becoming FTPS). Only then may the import keep what RustSCP
+/// saved for the site. A WinSCP id comes from the session's name alone, so another file
+/// (shared, crafted, or master-password protected and so without passwords) can point a
+/// saved site at another host, or at plain FTP, where a kept password would be sent.
+fn same_winscp_endpoint(saved: &ConnectionConfig, imported: &ConnectionConfig) -> bool {
+    let protocol_kept = saved.protocol == imported.protocol
+        || (saved.protocol == Protocol::Ftp && imported.protocol == Protocol::Ftps);
+    protocol_kept
+        && saved.username == imported.username
+        && comparable_host(&saved.host) == comparable_host(&imported.host)
+        && effective_port(saved) == effective_port(imported)
+}
+
+/// Copies onto an imported site what RustSCP saved for it and the file does not carry (a
+/// password WinSCP could not give, a key passphrase, a trusted FTPS certificate). Returns
+/// whether anything was copied. Only for the same endpoint ([`same_winscp_endpoint`]).
+fn keep_saved_credentials(site: &mut ConnectionConfig, old: &ConnectionConfig) -> bool {
+    use rustscp_core::AuthMethod;
+    let mut kept = false;
+    if matches!(site.auth, AuthMethod::None) {
+        if !matches!(old.auth, AuthMethod::None) {
+            site.auth = old.auth.clone();
+            kept = true;
+        }
+    } else if let (
+        AuthMethod::PrivateKey { path, passphrase },
+        AuthMethod::PrivateKey {
+            path: old_path,
+            passphrase: old_passphrase @ Some(_),
+        },
+    ) = (&mut site.auth, &old.auth)
+    {
+        if passphrase.is_none() && path == old_path {
+            *passphrase = old_passphrase.clone();
+            kept = true;
+        }
+    }
+    if site.tls_fingerprint.is_none() && old.tls_fingerprint.is_some() {
+        site.tls_fingerprint = old.tls_fingerprint.clone();
+        kept = true;
+    }
+    kept
+}
+
+/// A WinSCP merge: the saved sites after it, and how many saved sites lost what RustSCP
+/// saved for them because the file points them at another endpoint
+/// (`endpoint_changed_sessions` of the preview).
+struct WinScpMerge {
+    sites: Vec<ConnectionConfig>,
+    endpoint_changed: usize,
+}
+
+/// Saved sites after a WinSCP import (see [`merge_winscp_sites_counted`]).
+#[cfg(test)]
+fn merge_winscp_sites(
+    saved: &[ConnectionConfig],
+    imported: Vec<ConnectionConfig>,
+    replace: bool,
+) -> Vec<ConnectionConfig> {
+    merge_winscp_sites_counted(saved, imported, replace).sites
+}
+
+/// Saved sites after a WinSCP import. "replace" keeps only the Local site (as saved)
+/// plus the imported ones. "merge" updates a saved site with the same id (or else the
+/// same name, folder, user, host and port) in place, keeping its id, and adds the rest;
+/// each saved site takes at most one imported site, so no imported site is lost. A merged
+/// site that still reaches the same endpoint keeps the credentials and trusted FTPS
+/// certificate saved in RustSCP that the file does not carry; one the file points at
+/// another host, user, port or protocol keeps none of them (and is counted).
+fn merge_winscp_sites_counted(
+    saved: &[ConnectionConfig],
+    imported: Vec<ConnectionConfig>,
+    replace: bool,
+) -> WinScpMerge {
+    let imported: Vec<ConnectionConfig> =
+        imported.into_iter().filter(|s| s.id != "local").collect();
+    if replace {
+        let local = saved
+            .iter()
+            .find(|s| s.id == "local")
+            .cloned()
+            .unwrap_or_else(ConnectionConfig::local);
+        let mut sites = vec![local];
+        sites.extend(imported);
+        return WinScpMerge {
+            sites,
+            endpoint_changed: 0,
+        };
+    }
+
+    // Matches by id first, then by what the site is, among the saved sites not taken yet.
+    let mut target: Vec<Option<usize>> = vec![None; imported.len()];
+    let mut taken = vec![false; saved.len()];
+    for (i, site) in imported.iter().enumerate() {
+        if let Some(pos) = saved.iter().position(|s| s.id == site.id) {
+            if !taken[pos] {
+                taken[pos] = true;
+                target[i] = Some(pos);
+            }
+        }
+    }
+    for (i, site) in imported.iter().enumerate() {
+        if target[i].is_some() {
+            continue;
+        }
+        if let Some(pos) =
+            (0..saved.len()).find(|&pos| !taken[pos] && same_imported_site(&saved[pos], site))
+        {
+            taken[pos] = true;
+            target[i] = Some(pos);
+        }
+    }
+
+    let mut merged = saved.to_vec();
+    let mut endpoint_changed = 0;
+    let mut taken_ids: std::collections::HashSet<String> =
+        saved.iter().map(|s| s.id.clone()).collect();
+    for (mut site, pos) in imported.into_iter().zip(target) {
+        let Some(pos) = pos else {
+            // A new site whose id a saved site already uses gets a fresh one.
+            if !taken_ids.insert(site.id.clone()) {
+                site.id = normalize_site_id("");
+                taken_ids.insert(site.id.clone());
+            }
+            merged.push(site);
+            continue;
+        };
+        let old = &saved[pos];
+        site.id = old.id.clone();
+        if same_winscp_endpoint(old, &site) {
+            keep_saved_credentials(&mut site, old);
+        } else if keep_saved_credentials(&mut site.clone(), old) {
+            // The site now names another endpoint: what RustSCP saved for the old one
+            // stays out, and the site asks for its password again.
+            endpoint_changed += 1;
+        }
+        merged[pos] = site;
+    }
+    WinScpMerge {
+        sites: merged,
+        endpoint_changed,
+    }
+}
+
+/// Reads a `WinSCP.ini` from a local path (`~` expanded) or from its text, off the async
+/// workers, with normalized ids. The sites still hold the recovered passwords.
+async fn read_winscp_import(
+    path_or_content: String,
+    is_path: bool,
+) -> Result<WinScpImportResult, String> {
+    let mut result = tokio::task::spawn_blocking(move || {
+        if is_path {
+            // An empty path would expand to the home folder.
+            if path_or_content.trim().is_empty() || path_or_content.contains('\0') {
+                return Err("Choose the WinSCP.ini file to import".to_string());
+            }
+            let path = expand_local_home(&path_or_content);
+            rustscp_core::parse_winscp_ini_file(std::path::Path::new(&path))
+        } else {
+            rustscp_core::parse_winscp_ini(&path_or_content)
+        }
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    result.sites = normalize_imported_sites(std::mem::take(&mut result.sites));
+    result.total_sessions = result.sites.len();
+    Ok(result)
+}
+
+/// The preview of an import read by [`read_winscp_import`], against the saved sites: the
+/// sites redacted, and `endpoint_changed_sessions` counted for a merge.
+fn winscp_preview(
+    mut result: WinScpImportResult,
+    saved: &[ConnectionConfig],
+) -> WinScpImportResult {
+    result.endpoint_changed_sessions =
+        merge_winscp_sites_counted(saved, result.sites.clone(), false).endpoint_changed;
+    result.sites = redact_sites(&result.sites);
+    result
+}
+
+/// Reads a `WinSCP.ini` (a local path when `is_path`, else the file's text) and returns
+/// what an import would add. Nothing is saved, and passwords never leave the backend:
+/// the sites carry the stored-secret marker (the counts say how many were recovered).
+#[tauri::command]
+pub async fn preview_winscp_ini(
+    state: tauri::State<'_, AppState>,
+    path_or_content: String,
+    is_path: bool,
+) -> Result<WinScpImportResult, String> {
+    let result = read_winscp_import(path_or_content, is_path).await?;
+    let saved = state.saved_sites.read().await;
+    Ok(winscp_preview(result, &saved))
+}
+
+/// Imports the sites of a `WinSCP.ini` into the saved sites ("merge" or "replace", see
+/// [`merge_winscp_sites`]) and returns the saved list with secrets redacted, like
+/// `get_saved_sites`. The file is read again here, so no secret ever comes from the
+/// WebView. Memory changes only after the vault on disk has the new list.
+#[tauri::command]
+pub async fn import_winscp_ini(
+    state: tauri::State<'_, AppState>,
+    path_or_content: String,
+    is_path: bool,
+    merge_mode: String,
+) -> Result<Vec<ConnectionConfig>, String> {
+    let replace = parse_import_mode(&merge_mode)?;
+    ensure_vault_writable(&state)?;
+    let result = read_winscp_import(path_or_content, is_path).await?;
+    if result.sites.is_empty() {
+        return Err("No WinSCP sites with a host name were found in this file".to_string());
+    }
+    let imported = result.sites.len();
+
+    let mut sites = state.saved_sites.write().await;
+    let merge = merge_winscp_sites_counted(&sites, result.sites, replace);
+    rustscp_core::vault::save_local_vault_async(merge.sites.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+    *sites = merge.sites;
+    tracing::info!(
+        "imported {imported} WinSCP sites ({}); {} saved sites; {} pointed at another \
+         endpoint without their saved credentials; {} tunneled or proxied without passwords",
+        if replace { "replace" } else { "merge" },
+        sites.len(),
+        merge.endpoint_changed,
+        result.tunneled_sessions
+    );
     Ok(redact_sites(&sites))
 }
 
@@ -1643,7 +1921,293 @@ pub async fn rename_item(
         .invalidate_catalog(&session_id, &from)
         .await;
     state.disk_cache.invalidate_catalog(&session_id, &to).await;
+    // Both folders' listings changed (also for local Windows paths, which
+    // `invalidate_catalog` does not split), and cached contents under either name are stale.
+    let windows = cfg!(target_os = "windows") && vfs.protocol() == Protocol::Local;
+    invalidate_parent_listing(&state, &session_id, &from, windows).await;
+    invalidate_parent_listing(&state, &session_id, &to, windows).await;
+    state
+        .disk_cache
+        .invalidate_content(&session_id, &from)
+        .await;
+    state.disk_cache.invalidate_content(&session_id, &to).await;
     Ok(())
+}
+
+// ---------------------- SAME-SESSION MOVE ----------------------
+
+/// Error code: a local move would go to another disk, where a rename cannot work
+/// (`RUSTSCP_E_CROSS_DEVICE: ...`). The UI copies through the transfer queue instead.
+const E_CROSS_DEVICE: &str = "RUSTSCP_E_CROSS_DEVICE";
+/// Error code: the destination folder already has items with these names
+/// (`RUSTSCP_E_MOVE_CONFLICT: 'a', 'b' already exist in '<folder>'; ...`).
+/// `move_items` never replaces anything.
+const E_MOVE_CONFLICT: &str = "RUSTSCP_E_MOVE_CONFLICT";
+
+/// Parent folder of `path` (`windows`: `\` separates too); `None` without a separator.
+fn path_parent(path: &str, windows: bool) -> Option<String> {
+    let is_sep = |c: char| c == '/' || (windows && c == '\\');
+    let trimmed = if path.len() > 1 {
+        path.trim_end_matches(is_sep)
+    } else {
+        path
+    };
+    match trimmed.rfind(is_sep) {
+        Some(0) => Some(trimmed[..1].to_string()),
+        Some(i) => Some(trimmed[..i].to_string()),
+        None => None,
+    }
+}
+
+/// Drops the cached listing of the folder that holds `path`. `invalidate_catalog` does
+/// that for `/` paths; this also covers local Windows paths (`C:\dir\x`).
+async fn invalidate_parent_listing(state: &AppState, session_id: &str, path: &str, windows: bool) {
+    let Some(parent) = path_parent(path, windows) else {
+        return;
+    };
+    state
+        .disk_cache
+        .invalidate_catalog(session_id, &parent)
+        .await;
+    if windows && !parent.ends_with(['/', '\\']) {
+        state
+            .disk_cache
+            .invalidate_catalog(session_id, &format!("{parent}\\"))
+            .await;
+    }
+}
+
+/// One rename of a same-session move: `from` keeps its `name` inside the destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannedMove {
+    pub from: String,
+    pub to: String,
+    pub name: String,
+}
+
+/// Checks a same-session move before anything is touched and returns the renames to do.
+/// Refused, with nothing moved: no destination, a source that is a root or has no name,
+/// a source that is already in `dest_dir` (destination = source), a folder moved into
+/// itself or below itself, and two sources with the same name.
+pub(crate) fn plan_moves(
+    sources: &[String],
+    dest_dir: &str,
+    windows: bool,
+) -> Result<Vec<PlannedMove>, String> {
+    // Paths are used exactly as listed: a folder may end in a blank.
+    let dest = dest_dir;
+    if dest.trim().is_empty() || dest.contains('\0') {
+        return Err("Choose a destination folder".to_string());
+    }
+    let is_sep = |c: char| c == '/' || (windows && c == '\\');
+    // `.` / `..` parts would make the checks below (and the existence checks before each
+    // rename) look at another path than the rename; listed paths never have them.
+    let has_dot_parts = |path: &str| path.split(is_sep).any(|part| part == "." || part == "..");
+    if has_dot_parts(dest) {
+        return Err(format!(
+            "'{}' is not a plain folder path ('.' or '..'); nothing was moved",
+            dest.escape_default()
+        ));
+    }
+    let dest_cmp = normalize_path_for_compare(dest);
+    let mut names = std::collections::HashSet::new();
+    let mut planned = Vec::with_capacity(sources.len());
+    for source in sources {
+        let trimmed = if source.len() > 1 {
+            source.trim_end_matches(is_sep)
+        } else {
+            source.as_str()
+        };
+        let name = trimmed.rsplit(is_sep).next().unwrap_or(trimmed);
+        let src_cmp = normalize_path_for_compare(trimmed);
+        if trimmed.trim().is_empty()
+            || trimmed.contains('\0')
+            || name.is_empty()
+            || has_dot_parts(trimmed)
+            || src_cmp.is_empty()
+            || src_cmp == "/"
+        {
+            return Err(format!(
+                "'{}' cannot be moved; nothing was moved",
+                source.escape_default()
+            ));
+        }
+        if dest_cmp == src_cmp || dest_cmp.starts_with(&format!("{src_cmp}/")) {
+            return Err(format!(
+                "A folder cannot be moved into itself ('{dest}' is inside '{trimmed}'); nothing \
+                 was moved"
+            ));
+        }
+        let parent_cmp = path_parent(trimmed, windows)
+            .map(|p| normalize_path_for_compare(&p))
+            .unwrap_or_default();
+        if parent_cmp == dest_cmp {
+            return Err(format!(
+                "'{name}' is already in '{dest}' (destination = source); nothing was moved"
+            ));
+        }
+        if !names.insert(name.to_string()) {
+            return Err(format!(
+                "Two of the selected items are named '{name}'; nothing was moved"
+            ));
+        }
+        planned.push(PlannedMove {
+            from: trimmed.to_string(),
+            to: join_dir_name(dest, name),
+            name: name.to_string(),
+        });
+    }
+    Ok(planned)
+}
+
+/// Whether something already has the name `path`. Local paths use `lstat`, so a dangling
+/// symlink counts too (a rename would silently replace it).
+async fn destination_taken(vfs: &Arc<dyn VirtualFileSystem>, path: &str) -> Result<bool, String> {
+    if vfs.protocol() == Protocol::Local {
+        return match tokio::fs::symlink_metadata(path).await {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(format!("Could not check '{path}': {e}")),
+        };
+    }
+    vfs.exists(path)
+        .await
+        .map_err(|e| format!("Could not check '{path}': {e}"))
+}
+
+fn move_conflict(names: &[&str], dest: &str) -> String {
+    let list = names
+        .iter()
+        .map(|n| format!("'{n}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let verb = if names.len() == 1 { "exists" } else { "exist" };
+    format!("{E_MOVE_CONFLICT}: {list} already {verb} in '{dest}'; nothing was replaced")
+}
+
+/// `true` when both local paths are on the same disk (`None` when that cannot be told).
+#[cfg(unix)]
+async fn same_local_device(a: &str, b: &str) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let da = tokio::fs::symlink_metadata(a).await.ok()?.dev();
+    let db = tokio::fs::metadata(b).await.ok()?.dev();
+    Some(da == db)
+}
+
+#[cfg(not(unix))]
+async fn same_local_device(_a: &str, _b: &str) -> Option<bool> {
+    None
+}
+
+/// Message for a failed rename of `from`; starts with [`E_CROSS_DEVICE`] when the item is
+/// on another disk than the destination (the UI then copies it through the queue).
+fn rename_error(from: &str, e: rustscp_core::CoreError) -> String {
+    match &e {
+        rustscp_core::CoreError::Io(io) if io.kind() == std::io::ErrorKind::CrossesDevices => {
+            format!("{E_CROSS_DEVICE}: could not move '{from}' to another disk: {e}")
+        }
+        _ => format!("Could not move '{from}': {e}"),
+    }
+}
+
+/// Runs the planned renames in order and never over an existing item. Returns how many
+/// were done, plus the error that stopped the rest.
+async fn run_moves(
+    vfs: &Arc<dyn VirtualFileSystem>,
+    planned: &[PlannedMove],
+    dest: &str,
+) -> (usize, Option<String>) {
+    if let Ok(meta) = vfs.metadata(dest).await {
+        if meta.is_file() {
+            return (0, Some(format!("'{dest}' is a file, not a folder")));
+        }
+    }
+    // All names are checked first, so a conflict normally moves nothing at all.
+    let mut taken = Vec::new();
+    for m in planned {
+        match destination_taken(vfs, &m.to).await {
+            Ok(true) => taken.push(m.name.as_str()),
+            Ok(false) => {}
+            Err(e) => return (0, Some(e)),
+        }
+    }
+    if !taken.is_empty() {
+        return (0, Some(move_conflict(&taken, dest)));
+    }
+    if vfs.protocol() == Protocol::Local {
+        for m in planned {
+            if same_local_device(&m.from, dest).await == Some(false) {
+                return (
+                    0,
+                    Some(format!(
+                        "{E_CROSS_DEVICE}: '{}' is on another disk than '{dest}'",
+                        m.from
+                    )),
+                );
+            }
+        }
+    }
+    for (done, m) in planned.iter().enumerate() {
+        // Checked again right before each rename: another program may have created the
+        // name, or an earlier move took it on a case-insensitive disk.
+        match destination_taken(vfs, &m.to).await {
+            Ok(false) => {}
+            Ok(true) => return (done, Some(move_conflict(&[m.name.as_str()], dest))),
+            Err(e) => return (done, Some(e)),
+        }
+        if let Err(e) = vfs.rename(&m.from, &m.to).await {
+            return (done, Some(rename_error(&m.from, e)));
+        }
+    }
+    (planned.len(), None)
+}
+
+/// Moves `sources` into `dest_dir` inside one session with renames (instant, no data
+/// copied) and returns the new paths. Never replaces an existing item, never moves a
+/// folder into itself; see [`plan_moves`]. Codes: [`E_MOVE_CONFLICT`] for names already
+/// in the destination, [`E_CROSS_DEVICE`] for local items on another disk (nothing
+/// moved: use the transfer queue). Items moved before an error stay moved and the error
+/// says how many.
+#[tauri::command]
+pub async fn move_items(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    sources: Vec<String>,
+    dest_dir: String,
+) -> Result<Vec<String>, String> {
+    if sources.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The registry lock is released here: the renames below never hold it.
+    let vfs = get_vfs(&state, &session_id).await?;
+    let windows = cfg!(target_os = "windows") && vfs.protocol() == Protocol::Local;
+    let planned = plan_moves(&sources, &dest_dir, windows)?;
+    let dest = dest_dir.as_str();
+    let (done, error) = run_moves(&vfs, &planned, dest).await;
+
+    // The failed item may be half-moved (S3 copies, then deletes): refresh it too.
+    let touched = done + usize::from(error.is_some() && done < planned.len());
+    for m in &planned[..touched] {
+        for path in [&m.from, &m.to] {
+            state.disk_cache.invalidate_catalog(&session_id, path).await;
+            state.disk_cache.invalidate_content(&session_id, path).await;
+            invalidate_parent_listing(&state, &session_id, path, windows).await;
+        }
+    }
+    if touched > 0 {
+        state.disk_cache.invalidate_catalog(&session_id, dest).await;
+    }
+
+    match error {
+        None => Ok(planned.into_iter().map(|m| m.to).collect()),
+        Some(e) if done == 0 => Err(e),
+        // Without the cross-device code: the UI would copy the items already moved again.
+        Some(e) => Err(format!(
+            "{} ({done} of {} items were moved)",
+            e.strip_prefix(&format!("{E_CROSS_DEVICE}: ")).unwrap_or(&e),
+            planned.len()
+        )),
+    }
 }
 
 #[tauri::command]
@@ -5986,6 +6550,7 @@ mod security_tests {
             auth,
             remote_root: "/".to_string(),
             tls_fingerprint: None,
+            group: None,
         }
     }
 
@@ -7776,6 +8341,7 @@ mod correctness_tests {
             auth: rustscp_core::AuthMethod::None,
             remote_root: "/".to_string(),
             tls_fingerprint: None,
+            group: None,
         };
         let a = sftp("Example.com", 22, "deploy");
         assert!(same_file_tree(&a, &sftp(" example.com ", 0, "deploy")));
@@ -7966,5 +8532,623 @@ mod correctness_tests {
         apply_continuous_sync_event(&vfs, &removal("never-existed.txt"), &root, true)
             .await
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod winscp_and_move_tests {
+    use super::*;
+    use rustscp_core::AuthMethod;
+
+    /// WinSCP's password obfuscation (EncryptPassword in Security.cpp) without the
+    /// random shift and padding, for test files.
+    fn winscp_obfuscate(host: &str, user: &str, password: &str) -> String {
+        let data = format!("{user}{host}{password}");
+        [0xFFu8, 0x00, data.len() as u8, 0x00]
+            .into_iter()
+            .chain(data.bytes())
+            .map(|ch| format!("{:02X}", (!ch) ^ 0xA3))
+            .collect()
+    }
+
+    fn sample_ini() -> String {
+        format!(
+            "[Sessions\\Production/Web/web%20one]\r\n\
+             HostName=web1.example.com\r\nUserName=deploy\r\nPassword={}\r\n\
+             [Sessions\\Production/db]\r\n\
+             HostName=db.example.com\r\nUserName=postgres\r\nPublicKeyFile=~%5C.ssh%5Cid_ed25519\r\n\
+             [Sessions\\loose]\r\n\
+             HostName=ftp.example.com\r\nFSProtocol=5\r\nUserName=ftp\r\nPassword={}\r\n",
+            winscp_obfuscate("web1.example.com", "deploy", "WebSecret#1"),
+            winscp_obfuscate("ftp.example.com", "ftp", "FtpSecret#2"),
+        )
+    }
+
+    fn saved(id: &str, name: &str, host: &str, auth: AuthMethod) -> ConnectionConfig {
+        ConnectionConfig {
+            id: id.to_string(),
+            name: name.to_string(),
+            protocol: Protocol::Sftp,
+            host: host.to_string(),
+            port: 22,
+            username: "deploy".to_string(),
+            auth,
+            remote_root: "/".to_string(),
+            tls_fingerprint: None,
+            group: None,
+        }
+    }
+
+    /// `preview_winscp_ini` without saved sites.
+    async fn preview(path_or_content: String, is_path: bool) -> Result<WinScpImportResult, String> {
+        Ok(winscp_preview(
+            read_winscp_import(path_or_content, is_path).await?,
+            &[],
+        ))
+    }
+
+    /// Saved sites after importing `ini` (merge) into `saved`, as `import_winscp_ini` does.
+    async fn import_into(saved: &[ConnectionConfig], ini: &str) -> Vec<ConnectionConfig> {
+        let imported = read_winscp_import(ini.to_string(), false).await.unwrap();
+        merge_winscp_sites(saved, imported.sites, false)
+    }
+
+    #[tokio::test]
+    async fn merge_never_moves_a_saved_password_to_another_endpoint() {
+        // 1st import: the person's own WinSCP.ini.
+        let own = format!(
+            "[Sessions\\Prod/web]\nHostName=web.corp.example\nUserName=deploy\nPassword={}\n",
+            winscp_obfuscate("web.corp.example", "deploy", "CorpSecret!")
+        );
+        let mut saved = import_into(&[ConnectionConfig::local()], &own).await;
+        assert_eq!(saved.len(), 2);
+        assert!(matches!(&saved[1].auth, AuthMethod::Password(p) if p == "CorpSecret!"));
+        saved[1].tls_fingerprint = Some("ab:cd".to_string());
+
+        // 2nd import: another file (shared, crafted, or master-password protected) with the
+        // same session name, another host over plain FTP, and no password.
+        let other = "[Sessions\\Prod/web]\nHostName=collector.attacker.example\n\
+                     UserName=deploy\nFSProtocol=5\n";
+        let imported = read_winscp_import(other.to_string(), false).await.unwrap();
+        let preview = winscp_preview(imported.clone(), &saved);
+        assert_eq!(preview.endpoint_changed_sessions, 1);
+        assert_eq!(preview.decrypted_passwords, 0);
+        let merge = merge_winscp_sites_counted(&saved, imported.sites, false);
+        assert_eq!(merge.endpoint_changed, 1);
+        let site = &merge.sites[1];
+        assert_eq!(site.id, saved[1].id, "updated in place");
+        assert_eq!(site.host, "collector.attacker.example");
+        assert_eq!(site.protocol, Protocol::Ftp);
+        assert!(matches!(site.auth, AuthMethod::None), "{:?}", site.auth);
+        assert_eq!(site.tls_fingerprint, None);
+        let json = serde_json::to_string(&merge.sites).unwrap();
+        assert!(!json.contains("CorpSecret!"));
+
+        // Importing the own file again (same endpoint) still keeps a trusted certificate.
+        let again = merge_winscp_sites_counted(
+            &saved,
+            read_winscp_import(own, false).await.unwrap().sites,
+            false,
+        );
+        assert_eq!(again.endpoint_changed, 0);
+        assert_eq!(again.sites[1].tls_fingerprint.as_deref(), Some("ab:cd"));
+    }
+
+    #[test]
+    fn saved_credentials_stay_only_on_the_same_endpoint() {
+        let mut base = saved("site", "s", "Files.Example.com", AuthMethod::None);
+        base.auth = AuthMethod::Password("typed in RustSCP".to_string());
+        base.tls_fingerprint = Some("ab:cd".to_string());
+        let keyed = |path: &str, passphrase: Option<&str>| AuthMethod::PrivateKey {
+            path: path.to_string(),
+            passphrase: passphrase.map(str::to_string),
+        };
+        let with = |f: &dyn Fn(&mut ConnectionConfig)| {
+            let mut s = base.clone();
+            s.auth = AuthMethod::None;
+            s.tls_fingerprint = None;
+            f(&mut s);
+            s
+        };
+        let kept = |old: &ConnectionConfig, imported: ConnectionConfig| {
+            let merge =
+                merge_winscp_sites_counted(std::slice::from_ref(old), vec![imported], false);
+            (merge.sites[0].clone(), merge.endpoint_changed)
+        };
+
+        // Same endpoint (host case and port 0 = default do not matter): everything stays.
+        for same in [
+            with(&|_| {}),
+            with(&|s| s.host = " files.example.com ".to_string()),
+            with(&|s| s.port = 0),
+        ] {
+            let (site, changed) = kept(&base, same);
+            assert!(matches!(&site.auth, AuthMethod::Password(p) if p == "typed in RustSCP"));
+            assert_eq!(site.tls_fingerprint.as_deref(), Some("ab:cd"));
+            assert_eq!(changed, 0);
+        }
+        // FTP becoming FTPS keeps the password; FTPS or SFTP becoming FTP never does.
+        let mut ftp = base.clone();
+        ftp.protocol = Protocol::Ftp;
+        ftp.port = 21;
+        let (site, _) = kept(
+            &ftp,
+            with(&|s| {
+                s.protocol = Protocol::Ftps;
+                s.port = 21;
+            }),
+        );
+        assert!(matches!(site.auth, AuthMethod::Password(_)));
+        let mut ftps = ftp.clone();
+        ftps.protocol = Protocol::Ftps;
+        for (old, imported) in [
+            (
+                ftps.clone(),
+                with(&|s| {
+                    s.protocol = Protocol::Ftp;
+                    s.port = 21;
+                }),
+            ),
+            (
+                base.clone(),
+                with(&|s| {
+                    s.protocol = Protocol::Ftp;
+                    s.port = 22;
+                }),
+            ),
+            (
+                base.clone(),
+                with(&|s| s.host = "other.example.com".to_string()),
+            ),
+            (base.clone(), with(&|s| s.username = "root".to_string())),
+            (base.clone(), with(&|s| s.port = 2222)),
+        ] {
+            let (site, changed) = kept(&old, imported);
+            assert!(matches!(site.auth, AuthMethod::None), "{:?}", site.auth);
+            assert_eq!(site.tls_fingerprint, None);
+            assert_eq!(changed, 1);
+        }
+
+        // A key passphrase follows the same rule.
+        let mut key_site = base.clone();
+        key_site.auth = keyed("~/.ssh/id", Some("phrase"));
+        key_site.tls_fingerprint = None;
+        let (site, changed) = kept(&key_site, with(&|s| s.auth = keyed("~/.ssh/id", None)));
+        assert!(matches!(
+            &site.auth,
+            AuthMethod::PrivateKey { passphrase: Some(p), .. } if p == "phrase"
+        ));
+        assert_eq!(changed, 0);
+        let (site, changed) = kept(
+            &key_site,
+            with(&|s| {
+                s.auth = keyed("~/.ssh/id", None);
+                s.host = "other.example.com".to_string();
+            }),
+        );
+        assert!(matches!(
+            &site.auth,
+            AuthMethod::PrivateKey {
+                passphrase: None,
+                ..
+            }
+        ));
+        assert_eq!(changed, 1);
+        // Nothing saved to keep: nothing to report.
+        let bare = with(&|_| {});
+        let (_, changed) = kept(&bare, with(&|s| s.host = "other.example.com".to_string()));
+        assert_eq!(changed, 0);
+    }
+
+    #[tokio::test]
+    async fn tunneled_sessions_reach_the_preview_without_passwords() {
+        let ini = format!(
+            "[Sessions\\Internal/db]\nHostName=10.0.0.5\nUserName=root\nPassword={}\n\
+             Tunnel=1\nTunnelHostName=bastion.corp.example\n",
+            winscp_obfuscate("10.0.0.5", "root", "DbRoot#1")
+        );
+        let result = preview(ini.clone(), false).await.unwrap();
+        assert_eq!(result.tunneled_sessions, 1);
+        assert_eq!(result.decrypted_passwords, 0);
+        let full = read_winscp_import(ini, false).await.unwrap();
+        assert!(matches!(full.sites[0].auth, AuthMethod::None));
+    }
+
+    #[tokio::test]
+    async fn preview_redacts_every_secret_and_saves_nothing() {
+        let result = preview(sample_ini(), false).await.unwrap();
+        assert_eq!(result.total_sessions, 3);
+        assert_eq!(result.decrypted_passwords, 2);
+        assert_eq!(result.key_auth_sessions, 1);
+        assert_eq!(result.folders, vec!["Production", "Production/Web"]);
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(
+            !json.contains("WebSecret#1") && !json.contains("FtpSecret#2"),
+            "{json}"
+        );
+        assert!(matches!(
+            &result.sites[0].auth,
+            AuthMethod::Password(p) if p == STORED_SECRET_MARKER
+        ));
+        assert!(matches!(
+            &result.sites[1].auth,
+            AuthMethod::PrivateKey { path, passphrase: None } if path == "~/.ssh/id_ed25519"
+        ));
+        assert_eq!(result.sites[0].group.as_deref(), Some("Production/Web"));
+        for site in &result.sites {
+            assert!(is_valid_session_id(&site.id), "{}", site.id);
+        }
+
+        // The unredacted read (what import saves) has the real passwords.
+        let full = read_winscp_import(sample_ini(), false).await.unwrap();
+        assert!(matches!(&full.sites[2].auth, AuthMethod::Password(p) if p == "FtpSecret#2"));
+    }
+
+    #[tokio::test]
+    async fn preview_reads_paths_and_reports_bad_input() {
+        let dir =
+            std::env::temp_dir().join(format!("rustscp-winscp-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ini = dir.join("WinSCP.ini");
+        std::fs::write(&ini, sample_ini()).unwrap();
+        let by_path = preview(ini.to_string_lossy().to_string(), true)
+            .await
+            .unwrap();
+        assert_eq!(by_path.total_sessions, 3);
+        assert!(!serde_json::to_string(&by_path)
+            .unwrap()
+            .contains("WebSecret#1"));
+
+        assert!(
+            preview(dir.join("nope.ini").to_string_lossy().to_string(), true)
+                .await
+                .is_err()
+        );
+        for empty in ["", "   "] {
+            let err = preview(empty.to_string(), true).await.unwrap_err();
+            assert!(err.contains("Choose the WinSCP.ini"), "{err}");
+        }
+        assert!(preview(dir.to_string_lossy().to_string(), true)
+            .await
+            .is_err());
+        // Text without sessions is an empty preview, not an error.
+        let empty = preview("hello".to_string(), false).await.unwrap();
+        assert_eq!(empty.total_sessions, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn imported_ids_are_normalized_and_unique() {
+        let sites = normalize_imported_sites(vec![
+            saved("../../etc", "a", "h", AuthMethod::None),
+            saved("local", "b", "h", AuthMethod::None),
+            saved("dup", "c", "h", AuthMethod::None),
+            saved("dup", "d", "h", AuthMethod::None),
+            saved("", "e", "h", AuthMethod::None),
+            saved(&"x".repeat(80), "f", "h", AuthMethod::None),
+            saved(
+                "ok",
+                "g",
+                "h",
+                AuthMethod::Password(STORED_SECRET_MARKER.to_string()),
+            ),
+        ]);
+        let ids: Vec<&str> = sites.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.iter().all(|id| is_valid_session_id(id)), "{ids:?}");
+        assert!(!ids.contains(&"local"));
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            ids.len()
+        );
+        assert_eq!(ids[2], "dup");
+        assert_eq!(ids[6], "ok");
+        // A stable id for the same invalid id (re-imports merge), a marker never saved.
+        assert_eq!(ids[0], normalize_site_id("../../etc"));
+        assert!(matches!(&sites[6].auth, AuthMethod::Password(p) if p.is_empty()));
+    }
+
+    #[test]
+    fn import_modes_are_strict() {
+        assert_eq!(parse_import_mode("merge"), Ok(false));
+        assert_eq!(parse_import_mode(""), Ok(false));
+        assert_eq!(parse_import_mode("replace"), Ok(true));
+        assert!(parse_import_mode("REPLACE ALL").is_err());
+        assert!(parse_import_mode("delete").is_err());
+    }
+
+    #[tokio::test]
+    async fn merge_updates_in_place_and_replace_keeps_local() {
+        let imported = read_winscp_import(sample_ini(), false).await.unwrap().sites;
+        let web_id = imported[0].id.clone();
+
+        let mut by_name = saved(
+            "old-db",
+            "db",
+            "DB.example.com",
+            AuthMethod::PrivateKey {
+                path: "~/.ssh/id_ed25519".to_string(),
+                passphrase: Some("kept-passphrase".to_string()),
+            },
+        );
+        by_name.username = "postgres".to_string();
+        by_name.group = Some("Production".to_string());
+        let mut by_id = saved(
+            &web_id,
+            "renamed in RustSCP",
+            "web1.example.com",
+            AuthMethod::Password("old".to_string()),
+        );
+        by_id.tls_fingerprint = Some("ab:cd".to_string());
+        let unrelated = saved("mine", "mine", "other.example.com", AuthMethod::None);
+        let existing = vec![ConnectionConfig::local(), by_id, by_name, unrelated.clone()];
+
+        let merged = merge_winscp_sites(&existing, imported.clone(), false);
+        assert_eq!(merged.len(), 5, "two updated in place, one added");
+        assert_eq!(merged[0].id, "local");
+        // Same id: replaced by the file's version (new password), FTPS trust kept.
+        assert_eq!(merged[1].id, web_id);
+        assert_eq!(merged[1].name, "web one");
+        assert!(matches!(&merged[1].auth, AuthMethod::Password(p) if p == "WebSecret#1"));
+        assert_eq!(merged[1].tls_fingerprint.as_deref(), Some("ab:cd"));
+        // Same site under another id: keeps its id and its key passphrase.
+        assert_eq!(merged[2].id, "old-db");
+        assert!(matches!(
+            &merged[2].auth,
+            AuthMethod::PrivateKey { passphrase: Some(p), .. } if p == "kept-passphrase"
+        ));
+        assert_eq!(merged[3].id, "mine");
+        assert_eq!(merged[4].name, "loose");
+
+        // Importing the same file again changes nothing.
+        let again = merge_winscp_sites(&merged, imported.clone(), false);
+        assert_eq!(again.len(), merged.len());
+
+        // A file without a password never erases one saved in RustSCP.
+        let mut no_pw = imported.clone();
+        no_pw[2].auth = AuthMethod::None;
+        let mut with_pw = merged.clone();
+        with_pw[4].auth = AuthMethod::Password("typed later".to_string());
+        let kept = merge_winscp_sites(&with_pw, no_pw, false);
+        assert!(matches!(&kept[4].auth, AuthMethod::Password(p) if p == "typed later"));
+
+        let replaced = merge_winscp_sites(&existing, imported, true);
+        assert_eq!(replaced.len(), 4);
+        assert_eq!(replaced[0].id, "local");
+        assert!(replaced.iter().all(|s| s.id != "mine" && s.id != "old-db"));
+        let redacted = serde_json::to_string(&redact_sites(&replaced)).unwrap();
+        assert!(!redacted.contains("WebSecret#1") && !redacted.contains("FtpSecret#2"));
+    }
+
+    #[test]
+    fn merge_never_folds_two_imported_sites_into_one() {
+        let mut twin_a = saved("winscp-aaaa", "web", "h.example.com", AuthMethod::None);
+        twin_a.auth = AuthMethod::Password("a".to_string());
+        let mut twin_b = twin_a.clone();
+        twin_b.id = "winscp-bbbb".to_string();
+        twin_b.auth = AuthMethod::Password("b".to_string());
+        // One saved site that looks like both (saved by the September build).
+        let old = saved("winscp-old", "web", "H.example.com", AuthMethod::None);
+        let existing = vec![ConnectionConfig::local(), old];
+
+        let merged = merge_winscp_sites(&existing, vec![twin_a, twin_b], false);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[1].id, "winscp-old");
+        assert!(matches!(&merged[1].auth, AuthMethod::Password(p) if p == "a"));
+        assert_eq!(merged[2].id, "winscp-bbbb");
+        assert!(matches!(&merged[2].auth, AuthMethod::Password(p) if p == "b"));
+
+        // A new site never takes the id of a saved one, and `local` is never imported.
+        let mut clash = saved("mine", "other", "x.example.com", AuthMethod::None);
+        clash.group = Some("Elsewhere".to_string());
+        let fake_local = saved("local", "fake", "evil.example.com", AuthMethod::None);
+        let existing = vec![
+            ConnectionConfig::local(),
+            saved("mine", "mine", "m.example.com", AuthMethod::None),
+        ];
+        let merged = merge_winscp_sites(&existing, vec![clash.clone(), fake_local], false);
+        // Same id: an update of that site, not a second site with the same id.
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[1].id, "mine");
+        assert_eq!(merged[1].group.as_deref(), Some("Elsewhere"));
+        assert!(merged.iter().all(|s| s.host != "evil.example.com"));
+    }
+
+    #[test]
+    fn replace_keeps_the_saved_local_site() {
+        let mut local = ConnectionConfig::local();
+        local.remote_root = "/Users/me/Projects".to_string();
+        let existing = vec![
+            local,
+            saved("mine", "mine", "m.example.com", AuthMethod::None),
+        ];
+        let imported = vec![saved("winscp-1", "a", "a.example.com", AuthMethod::None)];
+        let replaced = merge_winscp_sites(&existing, imported.clone(), true);
+        assert_eq!(
+            replaced.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["local", "winscp-1"]
+        );
+        assert_eq!(replaced[0].remote_root, "/Users/me/Projects");
+        // Without a saved Local site, a fresh one is added.
+        let replaced = merge_winscp_sites(&existing[1..], imported, true);
+        assert_eq!(replaced[0].id, "local");
+        assert_eq!(replaced.len(), 2);
+    }
+
+    fn paths(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn move_plans_refuse_self_moves_and_name_clashes() {
+        let plan = plan_moves(&paths(&["/a/x.txt", "/a/dir/"]), "/b", false).unwrap();
+        assert_eq!(
+            plan.iter().map(|m| m.to.as_str()).collect::<Vec<_>>(),
+            vec!["/b/x.txt", "/b/dir"]
+        );
+        assert_eq!(plan[1].from, "/a/dir");
+        assert!(plan_moves(&paths(&["/x.txt"]), "/", false)
+            .map(|_| ())
+            .unwrap_err()
+            .contains("already in"));
+        let into_root = plan_moves(&paths(&["/a/x"]), "/", false).unwrap();
+        assert_eq!(into_root[0].to, "/x");
+
+        let refused = |sources: &[&str], dest: &str| plan_moves(&paths(sources), dest, false);
+        // Destination = source folder.
+        assert!(refused(&["/a/x"], "/a").unwrap_err().contains("already in"));
+        assert!(refused(&["/a/x"], "/a/").is_err());
+        assert!(refused(&["/a/x"], "/a/./").is_err());
+        // Into itself or below itself.
+        assert!(refused(&["/a/dir"], "/a/dir")
+            .unwrap_err()
+            .contains("into itself"));
+        assert!(refused(&["/a/dir"], "/a/dir/sub/deeper").is_err());
+        assert!(refused(&["/a/dir"], "/a/dir/../dir/sub").is_err());
+        // A sibling with a common prefix is fine.
+        assert!(refused(&["/a/dir"], "/a/dir2").is_ok());
+        // Roots, empty and dot names.
+        for bad in ["/", "", "  ", "/a/..", "/a/.", "//"] {
+            assert!(refused(&[bad], "/b").is_err(), "{bad:?}");
+        }
+        assert!(refused(&["/a/x"], " ").is_err());
+        // Two items with one name would overwrite each other.
+        assert!(refused(&["/a/x", "/c/x"], "/b")
+            .unwrap_err()
+            .contains("named 'x'"));
+        // `.` / `..` anywhere would make the checks look at another path than the rename.
+        assert!(refused(&["/a/../etc/x"], "/b").is_err());
+        assert!(refused(&["/a/x"], "/b/../c")
+            .unwrap_err()
+            .contains("plain folder"));
+        // Paths are used exactly: a folder name may end in a blank.
+        let blank = plan_moves(&paths(&["/a/x"]), "/b ", false).unwrap();
+        assert_eq!(blank[0].to, "/b /x");
+        // Local Windows paths.
+        let win = plan_moves(&paths(&["C:\\data\\f.txt"]), "D:\\backup", true).unwrap();
+        assert_eq!(win[0].to, "D:\\backup/f.txt");
+        assert!(plan_moves(&paths(&["C:\\data\\f.txt"]), "C:\\data\\", true).is_err());
+        assert!(plan_moves(&paths(&["C:\\data"]), "C:\\data\\sub", true).is_err());
+    }
+
+    struct Scratch(std::path::PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("rustscp-move-{}", uuid::Uuid::new_v4().simple()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn s(&self, rel: &str) -> String {
+            self.0.join(rel).to_string_lossy().to_string()
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn moves_never_overwrite_and_report_conflicts() {
+        let t = Scratch::new();
+        for d in ["src", "dest", "src/folder"] {
+            std::fs::create_dir_all(t.0.join(d)).unwrap();
+        }
+        std::fs::write(t.0.join("src/a.txt"), b"new a").unwrap();
+        std::fs::write(t.0.join("src/b.txt"), b"b").unwrap();
+        std::fs::write(t.0.join("src/folder/inner.txt"), b"i").unwrap();
+        std::fs::write(t.0.join("dest/a.txt"), b"old a").unwrap();
+        let vfs: Arc<dyn VirtualFileSystem> = Arc::new(LocalFsDriver::new());
+
+        // A clash moves nothing and names the clash.
+        let plan = plan_moves(
+            &[t.s("src/a.txt"), t.s("src/b.txt")],
+            &t.s("dest"),
+            cfg!(windows),
+        )
+        .unwrap();
+        let (done, err) = run_moves(&vfs, &plan, &t.s("dest")).await;
+        let err = err.unwrap();
+        assert_eq!(done, 0);
+        assert!(
+            err.starts_with(E_MOVE_CONFLICT) && err.contains("'a.txt'"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(t.0.join("dest/a.txt")).unwrap(), b"old a");
+        assert!(t.0.join("src/b.txt").exists(), "nothing moved");
+
+        // A dangling symlink is a clash too.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(t.0.join("gone"), t.0.join("dest/b.txt")).unwrap();
+            let plan = plan_moves(&[t.s("src/b.txt")], &t.s("dest"), false).unwrap();
+            let (_, err) = run_moves(&vfs, &plan, &t.s("dest")).await;
+            assert!(err.unwrap().starts_with(E_MOVE_CONFLICT));
+            std::fs::remove_file(t.0.join("dest/b.txt")).unwrap();
+        }
+
+        // Without clashes files and folders move, contents intact.
+        let plan = plan_moves(
+            &[t.s("src/b.txt"), t.s("src/folder")],
+            &t.s("dest"),
+            cfg!(windows),
+        )
+        .unwrap();
+        let (done, err) = run_moves(&vfs, &plan, &t.s("dest")).await;
+        assert_eq!((done, err), (2, None));
+        assert_eq!(std::fs::read(t.0.join("dest/b.txt")).unwrap(), b"b");
+        assert_eq!(
+            std::fs::read(t.0.join("dest/folder/inner.txt")).unwrap(),
+            b"i"
+        );
+        assert!(!t.0.join("src/folder").exists());
+
+        // A file is not a destination folder.
+        let plan = plan_moves(&[t.s("src/a.txt")], &t.s("dest/b.txt"), cfg!(windows)).unwrap();
+        let (done, err) = run_moves(&vfs, &plan, &t.s("dest/b.txt")).await;
+        assert_eq!(done, 0);
+        assert!(err.unwrap().contains("not a folder"));
+        assert!(t.0.join("src/a.txt").exists());
+
+        // A missing source stops with an error and leaves the rest alone.
+        let plan = plan_moves(
+            &[t.s("src/missing.txt"), t.s("src/a.txt")],
+            &t.s("dest/folder"),
+            cfg!(windows),
+        )
+        .unwrap();
+        let (done, err) = run_moves(&vfs, &plan, &t.s("dest/folder")).await;
+        assert_eq!(done, 0);
+        assert!(err.unwrap().contains("missing.txt"));
+        assert!(t.0.join("src/a.txt").exists());
+    }
+
+    #[test]
+    fn parents_for_cache_invalidation() {
+        assert_eq!(path_parent("/a/b", false).as_deref(), Some("/a"));
+        assert_eq!(path_parent("/a/b/", false).as_deref(), Some("/a"));
+        assert_eq!(path_parent("/a", false).as_deref(), Some("/"));
+        assert_eq!(path_parent("a", false), None);
+        assert_eq!(path_parent("C:\\x\\y", true).as_deref(), Some("C:\\x"));
+        assert_eq!(path_parent("C:\\x", true).as_deref(), Some("C:"));
+        assert_eq!(path_parent("C:\\x\\y", false), None);
+    }
+
+    #[test]
+    fn rename_errors_keep_the_cross_device_code() {
+        let e =
+            rustscp_core::CoreError::Io(std::io::Error::from(std::io::ErrorKind::CrossesDevices));
+        let msg = rename_error("/a/x", e);
+        assert!(
+            msg.starts_with(E_CROSS_DEVICE) && msg.contains("'/a/x'"),
+            "{msg}"
+        );
+        let e = rustscp_core::CoreError::NotFound("x".into());
+        let msg = rename_error("/a/x", e);
+        assert!(
+            !msg.starts_with(E_CROSS_DEVICE) && msg.contains("'/a/x'"),
+            "{msg}"
+        );
     }
 }

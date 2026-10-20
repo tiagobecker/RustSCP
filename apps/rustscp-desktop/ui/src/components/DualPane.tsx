@@ -77,6 +77,11 @@ export interface DualPaneProps {
   onEditFile?: (file: FileEntry, sessionId?: string, pane?: PaneId) => void;
   /** Rename (F2 / context menu); `currentDir` is the folder the pane shows. */
   onRenameFile?: (file: FileEntry, sessionId: string, pane?: PaneId, currentDir?: string) => void;
+  /**
+   * Rename in place in the file list (F2, context menu, slow second click). Resolves false when
+   * the name must be fixed (the field stays open). `onRenameFile` stays the dialog fallback.
+   */
+  onRenameInline?: (file: FileEntry, newName: string, sessionId: string, pane?: PaneId, currentDir?: string) => Promise<boolean>;
   onShowProperties?: (file: FileEntry, sessionId?: string, pane?: PaneId) => void;
   onCalculateChecksum?: (file: FileEntry, sessionId?: string, pane?: PaneId) => void;
   onCalculateSize?: (file: FileEntry, sessionId?: string, pane?: PaneId) => void;
@@ -165,6 +170,7 @@ function usePaneHandlers(pane: PaneId, latest: LatestProps) {
       goHome: () => (L ? p().onLeftGoHome : p().onRightGoHome)?.(),
       editFile: (f: FileEntry) => p().onEditFile?.(f, sid(), pane),
       rename: (f: FileEntry) => p().onRenameFile?.(f, sid(), pane, dir()),
+      renameInline: (f: FileEntry, name: string) => p().onRenameInline?.(f, name, sid(), pane, dir()) ?? Promise.resolve(true),
       showProperties: (f: FileEntry) => p().onShowProperties?.(f, sid(), pane),
       checksum: (f: FileEntry) => p().onCalculateChecksum?.(f, sid(), pane),
       size: (f: FileEntry) => p().onCalculateSize?.(f, sid(), pane),
@@ -380,6 +386,7 @@ const DualPaneImpl: React.FC<DualPaneProps> = (props) => {
           onNewSession={onNewSession ? h.newSession : undefined}
           onEditFile={props.onEditFile ? h.editFile : undefined}
           onRename={props.onRenameFile ? h.rename : undefined}
+          onRenameInline={props.onRenameInline ? h.renameInline : undefined}
           onShowProperties={props.onShowProperties ? h.showProperties : undefined}
           onCalculateChecksum={props.onCalculateChecksum ? h.checksum : undefined}
           onCalculateSize={props.onCalculateSize ? h.size : undefined}

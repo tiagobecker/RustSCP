@@ -1094,6 +1094,16 @@ impl SftpDriver {
                 let pass = passphrase.as_deref().filter(|p| !p.is_empty());
                 sess.userauth_pubkey_file(user, None, &key_path, pass)
                     .map_err(|e| {
+                        // Sites imported from WinSCP usually point at PuTTY keys.
+                        if crate::winscp::is_putty_private_key(&key_path) {
+                            return CoreError::AuthFailed(format!(
+                                "Private key authentication failed: {} is a PuTTY (.ppk) key, \
+                                 which RustSCP cannot read. Convert it in PuTTYgen \
+                                 (Conversions > Export OpenSSH key) and choose the converted \
+                                 file for this site",
+                                key_path.display()
+                            ));
+                        }
                         CoreError::AuthFailed(format!("Private key authentication failed: {}", e))
                     })?;
             }
@@ -2497,6 +2507,7 @@ mod tests {
             },
             remote_root: "/".into(),
             tls_fingerprint: None,
+            group: None,
         };
 
         // Trust on first use, then known.
@@ -2758,6 +2769,7 @@ mod tests {
             auth: AuthMethod::Password("hunter2".into()),
             remote_root: "/".into(),
             tls_fingerprint: None,
+            group: None,
         };
         let dbg = format!("{:?}", SftpDriver::new(cfg));
         assert!(!dbg.contains("hunter2"), "{dbg}");

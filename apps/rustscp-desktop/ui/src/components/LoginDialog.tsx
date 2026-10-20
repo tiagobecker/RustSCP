@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Server,
   Cloud,
@@ -8,7 +8,12 @@ import {
   EyeOff,
   Check,
   Plus,
+  Folder,
   FolderOpen,
+  FolderInput,
+  ChevronRight,
+  ChevronsDownUp,
+  ChevronsUpDown,
   AlertCircle,
   Search,
   ArrowDownUp,
@@ -17,7 +22,7 @@ import {
   X,
 } from 'lucide-react';
 import { ConnectionConfig, Protocol } from '../types.ts';
-import { VaultModal } from './VaultModal.tsx';
+import { VaultModal, VaultTab } from './VaultModal.tsx';
 import { invoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
 import { Modal } from './ui/Modal.tsx';
@@ -59,6 +64,227 @@ const ProtocolIcon: React.FC<{ protocol: Protocol; className?: string }> = ({ pr
   return <Server className={className} />;
 };
 
+/* -------------------------------------------------------------------------- */
+/* Site folders                                                                */
+/* -------------------------------------------------------------------------- */
+
+/** Folder paths are '/'-separated; blank segments and the spaces around them are dropped. */
+const normalizeGroup = (raw?: string | null): string =>
+  (raw ?? '')
+    .split('/')
+    .map((segment) => segment.trim())
+    .filter(Boolean)
+    .join('/');
+
+const naturalCompare = (a: string, b: string) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+
+/** Folder path plus every parent path ("A/B/C" → "A", "A/B", "A/B/C"). */
+const folderChain = (group: string): string[] => {
+  const parts = group ? group.split('/') : [];
+  return parts.map((_, i) => parts.slice(0, i + 1).join('/'));
+};
+
+interface FolderNode {
+  name: string;
+  path: string;
+  folders: FolderNode[];
+  sites: ConnectionConfig[];
+  /** Sites in this folder and all of its subfolders */
+  count: number;
+}
+
+/** Builds the folder tree (sorted, Local pinned first at the top level). Maps keep folder names away from object prototypes. */
+const buildSiteTree = (sites: ConnectionConfig[]): FolderNode => {
+  const root: FolderNode = { name: '', path: '', folders: [], sites: [], count: 0 };
+  const byPath = new Map<string, FolderNode>([['', root]]);
+  for (const site of sites) {
+    let node = root;
+    const group = site.id === 'local' ? '' : normalizeGroup(site.group);
+    for (const path of folderChain(group)) {
+      let child = byPath.get(path);
+      if (!child) {
+        child = { name: path.slice(path.lastIndexOf('/') + 1), path, folders: [], sites: [], count: 0 };
+        byPath.set(path, child);
+        node.folders.push(child);
+      }
+      node = child;
+    }
+    node.sites.push(site);
+  }
+  const finish = (node: FolderNode): number => {
+    node.folders.sort((a, b) => naturalCompare(a.name, b.name));
+    node.sites.sort((a, b) => {
+      if (a.id === 'local') return -1;
+      if (b.id === 'local') return 1;
+      return naturalCompare(a.name, b.name) || naturalCompare(a.host, b.host);
+    });
+    node.count = node.sites.length + node.folders.reduce((n, f) => n + finish(f), 0);
+    return node.count;
+  };
+  finish(root);
+  return root;
+};
+
+const collectFolderPaths = (node: FolderNode, out: string[] = []): string[] => {
+  for (const f of node.folders) {
+    out.push(f.path);
+    collectFolderPaths(f, out);
+  }
+  return out;
+};
+
+type TreeRow = { kind: 'folder'; node: FolderNode; depth: number; expanded: boolean } | { kind: 'site'; site: ConnectionConfig; depth: number };
+
+/** Per-viewer list of collapsed folder paths. A convenience only: the list works without it. */
+const COLLAPSED_FOLDERS_KEY = 'rustscp_site_folders_collapsed';
+const MAX_REMEMBERED_FOLDERS = 2000;
+
+const loadCollapsedFolders = (): Set<string> => {
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(COLLAPSED_FOLDERS_KEY) || '[]');
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter((p): p is string => typeof p === 'string' && p.length > 0 && p.length <= 1024).slice(0, MAX_REMEMBERED_FOLDERS));
+  } catch {
+    return new Set();
+  }
+};
+
+const saveCollapsedFolders = (paths: Set<string>) => {
+  try {
+    localStorage.setItem(COLLAPSED_FOLDERS_KEY, JSON.stringify([...paths].slice(-MAX_REMEMBERED_FOLDERS)));
+  } catch {
+    /* storage unavailable (private window, blocked site data): the state just is not remembered */
+  }
+};
+
+/** Max folder suggestions listed under the Folder field */
+const MAX_FOLDER_SUGGESTIONS = 50;
+
+/** Folder text field with suggestions from the folders already in use (a small ARIA combobox). */
+const FolderField: React.FC<{
+  id: string;
+  value: string;
+  onChange: (value: string) => void;
+  folders: string[];
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  placeholder: string;
+  listLabel: string;
+}> = ({ id, value, onChange, folders, open, onOpenChange, placeholder, listLabel }) => {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [active, setActive] = useState(-1);
+  const [dropUp, setDropUp] = useState(false);
+  const listId = `${id}-folders`;
+
+  // A field that goes away (Advanced collapsed, Local selected) must not leave the list marked open
+  useEffect(() => () => onOpenChange(false), [onOpenChange]);
+
+  const matches = useMemo(() => {
+    const q = normalizeGroup(value).toLowerCase();
+    if (!q) return folders.slice(0, MAX_FOLDER_SUGGESTIONS);
+    const starts: string[] = [];
+    const contains: string[] = [];
+    for (const f of folders) {
+      const lower = f.toLowerCase();
+      if (lower === q) continue;
+      if (lower.startsWith(q)) starts.push(f);
+      else if (lower.includes(q)) contains.push(f);
+    }
+    return [...starts, ...contains].slice(0, MAX_FOLDER_SUGGESTIONS);
+  }, [folders, value]);
+
+  const show = open && matches.length > 0;
+
+  // Nothing to suggest: drop the open flag so Escape is not spent closing an invisible list
+  useEffect(() => {
+    if (open && matches.length === 0) onOpenChange(false);
+  }, [open, matches.length, onOpenChange]);
+
+  const openList = () => {
+    // Open upwards when the scrolling form has little room below the field
+    const input = inputRef.current;
+    const scroller = input?.closest<HTMLElement>('[data-form-scroll]');
+    if (input && scroller) {
+      const r = input.getBoundingClientRect();
+      const s = scroller.getBoundingClientRect();
+      const below = s.bottom - r.bottom;
+      setDropUp(below < 200 && r.top - s.top > below);
+    }
+    setActive(-1);
+    onOpenChange(true);
+  };
+
+  const pick = (folder: string) => {
+    onChange(folder);
+    setActive(-1);
+    onOpenChange(false);
+  };
+
+  return (
+    <div className="relative">
+      <TextInput
+        id={id}
+        ref={inputRef}
+        value={value}
+        maxLength={512}
+        role="combobox"
+        aria-expanded={show}
+        aria-controls={show ? listId : undefined}
+        aria-autocomplete="list"
+        aria-activedescendant={show && active >= 0 ? `${listId}-${active}` : undefined}
+        placeholder={placeholder}
+        onFocus={openList}
+        onBlur={() => onOpenChange(false)}
+        onChange={(e) => {
+          onChange(e.target.value);
+          setActive(-1);
+          if (!open) openList();
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            if (!show) openList();
+            else setActive((i) => (i + 1) % matches.length);
+          } else if (e.key === 'ArrowUp' && show) {
+            e.preventDefault();
+            setActive((i) => (i <= 0 ? matches.length - 1 : i - 1));
+          } else if (e.key === 'Enter' && show && active >= 0 && active < matches.length) {
+            // Picks the suggestion instead of submitting the form (Enter connects)
+            e.preventDefault();
+            e.stopPropagation();
+            pick(matches[active]);
+          }
+        }}
+      />
+      {show && (
+        <div
+          id={listId}
+          role="listbox"
+          aria-label={listLabel}
+          className={`absolute left-0 right-0 z-20 ui-menu max-h-48 overflow-y-auto animate-pop ${dropUp ? 'bottom-full mb-1' : 'top-full mt-1'}`}
+        >
+          {matches.map((folder, i) => (
+            <div
+              key={folder}
+              id={`${listId}-${i}`}
+              role="option"
+              aria-selected={i === active}
+              onMouseDown={(e) => e.preventDefault()}
+              onMouseEnter={() => setActive(i)}
+              onClick={() => pick(folder)}
+              className={`ui-menu-item h-7 cursor-pointer text-[12.5px] ${i === active ? 'bg-dark-650/70' : ''}`}
+              title={folder}
+            >
+              <Folder className="w-3.5 h-3.5 shrink-0 text-ink-faint" />
+              <span className="truncate">{folder}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
 export const LoginDialog: React.FC<LoginDialogProps> = ({
   isOpen,
   onClose,
@@ -70,10 +296,20 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
 }) => {
   const { t } = useTranslation();
   const [isVaultModalOpen, setIsVaultModalOpen] = useState(false);
+  // undefined: the vault dialog picks its own default tab
+  const [vaultInitialTab, setVaultInitialTab] = useState<VaultTab | undefined>(undefined);
 
   const [selectedSiteId, setSelectedSiteId] = useState<string>('new');
   const [protocol, setProtocol] = useState<Protocol>('sftp');
   const [siteName, setSiteName] = useState<string>('');
+  const [group, setGroup] = useState<string>('');
+  const [folderSuggestOpen, setFolderSuggestOpen] = useState(false);
+  const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(loadCollapsedFolders);
+  // Folders collapsed while a filter is active; forgotten when the filter changes
+  const [filterCollapsed, setFilterCollapsed] = useState<Set<string>>(() => new Set());
+  // Folders just imported (WinSCP "View connections"): the list scrolls to the first one once it renders
+  const [revealFolders, setRevealFolders] = useState<Set<string> | null>(null);
+  const siteListRef = useRef<HTMLDivElement>(null);
   const [host, setHost] = useState<string>('');
   const [port, setPort] = useState<string>('22');
   const [username, setUsername] = useState<string>('');
@@ -101,18 +337,110 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const hostRef = useRef<HTMLInputElement>(null);
 
-  const visibleSites = useMemo(() => {
-    const q = filter.trim().toLowerCase();
-    const list = [...savedSites].sort((a, b) => {
-      if (a.id === 'local') return -1;
-      if (b.id === 'local') return 1;
-      return a.name.localeCompare(b.name);
-    });
-    if (!q) return list;
-    return list.filter((s) => `${s.name} ${s.host} ${s.username}`.toLowerCase().includes(q));
-  }, [savedSites, filter]);
+  const filterQuery = filter.trim().toLowerCase();
+  const isFiltering = filterQuery.length > 0;
+
+  // The filter matches name, server, user and folder
+  const matchingSites = useMemo(() => {
+    if (!filterQuery) return savedSites;
+    return savedSites.filter((s) => `${s.name} ${s.host} ${s.username} ${normalizeGroup(s.group)}`.toLowerCase().includes(filterQuery));
+  }, [savedSites, filterQuery]);
+
+  const siteTree = useMemo(() => buildSiteTree(matchingSites), [matchingSites]);
+  const treeFolderPaths = useMemo(() => collectFolderPaths(siteTree), [siteTree]);
+
+  // Every folder in use, parents included: suggestions for the Folder field
+  const knownFolders = useMemo(() => {
+    const set = new Set<string>();
+    for (const s of savedSites) {
+      if (s.id === 'local') continue;
+      for (const path of folderChain(normalizeGroup(s.group))) set.add(path);
+    }
+    return [...set].sort(naturalCompare);
+  }, [savedSites]);
+
+  // While filtering, every folder with a match starts expanded (the viewer's saved state is left alone)
+  const treeRows = useMemo(() => {
+    const rows: TreeRow[] = [];
+    const isExpanded = (path: string) => (isFiltering ? !filterCollapsed.has(path) : !collapsedFolders.has(path));
+    const walk = (node: FolderNode, depth: number) => {
+      const pinned = depth === 0 ? node.sites.filter((s) => s.id === 'local') : [];
+      for (const site of pinned) rows.push({ kind: 'site', site, depth });
+      for (const folder of node.folders) {
+        const expanded = isExpanded(folder.path);
+        rows.push({ kind: 'folder', node: folder, depth, expanded });
+        if (expanded) walk(folder, depth + 1);
+      }
+      for (const site of node.sites) if (!pinned.includes(site)) rows.push({ kind: 'site', site, depth });
+    };
+    walk(siteTree, 0);
+    return rows;
+  }, [siteTree, isFiltering, filterCollapsed, collapsedFolders]);
+
+  useEffect(() => {
+    saveCollapsedFolders(collapsedFolders);
+  }, [collapsedFolders]);
+
+  useEffect(() => {
+    if (!revealFolders) return;
+    setRevealFolders(null);
+    const list = siteListRef.current;
+    if (!list) return;
+    // Rows are in tree order, so the first match is the top-most imported folder
+    const row = Array.from(list.querySelectorAll<HTMLElement>('[data-folder-path]')).find((el) => revealFolders.has(el.dataset.folderPath ?? ''));
+    // Scrolls the list only, never the dialog around it
+    if (row) list.scrollTop += row.getBoundingClientRect().top - list.getBoundingClientRect().top - 4;
+  }, [revealFolders, treeRows]);
 
   if (!isOpen) return null;
+
+  const anyFolderExpanded = treeFolderPaths.some((p) => (isFiltering ? !filterCollapsed.has(p) : !collapsedFolders.has(p)));
+
+  const setFoldersCollapsed = (paths: string[], collapse: boolean) => {
+    const update = (prev: Set<string>) => {
+      const next = new Set(prev);
+      for (const p of paths) {
+        if (collapse) next.add(p);
+        else next.delete(p);
+      }
+      return next;
+    };
+    if (isFiltering) setFilterCollapsed(update);
+    else setCollapsedFolders(update);
+  };
+
+  /** Option/Alt-click also toggles every subfolder, like Finder. */
+  const toggleFolder = (node: FolderNode, expanded: boolean, withSubfolders: boolean) => {
+    setFoldersCollapsed(withSubfolders ? [node.path, ...collectFolderPaths(node)] : [node.path], expanded);
+  };
+
+  /** After a WinSCP import: clears the filter, expands the imported folders and scrolls to the first one. */
+  const showImportedConnections = (folders: string[]) => {
+    setFilter('');
+    setFilterCollapsed(new Set());
+    const paths = new Set<string>();
+    for (const folder of folders) for (const path of folderChain(normalizeGroup(folder))) paths.add(path);
+    if (paths.size === 0) return;
+    setCollapsedFolders((prev) => {
+      if (![...paths].some((p) => prev.has(p))) return prev;
+      const next = new Set(prev);
+      paths.forEach((p) => next.delete(p));
+      return next;
+    });
+    setRevealFolders(paths);
+  };
+
+  /** Expands the folders above a site so it stays visible in the list. */
+  const revealFolder = (rawGroup?: string | null) => {
+    const chain = folderChain(normalizeGroup(rawGroup));
+    if (!chain.length) return;
+    setCollapsedFolders((prev) => {
+      if (!chain.some((p) => prev.has(p))) return prev;
+      const next = new Set(prev);
+      chain.forEach((p) => next.delete(p));
+      return next;
+    });
+  };
 
   const handleProtocolChange = (p: Protocol) => {
     // Only replace the port when it still holds the previous protocol's default
@@ -132,6 +460,9 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   const handleSelectSite = (site: ConnectionConfig) => {
     setSelectedSiteId(site.id);
     setSiteName(site.name);
+    setGroup(site.id === 'local' ? '' : normalizeGroup(site.group));
+    setFolderSuggestOpen(false);
+    if (site.id !== 'local') revealFolder(site.group);
     setProtocol(site.protocol);
     setHost(site.host);
     setPort(String(site.port || DEFAULT_PORTS[site.protocol] || ''));
@@ -169,6 +500,8 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   const resetForm = () => {
     setSelectedSiteId('new');
     setSiteName('');
+    setGroup('');
+    setFolderSuggestOpen(false);
     setProtocol('sftp');
     setHost('');
     setPort('22');
@@ -235,6 +568,8 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
       auth: buildAuth(),
       remote_root: remoteRoot.trim(),
       tls_fingerprint: protocol === 'ftps' && tlsFingerprint.trim() ? tlsFingerprint.trim() : null,
+      // The built-in Local site always stays at the top level
+      group: selectedSiteId === 'local' ? null : normalizeGroup(group) || null,
     };
   };
 
@@ -297,6 +632,11 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   // close only when no typed draft would be lost; with a draft it just stops a running attempt.
   // Close/Cancel buttons still call handleClose directly.
   const handleEscape = () => {
+    // First Escape just closes the folder suggestions
+    if (folderSuggestOpen) {
+      setFolderSuggestOpen(false);
+      return;
+    }
     if (!isDirty) {
       handleClose();
       return;
@@ -317,6 +657,8 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
       await onSaveSite(cfg);
       setSelectedSiteId(cfg.id);
       setSiteName(cfg.name);
+      setGroup(cfg.group ?? '');
+      revealFolder(cfg.group);
       setIsDirty(false);
       setSaveSuccess(true);
       setTimeout(() => setSaveSuccess(false), 2000);
@@ -365,6 +707,8 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   const isNew = selectedSiteId === 'new';
   const isS3 = protocol === 's3';
   const isLocal = protocol === 'local';
+  const isBuiltInLocal = selectedSiteId === 'local';
+  const normalizedGroup = isBuiltInLocal ? '' : normalizeGroup(group);
 
   const protocolOptions: Array<{ value: Protocol; label: string; title?: string }> = [
     { value: 'sftp', label: 'SFTP' },
@@ -379,9 +723,20 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
     <Modal isOpen={isOpen} onClose={handleEscape} size="2xl" padded={false} className="h-[min(600px,calc(100vh-2rem))]" dismissOnBackdrop={false}>
       <div className="flex h-full min-h-0">
         {/* Saved sites */}
-        <aside className="w-60 shrink-0 bg-dark-850 border-r border-line flex flex-col select-none">
-          <div className="px-4 pt-4 pb-2 flex items-center justify-between">
-            <h2 className="text-[15px] font-semibold text-ink">{t('loginDialog.title', 'Site Manager')}</h2>
+        <aside className="w-64 shrink-0 bg-dark-850 border-r border-line flex flex-col select-none">
+          <div className="px-4 pt-4 pb-2 flex items-center gap-1">
+            <h2 className="flex-1 min-w-0 truncate text-[15px] font-semibold text-ink">{t('loginDialog.title', 'Site Manager')}</h2>
+            {treeFolderPaths.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setFoldersCollapsed(treeFolderPaths, anyFolderExpanded)}
+                className="ui-icon-btn ui-icon-btn-sm"
+                title={anyFolderExpanded ? t('loginDialog.collapseFolders', 'Collapse all folders') : t('loginDialog.expandFolders', 'Expand all folders')}
+                aria-label={anyFolderExpanded ? t('loginDialog.collapseFolders', 'Collapse all folders') : t('loginDialog.expandFolders', 'Expand all folders')}
+              >
+                {anyFolderExpanded ? <ChevronsDownUp className="w-4 h-4" /> : <ChevronsUpDown className="w-4 h-4" />}
+              </button>
+            )}
             <button type="button" onClick={handleNewSite} className="ui-icon-btn ui-icon-btn-sm" title={t('loginDialog.newConnection')} aria-label={t('loginDialog.newConnection')}>
               <Plus className="w-4 h-4" />
             </button>
@@ -394,15 +749,34 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
                 <input
                   {...plainTextInputProps}
                   value={filter}
-                  onChange={(e) => setFilter(e.target.value)}
+                  onChange={(e) => {
+                    setFilter(e.target.value);
+                    setFilterCollapsed(new Set());
+                  }}
                   placeholder={t('loginDialog.filter', 'Filter')}
-                  className="ui-input h-7 pl-7 text-[12.5px]"
+                  aria-label={t('loginDialog.filterHint', 'Filter by name, server, user or folder')}
+                  title={t('loginDialog.filterHint', 'Filter by name, server, user or folder')}
+                  className="ui-input h-7 pl-7 pr-7 text-[12.5px]"
                 />
+                {filter && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setFilter('');
+                      setFilterCollapsed(new Set());
+                    }}
+                    className="absolute right-1 top-1/2 -translate-y-1/2 ui-icon-btn !w-5 !h-5 !rounded"
+                    title={t('loginDialog.clearFilter', 'Clear filter')}
+                    aria-label={t('loginDialog.clearFilter', 'Clear filter')}
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                )}
               </div>
             </div>
           )}
 
-          <div className="flex-1 overflow-y-auto px-2 pb-2 space-y-0.5">
+          <div ref={siteListRef} className="flex-1 overflow-y-auto px-2 pb-2 space-y-0.5">
             <button
               type="button"
               onClick={handleNewSite}
@@ -414,7 +788,34 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
               <span className="truncate">{t('loginDialog.newConnection')}</span>
             </button>
 
-            {visibleSites.map((site) => {
+            {treeRows.map((row) => {
+              if (row.kind === 'folder') {
+                const { node, depth, expanded } = row;
+                return (
+                  <button
+                    key={`folder:${node.path}`}
+                    type="button"
+                    data-folder-path={node.path}
+                    aria-expanded={expanded}
+                    onClick={(e) => toggleFolder(node, expanded, e.altKey)}
+                    onKeyDown={(e) => {
+                      if ((e.key === 'ArrowRight' && !expanded) || (e.key === 'ArrowLeft' && expanded)) {
+                        e.preventDefault();
+                        toggleFolder(node, expanded, e.altKey);
+                      }
+                    }}
+                    className="w-full flex items-center gap-1.5 h-8 pr-2.5 rounded-lg text-[13px] text-ink-muted hover:text-ink hover:bg-dark-650/50 transition-colors"
+                    style={{ paddingLeft: 4 + depth * 14 }}
+                    title={node.path}
+                  >
+                    <ChevronRight className={`w-3.5 h-3.5 shrink-0 text-ink-faint transition-transform ${expanded ? 'rotate-90' : ''}`} />
+                    {expanded ? <FolderOpen className="w-4 h-4 shrink-0 text-ink-faint" /> : <Folder className="w-4 h-4 shrink-0 text-ink-faint" />}
+                    <span className="flex-1 min-w-0 truncate text-left">{node.name}</span>
+                    <span className="shrink-0 text-[11px] text-ink-faint tabular-nums">{node.count}</span>
+                  </button>
+                );
+              }
+              const { site, depth } = row;
               const selected = selectedSiteId === site.id;
               const confirming = pendingDeleteId === site.id;
               return (
@@ -428,9 +829,10 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
                     runConnect(site);
                   }}
                   onKeyDown={(e) => e.key === 'Enter' && handleSelectSite(site)}
-                  className={`group flex items-center gap-2.5 px-2.5 h-11 rounded-lg cursor-pointer transition-colors ${
+                  className={`group flex items-center gap-2.5 pr-2.5 h-11 rounded-lg cursor-pointer transition-colors ${
                     selected ? 'bg-dark-650 text-ink' : 'text-ink hover:bg-dark-650/50'
                   }`}
+                  style={{ paddingLeft: 10 + depth * 14 }}
                   title={t('loginDialog.doubleClickHint', 'Double-click to connect')}
                 >
                   <ProtocolIcon protocol={site.protocol} className={`w-4 h-4 shrink-0 ${selected ? 'text-rust-500' : 'text-ink-faint'}`} />
@@ -464,30 +866,53 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
                 </div>
               );
             })}
-            {visibleSites.length === 0 && filter && (
+            {isFiltering && matchingSites.length === 0 && (
               <div className="px-3 py-6 text-center text-[12px] text-ink-faint">{t('loginDialog.noMatches', 'No matching sites')}</div>
             )}
           </div>
 
-          <div className="p-2 border-t border-line">
+          <div className="p-2 border-t border-line space-y-0.5">
             <button
               type="button"
-              onClick={() => setIsVaultModalOpen(true)}
+              onClick={() => {
+                setVaultInitialTab(undefined);
+                setIsVaultModalOpen(true);
+              }}
               className="w-full flex items-center gap-2 px-2.5 h-8 rounded-lg text-[12.5px] text-ink-muted hover:text-ink hover:bg-dark-650/50 transition-colors"
               title={t('loginDialog.vaultHint', 'Encrypted (AES-256) export/import for macOS, Windows and Linux')}
             >
               <ArrowDownUp className="w-3.5 h-3.5" />
               {t('loginDialog.importExport', 'Import / Export…')}
             </button>
+            <button
+              type="button"
+              onClick={() => {
+                setVaultInitialTab('winscp');
+                setIsVaultModalOpen(true);
+              }}
+              className="w-full flex items-center gap-2 px-2.5 h-8 rounded-lg text-[12.5px] text-ink-muted hover:text-ink hover:bg-dark-650/50 transition-colors"
+              title={t('loginDialog.winscpHint', 'Bring over your WinSCP sites, folders and saved passwords')}
+            >
+              <FolderInput className="w-3.5 h-3.5" />
+              {t('loginDialog.importWinscp', 'Import from WinSCP…')}
+            </button>
           </div>
         </aside>
 
         {/* Connection form */}
         <div className="flex-1 min-w-0 flex flex-col">
-          <div className="flex-1 overflow-y-auto px-7 pt-5 pb-6" onKeyDown={onFormKeyDown}>
+          <div className="flex-1 overflow-y-auto px-7 pt-5 pb-6" onKeyDown={onFormKeyDown} data-form-scroll>
             <div className="flex items-center justify-between mb-5">
               <div className="min-w-0">
-                <div className="text-[12px] text-ink-faint">{isNew ? t('loginDialog.newConnection') : t('loginDialog.editing', 'Editing')}</div>
+                <div className="text-[12px] text-ink-faint truncate">
+                  {isNew ? t('loginDialog.newConnection') : t('loginDialog.editing', 'Editing')}
+                  {normalizedGroup && (
+                    <span title={normalizedGroup}>
+                      {' · '}
+                      {normalizedGroup.split('/').join(' / ')}
+                    </span>
+                  )}
+                </div>
                 <input
                   {...plainTextInputProps}
                   value={siteName}
@@ -700,40 +1125,64 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
                     </Field>
                   )}
 
-                  {!isS3 && (
-                    <Disclosure label={t('loginDialog.advancedTab')} defaultOpen={!!remoteRoot || (protocol === 'ftps' && !!tlsFingerprint)}>
-                      <div className="space-y-4">
-                        <Field label={t('loginDialog.remoteRoot')} hint={t('loginDialog.remoteRootHelper')}>
-                          {(id) => (
-                            <TextInput id={id} mono value={remoteRoot} onChange={handleRemoteRootChange} placeholder="~" />
-                          )}
-                        </Field>
-                        {protocol === 'ftps' && (
-                          <Field
-                            label={t('loginDialog.tlsFingerprint', 'Trusted certificate (SHA-256)')}
-                            hint={t(
-                              'loginDialog.tlsFingerprintHint',
-                              "Only for a server with a self-signed certificate. Certificates your system trusts are always accepted. If the connection reports an untrusted certificate, compare its fingerprint with the server's and paste it here."
-                            )}
-                          >
-                            {(id) => (
-                              <TextInput
-                                id={id}
-                                mono
-                                value={tlsFingerprint}
-                                onChange={(e) => {
-                                  setTlsFingerprint(e.target.value);
-                                  setIsDirty(true);
-                                }}
-                                placeholder="AB:CD:EF:…"
-                              />
-                            )}
-                          </Field>
-                        )}
-                      </div>
-                    </Disclosure>
-                  )}
                 </>
+              )}
+
+              {/* The built-in Local site has nothing advanced to set (it always stays at the top level) */}
+              {!isBuiltInLocal && (
+                <Disclosure label={t('loginDialog.advancedTab')} defaultOpen={(!isS3 && !isLocal && !!remoteRoot) || (protocol === 'ftps' && !!tlsFingerprint)}>
+                  <div className="space-y-4">
+                    <Field
+                      label={t('loginDialog.folder', 'Folder')}
+                      hint={t('loginDialog.folderHint', 'Groups this connection in the site list. Use / for subfolders; leave empty for the top level.')}
+                    >
+                      {(id) => (
+                        <FolderField
+                          id={id}
+                          value={group}
+                          onChange={(value) => {
+                            setGroup(value);
+                            setIsDirty(true);
+                          }}
+                          folders={knownFolders}
+                          open={folderSuggestOpen}
+                          onOpenChange={setFolderSuggestOpen}
+                          placeholder={t('loginDialog.folderPlaceholder', 'e.g. Production/Web')}
+                          listLabel={t('loginDialog.folderSuggestions', 'Existing folders')}
+                        />
+                      )}
+                    </Field>
+                    {!isS3 && !isLocal && (
+                      <Field label={t('loginDialog.remoteRoot')} hint={t('loginDialog.remoteRootHelper')}>
+                        {(id) => (
+                          <TextInput id={id} mono value={remoteRoot} onChange={handleRemoteRootChange} placeholder="~" />
+                        )}
+                      </Field>
+                    )}
+                    {protocol === 'ftps' && (
+                      <Field
+                        label={t('loginDialog.tlsFingerprint', 'Trusted certificate (SHA-256)')}
+                        hint={t(
+                          'loginDialog.tlsFingerprintHint',
+                          "Only for a server with a self-signed certificate. Certificates your system trusts are always accepted. If the connection reports an untrusted certificate, compare its fingerprint with the server's and paste it here."
+                        )}
+                      >
+                        {(id) => (
+                          <TextInput
+                            id={id}
+                            mono
+                            value={tlsFingerprint}
+                            onChange={(e) => {
+                              setTlsFingerprint(e.target.value);
+                              setIsDirty(true);
+                            }}
+                            placeholder="AB:CD:EF:…"
+                          />
+                        )}
+                      </Field>
+                    )}
+                  </div>
+                </Disclosure>
               )}
             </div>
           </div>
@@ -783,10 +1232,14 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
       {isVaultModalOpen && (
         <VaultModal
           isOpen={isVaultModalOpen}
+          initialTab={vaultInitialTab}
           onClose={() => setIsVaultModalOpen(false)}
+          onViewConnections={showImportedConnections}
           siteCount={savedSites.filter((s) => s.id !== 'local').length}
           onSitesUpdated={(newSites) => {
             if (onSitesUpdated) onSitesUpdated(newSites);
+            // A replace import can remove the site being edited: never save it back by accident
+            if (selectedSiteId !== 'new' && !newSites.some((s) => s.id === selectedSiteId)) resetForm();
           }}
         />
       )}

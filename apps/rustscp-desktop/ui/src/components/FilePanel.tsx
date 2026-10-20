@@ -43,9 +43,22 @@ import {
   Plus,
   Ellipsis,
   Eye,
+  Copy,
+  FolderInput,
+  ArrowDownToLine,
 } from 'lucide-react';
 import { FileEntry, ActionDefinition, ClipboardState } from '../types.ts';
-import { tabDragManager } from '../utils/tabDragManager.ts';
+import {
+  tabDragManager,
+  fileDragTabs,
+  filePaneSinks,
+  FileDropMode,
+  FileDropOptions,
+  FileTabHit,
+  osDragPointToCss,
+  osFileDrag,
+  overlayBlocksDrop,
+} from '../utils/tabDragManager.ts';
 import { basename, dirname, samePath, isInside, isLikelyBinaryName, EDITOR_MAX_BYTES } from '../utils/paths.ts';
 import { plainTextInputProps } from '../utils/inputHardening.ts';
 import { Modal } from './ui/Modal.tsx';
@@ -53,6 +66,7 @@ import { Button, IconButton } from './ui/controls.tsx';
 import { Menu, MenuItem, MenuToggleItem, MenuLabel, MenuSeparator } from './ui/Menu.tsx';
 import { notify } from './ui/toast.tsx';
 import { FileContextMenu } from './FileContextMenu.tsx';
+import { DropActionModal } from './DropActionModal.tsx';
 import {
   FileIconKind,
   extensionOf,
@@ -64,19 +78,23 @@ import {
   isMacPlatform,
   safeDisplayName,
 } from './fileListUtils.ts';
-import { PaneDropHit, paneDropTargets, setFileDragCursor } from './paneDropTargets.ts';
-
-/**
- * Tauri drag-drop positions: wry reports AppKit points on macOS and GTK logical pixels on Linux
- * (both already CSS pixels), but physical pixels on Windows (WebView2 + ScreenToClient).
- */
-const IS_WINDOWS =
-  typeof navigator !== 'undefined' && (/^Win/i.test(navigator.platform || '') || /Windows NT/i.test(navigator.userAgent || ''));
+import { PaneDropHit, PaneDropTarget, paneDropTargets, setFileDragCursor } from './paneDropTargets.ts';
 
 /** Pointer travel (px) before a press on a row becomes a drag. */
 const DRAG_THRESHOLD = 4;
 /** Distance (px) from a list's top/bottom edge where a drag scrolls it. */
 const DRAG_SCROLL_EDGE = 32;
+/** A click on the name of the only selected item starts renaming after this delay (unless a double-click follows). */
+const SLOW_CLICK_RENAME_MS = 500;
+
+/** What a drop would do: copy, move, open the chooser ('ask'), or nothing (onto itself). */
+type DragEffect = 'copy' | 'move' | 'ask' | 'none';
+
+/**
+ * Effect of the row drag in progress, read by the pane under the pointer for its drop hint.
+ * Module level because the drag runs in the source pane and the hint shows in the target pane.
+ */
+let liveRowDragEffect: DragEffect = 'none';
 
 interface FilePanelProps {
   title: string;
@@ -134,8 +152,13 @@ interface FilePanelProps {
   canTransferToOtherPane?: boolean;
   /** Optional: where F5/F6 send files (e.g. "Server · /var/www"); when set, F5/F6 ask for confirmation first. */
   otherPaneLabel?: string;
-  /** Optional: rename one item (context menu "Rename…" and F2). Omitted = no rename UI. */
+  /** Optional: rename one item in a dialog. Used when inline renaming is unavailable. Omitted (with onRenameInline) = no rename UI. */
   onRename?: (file: FileEntry) => void;
+  /**
+   * Optional: rename in place (F2, context menu, slow second click on the name). Resolves true when
+   * done (renamed, unchanged, or failed with an error shown), false when the name must be fixed.
+   */
+  onRenameInline?: (file: FileEntry, newName: string) => Promise<boolean>;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -319,6 +342,86 @@ const diffRowTint = (diff?: string) =>
     : 'bg-emerald-500/[0.06]';
 
 /* -------------------------------------------------------------------------- */
+/* Inline rename                                                               */
+/* -------------------------------------------------------------------------- */
+
+interface InlineRenameProps {
+  initial: string;
+  isDir: boolean;
+  busy: boolean;
+  grid?: boolean;
+  isPt: boolean;
+  /** `dirty` is false when the text was never edited (then nothing is renamed). */
+  onCommit: (value: string, via: 'enter' | 'blur', dirty: boolean) => void;
+  onCancel: () => void;
+}
+
+/**
+ * Name field shown in place of a row's name (Finder style): the name without its extension is
+ * selected, Return renames, Escape cancels, clicking elsewhere renames. Its pointer, click and key
+ * events stay inside it, so the list never selects, drags or opens the row underneath.
+ */
+const InlineRenameInput: React.FC<InlineRenameProps> = ({ initial, isDir, busy, grid, isPt, onCommit, onCancel }) => {
+  const ref = useRef<HTMLInputElement>(null);
+  const [value, setValue] = useState(initial);
+  const dirtyRef = useRef(false);
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.focus({ preventScroll: true });
+    // The stem only (like Finder); folders and dotfiles select everything
+    const dot = isDir ? -1 : el.value.lastIndexOf('.');
+    el.setSelectionRange(0, dot > 0 ? dot : el.value.length);
+    // Runs once per field: a new rename mounts a new field
+  }, []);
+
+  // A name that must be fixed hands the field back
+  useEffect(() => {
+    if (!busy) ref.current?.focus({ preventScroll: true });
+  }, [busy]);
+
+  const stop = (e: React.SyntheticEvent) => e.stopPropagation();
+
+  return (
+    <input
+      ref={ref}
+      type="text"
+      {...plainTextInputProps}
+      data-inline-rename=""
+      value={value}
+      readOnly={busy}
+      aria-label={isPt ? 'Novo nome' : 'New name'}
+      onChange={(e) => {
+        dirtyRef.current = true;
+        setValue(e.target.value);
+      }}
+      onKeyDown={(e) => {
+        e.stopPropagation();
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          onCommit(value, 'enter', dirtyRef.current);
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          onCancel();
+        }
+      }}
+      onBlur={() => onCommit(value, 'blur', dirtyRef.current)}
+      onPointerDown={stop}
+      onMouseDown={stop}
+      onClick={stop}
+      onDoubleClick={stop}
+      onContextMenu={stop}
+      className={cx(
+        'ui-input min-w-0 px-1.5 py-0 rounded-md',
+        grid ? 'h-6 w-full text-[12px] text-center' : 'h-[22px] flex-1 text-[13px]',
+        busy && 'opacity-70'
+      )}
+    />
+  );
+};
+
+/* -------------------------------------------------------------------------- */
 /* Rows (memoized; event handlers are delegated to the list container)         */
 /* -------------------------------------------------------------------------- */
 
@@ -335,9 +438,11 @@ interface RowProps {
   template: string;
   locale: string;
   isPt: boolean;
+  /** Inline rename field shown instead of the name */
+  renameSlot?: React.ReactNode;
 }
 
-const FileRow = memo(function FileRow({ item, index, rowId, selected, cursor, cut, dropTarget, diff, columns, template, locale, isPt }: RowProps) {
+const FileRow = memo(function FileRow({ item, index, rowId, selected, cursor, cut, dropTarget, diff, columns, template, locale, isPt, renameSlot }: RowProps) {
   const base = 'grid items-center h-[26px] px-2 text-[13px] cursor-default select-none';
   const stateCls = dropTarget
     ? 'bg-rust-500/15 ring-1 ring-inset ring-rust-500/60'
@@ -389,9 +494,11 @@ const FileRow = memo(function FileRow({ item, index, rowId, selected, cursor, cu
             return (
               <div key="name" role="gridcell" className="flex items-center gap-2 min-w-0 pr-2">
                 <FileIcon kind={meta.icon} />
-                <bdi className="truncate text-ink" title={meta.display}>
-                  {meta.display}
-                </bdi>
+                {renameSlot ?? (
+                  <bdi data-name-cell="" className="truncate text-ink" title={meta.display}>
+                    {meta.display}
+                  </bdi>
+                )}
                 {diff && (
                   <span className={cx('shrink-0 text-[10.5px] leading-4 px-1.5 rounded-full', diffChipClass(diff))} title={diffTitle(diff, isPt)}>
                     {diffLabel(diff, isPt)}
@@ -459,9 +566,11 @@ interface CardProps {
   dropTarget: boolean;
   diff?: string;
   isPt: boolean;
+  /** Inline rename field shown instead of the name */
+  renameSlot?: React.ReactNode;
 }
 
-const FileCard = memo(function FileCard({ item, index, rowId, selected, cursor, cut, dropTarget, diff, isPt }: CardProps) {
+const FileCard = memo(function FileCard({ item, index, rowId, selected, cursor, cut, dropTarget, diff, isPt, renameSlot }: CardProps) {
   const base = 'relative flex flex-col items-center justify-center gap-1.5 px-2 rounded-xl text-center cursor-default select-none';
   const stateCls = dropTarget
     ? 'bg-rust-500/15 ring-1 ring-rust-500/60'
@@ -499,7 +608,11 @@ const FileCard = memo(function FileCard({ item, index, rowId, selected, cursor, 
       style={{ height: CARD_H }}
     >
       <FileIcon kind={meta.icon} large />
-      <bdi className="w-full text-[12px] leading-tight text-ink line-clamp-2 break-all">{meta.display}</bdi>
+      {renameSlot ?? (
+        <bdi data-name-cell="" className="w-full text-[12px] leading-tight text-ink line-clamp-2 break-all">
+          {meta.display}
+        </bdi>
+      )}
       <span className="text-[11px] text-ink-faint tabular-nums">{file.file_type === 'directory' ? meta.typeLabel : meta.sizeText}</span>
       {diff && (
         <span
@@ -537,7 +650,35 @@ interface RowDragGhost {
   /** Display name when one item is dragged */
   name: string;
   icon: FileIconKind;
-  effect: 'copy' | 'move' | 'none';
+  effect: DragEffect;
+}
+
+/** Drop chooser waiting for the user (right-button drag, files from Finder/Explorer). */
+interface DropChoiceState {
+  sourceSessionId: string;
+  /** Session of this pane when the drop happened */
+  destSessionId: string;
+  paths: string[];
+  destDir: string;
+  verifyDest: boolean;
+  sourceLabel?: string;
+}
+
+/** Text shown at the bottom of the pane while something is dragged over it. */
+interface DropHint {
+  destDir: string;
+  effect: 'copy' | 'move' | 'ask';
+}
+
+/** Item being renamed in place. */
+interface RenamingState {
+  path: string;
+  name: string;
+  isDir: boolean;
+  /** Waiting for the rename to finish (the field is read-only) */
+  busy: boolean;
+  /** Identifies this edit, so a late blur or result of a previous one is ignored */
+  nonce: number;
 }
 
 /** A press on a file row that may become a drag (pointer events, see paneDropTargets.ts). */
@@ -557,7 +698,13 @@ interface RowDragState {
   altKey: boolean;
   /** Registry id of the pane currently highlighted */
   hoverId: string | null;
+  /** The drag rests on a session tab (spring-loading) */
+  overTab: boolean;
   scrollRaf: number | null;
+  /** Right-button drag: the drop opens the copy-or-move chooser */
+  secondary: boolean;
+  /** Title of the source pane when the drag started (the chooser's "From") */
+  sourceLabel: string;
 }
 
 export const FilePanel: React.FC<FilePanelProps> = ({
@@ -611,6 +758,7 @@ export const FilePanel: React.FC<FilePanelProps> = ({
   canTransferToOtherPane,
   otherPaneLabel,
   onRename,
+  onRenameInline,
 }) => {
   const { t, i18n } = useTranslation();
   const isPt = i18n.language.startsWith('pt');
@@ -652,6 +800,9 @@ export const FilePanel: React.FC<FilePanelProps> = ({
   const [transferConfirm, setTransferConfirm] = useState<TransferConfirmState | null>(null);
   const [customBookmarks, setCustomBookmarks] = useState<string[]>([]);
   const [rowDragGhost, setRowDragGhost] = useState<RowDragGhost | null>(null);
+  const [dropChoice, setDropChoice] = useState<DropChoiceState | null>(null);
+  const [dropHint, setDropHint] = useState<DropHint | null>(null);
+  const [renaming, setRenaming] = useState<RenamingState | null>(null);
 
   const pathInputRef = useRef<HTMLInputElement>(null);
   const filterInputRef = useRef<HTMLInputElement>(null);
@@ -667,6 +818,15 @@ export const FilePanel: React.FC<FilePanelProps> = ({
   const ghostRef = useRef<HTMLDivElement>(null);
   /** Set for the click that follows a finished drag, so it does not also select a row */
   const suppressClickRef = useRef(false);
+  /** Until when a contextmenu event is swallowed (the one Windows sends after a right-button drag) */
+  const suppressContextMenuUntilRef = useRef(0);
+  const renamingRef = useRef<RenamingState | null>(null);
+  renamingRef.current = renaming;
+  const renameNonceRef = useRef(0);
+  /** Pending "slow second click" rename */
+  const slowClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** The pane had keyboard focus when the current press started (a click that only focuses the pane never renames) */
+  const pressHadFocusRef = useRef(false);
   /** Latest row-drag handlers (reassigned every render); the window listeners below call through it. */
   const rowDragImplRef = useRef({
     move: (_e: PointerEvent) => {},
@@ -839,6 +999,8 @@ export const FilePanel: React.FC<FilePanelProps> = ({
   };
 
   const changeViewMode = (mode: 'list' | 'grid') => {
+    cancelSlowClickRename();
+    if (mode !== viewMode) setRenamingNow(null);
     setViewMode(mode);
     try {
       localStorage.setItem(`rustscp_view_mode_${paneId || 'main'}`, mode);
@@ -1001,6 +1163,8 @@ export const FilePanel: React.FC<FilePanelProps> = ({
   useLayoutEffect(() => {
     setCursorKey(null);
     anchorKeyRef.current = null;
+    cancelSlowClickRename();
+    setRenamingNow(null);
     const el = scrollRef.current;
     if (el) el.scrollTop = 0;
     setViewport((v) => (v.top === 0 ? v : { ...v, top: 0 }));
@@ -1097,6 +1261,103 @@ export const FilePanel: React.FC<FilePanelProps> = ({
     }
   }, [rows, loading, scrollIndexIntoView]);
 
+  /* -------------------------------- Inline rename -------------------------------- */
+
+  const cancelSlowClickRename = () => {
+    if (slowClickTimerRef.current !== null) {
+      clearTimeout(slowClickTimerRef.current);
+      slowClickTimerRef.current = null;
+    }
+  };
+
+  /** Updates the rename state and its ref together (async flows read the ref). */
+  const setRenamingNow = (next: RenamingState | null) => {
+    renamingRef.current = next;
+    setRenaming(next);
+  };
+
+  /** F2, context menu and slow second click: rename in place when possible, otherwise in a dialog. */
+  const startRename = (file: FileEntry) => {
+    cancelSlowClickRename();
+    if (!sessionId || file.name === '.' || file.name === '..') return;
+    const idx = rowsRef.current.findIndex((r) => r.kind === 'file' && r.file.path === file.path);
+    if (!onRenameInline || idx < 0) {
+      onRename?.(file);
+      return;
+    }
+    setContextMenu(null);
+    const row = rowsRef.current[idx];
+    setCursorKey(row.key);
+    anchorKeyRef.current = row.key;
+    const sel = selectedRef.current;
+    if (!(sel.length === 1 && sel[0] === file.path)) applySelection([file.path]);
+    scrollIndexIntoView(idx);
+    setRenamingNow({
+      path: file.path,
+      name: file.name,
+      isDir: file.file_type === 'directory',
+      busy: false,
+      nonce: ++renameNonceRef.current,
+    });
+  };
+  const startRenameRef = useRef(startRename);
+  startRenameRef.current = startRename;
+
+  const endRename = (refocus: boolean) => {
+    setRenamingNow(null);
+    if (refocus) panelRef.current?.focus({ preventScroll: true });
+  };
+
+  const commitRename = async (nonce: number, value: string, via: 'enter' | 'blur', dirty: boolean) => {
+    const r = renamingRef.current;
+    if (!r || r.nonce !== nonce || r.busy) return;
+    const name = value.trim();
+    const file = filesRef.current.find((f) => f.path === r.path);
+    // Unchanged or emptied: nothing to rename (Finder keeps the old name)
+    if (!dirty || !name || name === r.name || !file || !onRenameInline) {
+      endRename(via === 'enter');
+      return;
+    }
+    if (via === 'blur') {
+      // Clicking elsewhere renames too; a name that must be fixed is explained by App's toast
+      endRename(false);
+      void onRenameInline(file, name);
+      return;
+    }
+    setRenamingNow({ ...r, busy: true });
+    let done = true;
+    try {
+      done = await onRenameInline(file, name);
+    } catch {
+      done = true;
+    }
+    const cur = renamingRef.current;
+    if (!cur || cur.nonce !== nonce) return;
+    const active = document.activeElement as HTMLElement | null;
+    const fieldFocused = !!active?.closest?.('[data-inline-rename]');
+    if (!done && fieldFocused) {
+      setRenamingNow({ ...cur, busy: false }); // the toast says what to fix; the typed name stays
+      return;
+    }
+    // Return renamed: the list gets the keyboard back, also when the refreshed listing already
+    // unmounted the field (focus fell to the page). Focus the user moved elsewhere stays there.
+    const focusDropped = !active || active === document.body || (!!panelRef.current && panelRef.current.contains(active));
+    endRename(done && (fieldFocused || focusDropped));
+  };
+
+  // The item being renamed left the listing (refresh, filter): stop editing it
+  useEffect(() => {
+    const r = renamingRef.current;
+    if (r && !r.busy && !rows.some((row) => row.key === r.path)) setRenamingNow(null);
+  }, [rows]);
+
+  useEffect(
+    () => () => {
+      if (slowClickTimerRef.current !== null) clearTimeout(slowClickTimerRef.current);
+    },
+    []
+  );
+
   /* ------------------------------ Open / edit files ------------------------------ */
 
   const editWithGuards = (file: FileEntry) => {
@@ -1173,9 +1434,10 @@ export const FilePanel: React.FC<FilePanelProps> = ({
 
   /**
    * Single entry point for every drop into this pane. Same-session drops into the item's own
-   * folder (or a folder into itself) are skipped, and name collisions always ask first.
+   * folder (or a folder into itself) are skipped, 'ask' opens the copy-or-move chooser, and name
+   * collisions always ask first.
    */
-  const queueTransfer = async (sourceSessionId: string, paths: string[], destDir: string, isCopy: boolean) => {
+  const queueTransfer = async (sourceSessionId: string, paths: string[], destDir: string, mode: FileDropMode, opts?: FileDropOptions) => {
     if (!onDropItems || !sessionId || !paths.length) return;
     let candidates = paths;
     if (sourceSessionId === sessionId) {
@@ -1193,10 +1455,36 @@ export const FilePanel: React.FC<FilePanelProps> = ({
     }
     if (!candidates.length) return;
 
-    const existing = await existingNamesIn(destDir);
+    if (mode === 'ask') {
+      setDropChoice({
+        sourceSessionId,
+        destSessionId: sessionId,
+        paths: candidates,
+        destDir,
+        verifyDest: !!opts?.verifyDest,
+        sourceLabel: opts?.sourceLabel,
+      });
+      return;
+    }
+    await sendWithConflictCheck(sourceSessionId, sessionId, candidates, destDir, mode === 'copy', !!opts?.verifyDest);
+  };
+
+  /** Asks Replace/Skip for names that already exist in `destDir`, then hands the drop to App. */
+  const sendWithConflictCheck = async (
+    sourceSessionId: string,
+    destSessionId: string,
+    candidates: string[],
+    destDir: string,
+    isCopy: boolean,
+    verifyDest: boolean
+  ) => {
+    if (!onDropItems || !candidates.length) return;
+    // This pane's listing is trusted only while it shows that session; drops on a tab list again
+    const existing =
+      !verifyDest && destSessionId === sessionIdRef.current ? await existingNamesIn(destDir) : await listNames(destSessionId, destDir);
     const collisions = existing ? candidates.filter((p) => existing.has(basename(p))) : [];
     const send = (list: string[]) => {
-      if (list.length) onDropItems(sourceSessionId, list, sessionId, destDir, isCopy);
+      if (list.length) onDropItems(sourceSessionId, list, destSessionId, destDir, isCopy);
     };
 
     if (existing === null) {
@@ -1329,8 +1617,10 @@ export const FilePanel: React.FC<FilePanelProps> = ({
   //  - File rows (from this pane or the other one): pointer events, see "Row drag" below. HTML5
   //    drag and drop cannot work in the desktop app: Tauri's native drag-drop handler
   //    (dragDropEnabled, required for the absolute paths of Finder/Explorer drops) consumes every
-  //    dragover/drop inside the webview, so the page never sees them.
-  //  - Files from Finder/Explorer: Tauri's onDragDropEvent with absolute paths (further below).
+  //    dragover/drop inside the webview, so the page never sees them. A right-button drag opens the
+  //    copy-or-move chooser on drop; resting on a session tab opens it (spring-loaded tabs).
+  //  - Files from Finder/Explorer: Tauri's onDragDropEvent with absolute paths (further below);
+  //    the drop opens the copy-or-move chooser.
   //  - Session tabs: pointer drags owned by SessionTabs/tabDragManager (DualPane picks the pane).
   // The HTML5 container handlers only matter in the browser preview.
 
@@ -1355,9 +1645,17 @@ export const FilePanel: React.FC<FilePanelProps> = ({
     return { destDir: currentPathRef.current, key: null };
   };
 
+  /** Drop hint at the bottom of the pane (null hides it). Uses setters only, so stale closures are fine. */
+  const showDropHint = (destDir: string | null, effect: DragEffect) =>
+    setDropHint((prev) => {
+      if (!destDir || effect === 'none') return prev ? null : prev;
+      return prev && prev.destDir === destDir && prev.effect === effect ? prev : { destDir, effect };
+    });
+
   const clearDragUi = () => {
     setDragOverKey(null);
     setIsDragOverContainer(false);
+    setDropHint(null);
   };
 
   // Every mounted pane is a drop target for row drags and tells F5/F6 in the other pane what it shows.
@@ -1372,8 +1670,10 @@ export const FilePanel: React.FC<FilePanelProps> = ({
         setHover: (hit) => {
           setDragOverKey(hit?.key ?? null);
           setIsDragOverContainer(!!hit && !hit.key);
+          showDropHint(hit ? hit.destDir : null, liveRowDragEffect);
         },
-        drop: (sourceSessionId, paths, destDir, isCopy) => void queueTransferRef.current(sourceSessionId, paths, destDir, isCopy),
+        drop: (sourceSessionId, paths, destDir, isCopy) =>
+          void queueTransferRef.current(sourceSessionId, paths, destDir, isCopy ? 'copy' : 'move'),
         listing: () => ({
           sessionId: sessionIdRef.current,
           path: currentPathRef.current,
@@ -1383,22 +1683,58 @@ export const FilePanel: React.FC<FilePanelProps> = ({
     [idBase, paneId]
   );
 
+  // The same pane as a destination for drops that may ask copy-or-move (right-button drags,
+  // Finder/Explorer, drops on a session tab).
+  useEffect(
+    () =>
+      filePaneSinks.register(idBase, {
+        paneId,
+        shown: () =>
+          loadingRef.current || !sessionIdRef.current || !currentPathRef.current
+            ? null
+            : { sessionId: sessionIdRef.current, path: currentPathRef.current },
+        drop: (sourceSessionId, paths, destDir, mode, opts) => void queueTransferRef.current(sourceSessionId, paths, destDir, mode, opts),
+      }),
+    [idBase, paneId]
+  );
+
+  const notifyFolderNotReady = () =>
+    notify.info(
+      isPt ? 'A pasta ainda está abrindo' : 'The folder is still opening',
+      isPt ? 'Solte de novo quando a lista aparecer.' : 'Drop again when the list appears.'
+    );
+
   /* ---------------------------------- Row drag ---------------------------------- */
   // Press on a file row and move a few pixels: the selection (or that row) follows the pointer.
   // Drop on a folder row, the '..' row or empty space of either pane. Copy between sessions,
   // move within one session; Option/Alt flips it. Escape cancels.
 
-  /** Pane, folder and effect under a viewport point. */
-  const resolveDropAt = (x: number, y: number, altKey: boolean, sourceSessionId: string, paths: string[]) => {
+  /**
+   * Pane (and folder) or session tab under a viewport point, with the drop's effect: copy between
+   * sessions, move within one, Option/Alt flips it; a right-button drag always asks.
+   */
+  const resolveDropAt = (
+    x: number,
+    y: number,
+    altKey: boolean,
+    sourceSessionId: string,
+    paths: string[],
+    secondary: boolean
+  ):
+    | { kind: 'pane'; id: string; target: PaneDropTarget; hit: PaneDropHit; effect: DragEffect }
+    | { kind: 'tab'; tab: FileTabHit; effect: DragEffect }
+    | null => {
     const el = document.elementFromPoint(x, y);
+    const pick = (same: boolean): DragEffect => (secondary ? 'ask' : (same ? altKey : !altKey) ? 'copy' : 'move');
+    const tab = fileDragTabs.hitTest(el);
+    if (tab) return { kind: 'tab', tab, effect: pick(tab.sessionId === sourceSessionId) };
     const found = el ? paneDropTargets.fromElement(el) : null;
     const hit = found && el ? found.target.hitTest(el) : null;
     const targetSid = found?.target.sessionId();
     if (!found || !hit || !targetSid) return null;
     const same = targetSid === sourceSessionId;
-    const effect: 'copy' | 'move' | 'none' =
-      same && paths.every((p) => isSelfTarget(p, hit.destDir)) ? 'none' : (same ? altKey : !altKey) ? 'copy' : 'move';
-    return { id: found.id, target: found.target, hit, effect };
+    const effect: DragEffect = same && paths.every((p) => isSelfTarget(p, hit.destDir)) ? 'none' : pick(same);
+    return { kind: 'pane', id: found.id, target: found.target, hit, effect };
   };
 
   /** One auto-scroll step of the list under the pointer when it is near the list's top/bottom edge. */
@@ -1420,14 +1756,20 @@ export const FilePanel: React.FC<FilePanelProps> = ({
   const updateRowDrag = () => {
     const st = rowDragRef.current;
     if (!st || !st.active) return;
-    const res = resolveDropAt(st.x, st.y, st.altKey, st.sourceSessionId, st.paths);
-    const nextId = res && res.effect !== 'none' ? res.id : null;
-    if (st.hoverId && st.hoverId !== nextId) paneDropTargets.get(st.hoverId)?.setHover(null);
-    if (res && nextId) res.target.setHover(res.hit);
-    st.hoverId = nextId;
-
+    const res = resolveDropAt(st.x, st.y, st.altKey, st.sourceSessionId, st.paths, st.secondary);
     const effect = res?.effect ?? 'none';
-    setFileDragCursor(effect);
+    liveRowDragEffect = effect;
+    const pane = res && res.kind === 'pane' && res.effect !== 'none' ? res : null;
+    const nextId = pane ? pane.id : null;
+    if (st.hoverId && st.hoverId !== nextId) paneDropTargets.get(st.hoverId)?.setHover(null);
+    if (pane) pane.target.setHover(pane.hit);
+    st.hoverId = nextId;
+    // Spring-loaded tabs: resting on a session tab opens it
+    const tab = res && res.kind === 'tab' ? res.tab : null;
+    if (tab || st.overTab) fileDragTabs.hover(tab);
+    st.overTab = !!tab;
+
+    setFileDragCursor(effect === 'ask' ? 'move' : effect);
     if (ghostRef.current) ghostRef.current.style.transform = `translate(${st.x + 14}px, ${st.y + 14}px)`;
     setRowDragGhost((g) => (g && g.effect !== effect ? { ...g, effect } : g));
 
@@ -1456,6 +1798,8 @@ export const FilePanel: React.FC<FilePanelProps> = ({
       /* element already gone */
     }
     if (st.hoverId) paneDropTargets.get(st.hoverId)?.setHover(null);
+    if (st.overTab) fileDragTabs.hover(null);
+    liveRowDragEffect = 'none';
     fileDragState.set(null);
     setFileDragCursor(null);
     setRowDragGhost(null);
@@ -1465,13 +1809,19 @@ export const FilePanel: React.FC<FilePanelProps> = ({
     const paths = selectedSet.has(st.path) && visibleSelected.length ? visibleSelected : [st.path];
     st.active = true;
     st.paths = paths;
+    st.sourceLabel = title;
+    cancelSlowClickRename();
     fileDragState.set({ sourceSessionId: st.sourceSessionId, paths });
     try {
       st.captureEl.setPointerCapture(st.pointerId);
     } catch {
       /* capture is best-effort: the window listeners still see the pointer */
     }
-    setContextMenu(null);
+    if (contextMenu) {
+      // macOS opens the context menu when the right button goes down; a right-button drag replaces it
+      setContextMenu(null);
+      panelRef.current?.focus({ preventScroll: true });
+    }
     const first = rowsRef.current.find((r) => r.kind === 'file' && r.file.path === paths[0]);
     setRowDragGhost({
       count: paths.length,
@@ -1506,15 +1856,28 @@ export const FilePanel: React.FC<FilePanelProps> = ({
       endRowDrag(); // a plain click: the click handlers select/open as usual
       return;
     }
-    const res = resolveDropAt(e.clientX, e.clientY, e.altKey, st.sourceSessionId, st.paths);
-    const { sourceSessionId, paths } = st;
+    const res = resolveDropAt(e.clientX, e.clientY, e.altKey, st.sourceSessionId, st.paths, st.secondary);
+    const { sourceSessionId, paths, secondary, sourceLabel } = st;
     endRowDrag();
     // The click that follows this pointerup must not select or clear anything
     suppressClickRef.current = true;
     window.setTimeout(() => {
       suppressClickRef.current = false;
     }, 0);
-    if (res && res.effect !== 'none') res.target.drop(sourceSessionId, paths, res.hit.destDir, res.effect === 'copy');
+    // Windows sends a contextmenu event after a right-button drag: it must not open the menu
+    if (secondary) suppressContextMenuUntilRef.current = performance.now() + 600;
+    if (!res || res.effect === 'none') return;
+    const mode = res.effect as FileDropMode;
+    const opts: FileDropOptions = { sourceLabel };
+    if (res.kind === 'tab') {
+      void fileDragTabs.deliver(res.tab, sourceSessionId, paths, mode, opts).then((r) => {
+        if (r === 'timeout') notifyFolderNotReady();
+      });
+      return;
+    }
+    const sink = filePaneSinks.get(res.id);
+    if (sink) sink.drop(sourceSessionId, paths, res.hit.destDir, mode, opts);
+    else if (mode !== 'ask') res.target.drop(sourceSessionId, paths, res.hit.destDir, mode === 'copy');
   };
 
   const onRowDragKey = (e: KeyboardEvent) => {
@@ -1539,6 +1902,21 @@ export const FilePanel: React.FC<FilePanelProps> = ({
   // A pane that unmounts mid-drag (session closed, mode switch) cleans up after itself
   useEffect(() => () => rowDragImplRef.current.cancel(), []);
 
+  // Right-button drags: no context menu during the drag, nor the one Windows sends right after it
+  useEffect(() => {
+    const onContextMenu = (e: MouseEvent) => {
+      const st = rowDragRef.current;
+      const during = !!st && st.active && st.secondary;
+      const after = suppressContextMenuUntilRef.current > 0 && performance.now() < suppressContextMenuUntilRef.current;
+      if (!during && !after) return;
+      if (after) suppressContextMenuUntilRef.current = 0;
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    window.addEventListener('contextmenu', onContextMenu, true);
+    return () => window.removeEventListener('contextmenu', onContextMenu, true);
+  }, []);
+
   // The ghost's position is set outside React so pointer moves do not re-render the panel
   useLayoutEffect(() => {
     const st = rowDragRef.current;
@@ -1546,8 +1924,12 @@ export const FilePanel: React.FC<FilePanelProps> = ({
   }, [rowDragGhost]);
 
   const handleRowsPointerDown = (e: React.PointerEvent) => {
-    if (e.button !== 0 || e.pointerType === 'touch' || !sessionId || !onDropItems) return;
-    if (isMac && e.ctrlKey) return; // Control-click opens the context menu on macOS
+    cancelSlowClickRename();
+    pressHadFocusRef.current = !!panelRef.current?.contains(document.activeElement);
+    // Right-button drags (mouse only) end in the copy-or-move chooser
+    const secondary = e.button === 2 && e.pointerType === 'mouse';
+    if ((e.button !== 0 && !secondary) || e.pointerType === 'touch' || !sessionId || !onDropItems) return;
+    if (!secondary && isMac && e.ctrlKey) return; // Control-click opens the context menu on macOS
     const hit = rowFromEvent(e);
     if (!hit || hit.item.kind !== 'file') return;
     endRowDrag();
@@ -1564,7 +1946,10 @@ export const FilePanel: React.FC<FilePanelProps> = ({
       y: e.clientY,
       altKey: e.altKey,
       hoverId: null,
+      overTab: false,
       scrollRaf: null,
+      secondary,
+      sourceLabel: title,
     };
     window.addEventListener('pointermove', rowDragListeners.move, true);
     window.addEventListener('pointerup', rowDragListeners.up, true);
@@ -1647,24 +2032,22 @@ export const FilePanel: React.FC<FilePanelProps> = ({
   };
 
   // OS file drops (Finder/Explorer): Tauri delivers absolute paths and the pointer position.
+  // One subscription for the pane's whole life: the session can change mid-drag (a tab springs
+  // open), and Tauri sends 'enter' only once per drag, so the handler reads the session through
+  // refs and the drag state lives in osFileDrag.
   useEffect(() => {
-    if (!isTauri() || !sessionId) return;
+    if (!isTauri()) return;
     let disposed = false;
     let unlisten: (() => void) | null = null;
-    let active = false;
 
     /** Folder under the drop point, or null when the point is not on this pane's visible list. */
     const targetAt = (pos: { x: number; y: number }): PaneDropHit | null => {
-      // wry reports AppKit points (macOS) and GTK logical pixels (Linux), which already are CSS
-      // pixels; only Windows reports physical pixels.
-      const scale = IS_WINDOWS ? window.devicePixelRatio || 1 : 1;
-      const x = pos.x / scale;
-      const y = pos.y / scale;
+      const { x, y } = osDragPointToCss(pos);
       const listEl = scrollRef.current;
       const rect = listEl?.getBoundingClientRect();
       if (!listEl || !rect || x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return null;
       // A dialog or menu covering the pane takes the drop away from it: never upload "through" an overlay.
-      if (document.querySelector('[aria-modal="true"], [role="menu"]')) return null;
+      if (overlayBlocksDrop()) return null;
       const topEl = document.elementFromPoint(x, y);
       if (!topEl || !listEl.contains(topEl)) return null;
       return hitTestList(topEl);
@@ -1673,25 +2056,26 @@ export const FilePanel: React.FC<FilePanelProps> = ({
     getCurrentWebview()
       .onDragDropEvent((event) => {
         const p = event.payload;
+        const carriesFiles = osFileDrag.track(p);
         if (p.type === 'leave') {
-          active = false;
           clearDragUi();
           return;
         }
-        if (p.type === 'enter') {
-          active = !!p.paths?.length;
-          if (!active) return;
-        }
-        if (!active) return;
+        if (!carriesFiles) return;
+        // No session (empty pane): hitTestList answers null, so the pane shows no target
         const hit = targetAt(p.position);
         if (p.type === 'drop') {
-          active = false;
           clearDragUi();
-          if (hit && p.paths?.length) void queueTransferRef.current('local', p.paths, hit.destDir, true);
+          if (hit && p.paths?.length) {
+            // Copy or move? The chooser asks (Copy is the default), so originals are never removed by surprise
+            const pt = (i18n.language || '').startsWith('pt');
+            void queueTransferRef.current('local', p.paths, hit.destDir, 'ask', { sourceLabel: pt ? 'Este computador' : 'This computer' });
+          }
           return;
         }
         setDragOverKey(hit?.key ?? null);
         setIsDragOverContainer(!!hit && !hit.key);
+        showDropHint(hit ? hit.destDir : null, 'ask');
       })
       .then((fn) => {
         if (disposed) fn();
@@ -1705,7 +2089,7 @@ export const FilePanel: React.FC<FilePanelProps> = ({
       disposed = true;
       unlisten?.();
     };
-  }, [sessionId]); // targetAt reads refs only
+  }, []); // targetAt, clearDragUi, showDropHint and queueTransferRef read refs/setters only
 
   /* ------------------------------- Pointer handlers ------------------------------ */
 
@@ -1742,11 +2126,42 @@ export const FilePanel: React.FC<FilePanelProps> = ({
       selectRange(anchorIdx >= 0 ? anchorIdx : index, index);
       return;
     }
+    const sel = selectedRef.current;
+    const wasOnlySelection = sel.length === 1 && sel[0] === item.file.path;
     anchorKeyRef.current = item.key;
     onSelectFile(item.file.path, e.metaKey || e.ctrlKey);
+
+    // Slow second click on the name of the only selected item renames it (Finder). Waits out a
+    // possible double-click, and never fires for the click that only brought focus to this pane.
+    const onName = !!(e.target as HTMLElement | null)?.closest?.('[data-name-cell]');
+    if (
+      onRenameInline &&
+      wasOnlySelection &&
+      onName &&
+      e.detail === 1 &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      !e.altKey &&
+      pressHadFocusRef.current &&
+      !renamingRef.current
+    ) {
+      const path = item.file.path;
+      cancelSlowClickRename();
+      slowClickTimerRef.current = setTimeout(() => {
+        slowClickTimerRef.current = null;
+        const now = selectedRef.current;
+        if (rowDragRef.current?.active || renamingRef.current || now.length !== 1 || now[0] !== path) return;
+        // Only while the list itself has the keyboard: never take focus from the filter field,
+        // a menu or a dialog that opened in the meantime
+        if (!panelRef.current || document.activeElement !== panelRef.current) return;
+        const row = rowsRef.current.find((r) => r.kind === 'file' && r.file.path === path);
+        if (row && row.kind === 'file') startRenameRef.current(row.file);
+      }, SLOW_CLICK_RENAME_MS);
+    }
   };
 
   const handleRowsDoubleClick = (e: React.MouseEvent) => {
+    cancelSlowClickRename();
     const hit = rowFromEvent(e);
     if (!hit) return;
     e.stopPropagation();
@@ -1758,6 +2173,7 @@ export const FilePanel: React.FC<FilePanelProps> = ({
   };
 
   const handleRowsContextMenu = (e: React.MouseEvent) => {
+    cancelSlowClickRename();
     const hit = rowFromEvent(e);
     if (!hit || hit.item.kind !== 'file') return; // background menu
     e.preventDefault();
@@ -1776,6 +2192,7 @@ export const FilePanel: React.FC<FilePanelProps> = ({
 
   const handleContainerContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
+    cancelSlowClickRename();
     if (!sessionId) return;
     focusPanel();
     setContextMenu({ x: e.clientX, y: e.clientY, file: null, targetPaths: [], isBackground: true });
@@ -1824,6 +2241,7 @@ export const FilePanel: React.FC<FilePanelProps> = ({
   };
 
   const openFilterBar = () => {
+    cancelSlowClickRename();
     if (!showFilterBar) {
       setShowFilterBar(true); // the input autofocuses when it mounts
       return;
@@ -1840,6 +2258,7 @@ export const FilePanel: React.FC<FilePanelProps> = ({
     if (isEditingPath || tagName === 'input' || tagName === 'textarea' || tagName === 'select' || target?.isContentEditable) return;
     if (target?.closest('[role="menu"]')) return;
     if (!sessionId) return;
+    cancelSlowClickRename();
 
     const key = e.key;
     const modKey = e.metaKey || e.ctrlKey;
@@ -1992,7 +2411,7 @@ export const FilePanel: React.FC<FilePanelProps> = ({
       return;
     }
     if (key === 'F2' && !e.shiftKey && !modKey && !e.altKey) {
-      if (!onRename) return;
+      if (!onRename && !onRenameInline) return;
       // One item only: the single selection, or the cursor row when nothing is selected. Never '..'.
       let row: RowItem | undefined;
       if (sel.length === 1) row = rowsRef.current.find((r) => r.kind === 'file' && r.file.path === sel[0]);
@@ -2002,7 +2421,7 @@ export const FilePanel: React.FC<FilePanelProps> = ({
       }
       if (row && row.kind === 'file') {
         handled();
-        onRename(row.file);
+        startRename(row.file);
       }
       return;
     }
@@ -2179,9 +2598,51 @@ export const FilePanel: React.FC<FilePanelProps> = ({
     </div>
   );
 
+  /** Inline rename field for the row/card being renamed (undefined for every other one). */
+  const renameSlotFor = (item: RowItem, grid: boolean) => {
+    const r = renaming;
+    if (!r || item.kind !== 'file' || item.key !== r.path) return undefined;
+    return (
+      <InlineRenameInput
+        key={r.nonce}
+        initial={r.name}
+        isDir={r.isDir}
+        busy={r.busy}
+        grid={grid}
+        isPt={isPt}
+        onCommit={(value, via, dirty) => void commitRename(r.nonce, value, via, dirty)}
+        onCancel={() => endRename(true)}
+      />
+    );
+  };
+
+  /** Index of the row being renamed: it is drawn on its own, so scrolling never unmounts its field. */
+  const renameIndex = renaming ? rows.findIndex((r) => r.key === renaming.path) : -1;
+
   function renderListRows() {
     const { first, last } = listRange;
     const slice = rows.slice(first, last);
+    const renderRow = (item: RowItem, index: number) => {
+      const isFileRow = item.kind === 'file';
+      return (
+        <FileRow
+          key={item.key}
+          item={item}
+          index={index}
+          rowId={`${idBase}-r${index}`}
+          selected={isFileRow && selectedSet.has(item.key)}
+          cursor={showCursor && cursorKey === item.key}
+          cut={isFileRow && !!cutSet?.has(item.key)}
+          dropTarget={dragOverKey === item.key}
+          diff={isFileRow ? diffMap?.[item.file.name] : undefined}
+          columns={visibleColumns}
+          template={gridTemplate}
+          locale={locale}
+          isPt={isPt}
+          renameSlot={renameSlotFor(item, false)}
+        />
+      );
+    };
     return (
       <div
         role="rowgroup"
@@ -2192,28 +2653,13 @@ export const FilePanel: React.FC<FilePanelProps> = ({
         onPointerDown={handleRowsPointerDown}
       >
         <div style={{ position: 'absolute', top: first * ROW_H, left: 0, right: 0 }}>
-          {slice.map((item, i) => {
-            const index = first + i;
-            const isFileRow = item.kind === 'file';
-            return (
-              <FileRow
-                key={item.key}
-                item={item}
-                index={index}
-                rowId={`${idBase}-r${index}`}
-                selected={isFileRow && selectedSet.has(item.key)}
-                cursor={showCursor && cursorKey === item.key}
-                cut={isFileRow && !!cutSet?.has(item.key)}
-                dropTarget={dragOverKey === item.key}
-                diff={isFileRow ? diffMap?.[item.file.name] : undefined}
-                columns={visibleColumns}
-                template={gridTemplate}
-                locale={locale}
-                isPt={isPt}
-              />
-            );
-          })}
+          {slice.map((item, i) =>
+            first + i === renameIndex ? <div key={item.key} style={{ height: ROW_H }} aria-hidden /> : renderRow(item, first + i)
+          )}
         </div>
+        {renameIndex >= 0 && (
+          <div style={{ position: 'absolute', top: renameIndex * ROW_H, left: 0, right: 0 }}>{renderRow(rows[renameIndex], renameIndex)}</div>
+        )}
       </div>
     );
   }
@@ -2240,6 +2686,25 @@ export const FilePanel: React.FC<FilePanelProps> = ({
     const stride = CARD_H + CARD_GAP;
     const slice = rows.slice(firstRow * gridCols, lastRow * gridCols);
     const height = rowCount > 0 ? GRID_PAD * 2 + rowCount * stride - CARD_GAP : 0;
+    const cardW = Math.max(0, (viewport.width - GRID_PAD * 2 - (gridCols - 1) * CARD_GAP) / gridCols);
+    const renderCard = (item: RowItem, index: number) => {
+      const isFileRow = item.kind === 'file';
+      return (
+        <FileCard
+          key={item.key}
+          item={item}
+          index={index}
+          rowId={`${idBase}-r${index}`}
+          selected={isFileRow && selectedSet.has(item.key)}
+          cursor={showCursor && cursorKey === item.key}
+          cut={isFileRow && !!cutSet?.has(item.key)}
+          dropTarget={dragOverKey === item.key}
+          diff={isFileRow ? diffMap?.[item.file.name] : undefined}
+          isPt={isPt}
+          renameSlot={renameSlotFor(item, true)}
+        />
+      );
+    };
     return (
       <>
         <div
@@ -2265,23 +2730,21 @@ export const FilePanel: React.FC<FilePanelProps> = ({
           >
             {slice.map((item, i) => {
               const index = firstRow * gridCols + i;
-              const isFileRow = item.kind === 'file';
-              return (
-                <FileCard
-                  key={item.key}
-                  item={item}
-                  index={index}
-                  rowId={`${idBase}-r${index}`}
-                  selected={isFileRow && selectedSet.has(item.key)}
-                  cursor={showCursor && cursorKey === item.key}
-                  cut={isFileRow && !!cutSet?.has(item.key)}
-                  dropTarget={dragOverKey === item.key}
-                  diff={isFileRow ? diffMap?.[item.file.name] : undefined}
-                  isPt={isPt}
-                />
-              );
+              return index === renameIndex ? <div key={item.key} style={{ height: CARD_H }} aria-hidden /> : renderCard(item, index);
             })}
           </div>
+          {renameIndex >= 0 && (
+            <div
+              style={{
+                position: 'absolute',
+                top: GRID_PAD + Math.floor(renameIndex / gridCols) * stride,
+                left: GRID_PAD + (renameIndex % gridCols) * (cardW + CARD_GAP),
+                width: cardW,
+              }}
+            >
+              {renderCard(rows[renameIndex], renameIndex)}
+            </div>
+          )}
         </div>
         {displayedFiles.length === 0 && (
           <div className="py-10 text-center text-[12.5px] text-ink-faint">
@@ -2304,12 +2767,17 @@ export const FilePanel: React.FC<FilePanelProps> = ({
       aria-label={title}
       aria-activedescendant={showCursor ? cursorRowId : undefined}
       onKeyDown={handleKeyDown}
+      // Any press in the pane (toolbar, filter, menus, empty space) cancels a pending slow-click
+      // rename; a press on a row re-arms it on its click
+      onPointerDownCapture={cancelSlowClickRename}
       onFocus={() => {
         setHasFocus(true);
         onFocusPanel?.();
       }}
       onBlur={(e) => {
-        if (!e.currentTarget.contains(e.relatedTarget as Node)) setHasFocus(false);
+        if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+        setHasFocus(false);
+        cancelSlowClickRename();
       }}
       onClick={() => {
         onFocusPanel?.();
@@ -2669,6 +3137,30 @@ export const FilePanel: React.FC<FilePanelProps> = ({
         )}
       </div>
 
+      {/* What a drop here would do (row drags and files from Finder/Explorer) */}
+      {dropHint && (
+        <div
+          aria-hidden
+          className="pointer-events-none absolute left-1/2 -translate-x-1/2 bottom-9 z-20 max-w-[calc(100%-24px)] flex items-center gap-1.5 h-7 px-3 rounded-full bg-surface-overlay border border-line shadow-pop text-[12px] text-ink whitespace-nowrap animate-in"
+        >
+          {dropHint.effect === 'copy' ? (
+            <Copy className="w-3.5 h-3.5 shrink-0 text-ink-muted" />
+          ) : dropHint.effect === 'move' ? (
+            <FolderInput className="w-3.5 h-3.5 shrink-0 text-ink-muted" />
+          ) : (
+            <ArrowDownToLine className="w-3.5 h-3.5 shrink-0 text-ink-muted" />
+          )}
+          <span className="shrink-0">
+            {dropHint.effect === 'copy'
+              ? isPt ? 'Copiar para' : 'Copy to'
+              : dropHint.effect === 'move'
+              ? isPt ? 'Mover para' : 'Move to'
+              : isPt ? 'Copiar ou mover para' : 'Copy or move to'}
+          </span>
+          <bdi className="min-w-0 truncate font-mono text-[11.5px] text-ink-muted">{safeDisplayName(basename(dropHint.destDir) || dropHint.destDir)}</bdi>
+        </div>
+      )}
+
       {/* Status bar */}
       {sessionId && (
         <div className="flex items-center gap-1.5 h-6 px-3 border-t border-line text-[11.5px] text-ink-faint tabular-nums select-none whitespace-nowrap overflow-hidden">
@@ -2707,7 +3199,8 @@ export const FilePanel: React.FC<FilePanelProps> = ({
           onCopy={onCopy}
           onPaste={onPaste ? handlePasteHere : undefined}
           onDuplicate={onDuplicate}
-          onRename={onRename}
+          onRename={onRename || onRenameInline ? startRename : undefined}
+          renameInPlace={!!onRenameInline}
           onGoHome={onGoHome}
           onOpenAiAssistant={onOpenAiAssistant}
           onRequestCompress={onRequestCompress}
@@ -2803,6 +3296,22 @@ export const FilePanel: React.FC<FilePanelProps> = ({
           document.body
         )}
 
+      {dropChoice && (
+        <DropActionModal
+          isOpen
+          onClose={() => setDropChoice(null)}
+          onChoose={(action) => {
+            const c = dropChoice;
+            void sendWithConflictCheck(c.sourceSessionId, c.destSessionId, c.paths, c.destDir, action === 'copy', c.verifyDest);
+          }}
+          paths={dropChoice.paths}
+          sourceLabel={dropChoice.sourceLabel}
+          destLabel={title}
+          destDir={dropChoice.destDir}
+          sameSession={dropChoice.sourceSessionId === dropChoice.destSessionId}
+        />
+      )}
+
       {binaryConfirm &&
         createPortal(
           <Modal
@@ -2891,7 +3400,11 @@ export const FilePanel: React.FC<FilePanelProps> = ({
             </bdi>
             {rowDragGhost.effect !== 'none' && (
               <span className="shrink-0 text-[11px] text-ink-faint">
-                {rowDragGhost.effect === 'copy' ? (isPt ? 'Copiar' : 'Copy') : isPt ? 'Mover' : 'Move'}
+                {rowDragGhost.effect === 'copy'
+                  ? isPt ? 'Copiar' : 'Copy'
+                  : rowDragGhost.effect === 'move'
+                  ? isPt ? 'Mover' : 'Move'
+                  : isPt ? 'Copiar ou mover…' : 'Copy or move…'}
               </span>
             )}
           </div>,

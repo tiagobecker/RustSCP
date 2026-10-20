@@ -383,6 +383,7 @@ mod tests {
             auth,
             remote_root: "/".into(),
             tls_fingerprint: None,
+            group: None,
         }
     }
 

@@ -37,6 +37,30 @@ export interface ConnectionConfig {
   remote_root: string;
   /** FTPS only: SHA-256 fingerprint of a self-signed server certificate to trust. */
   tls_fingerprint?: string | null;
+  /** Folder in the site list, '/'-separated (e.g. "Production/Web"). Missing or null: top level. */
+  group?: string | null;
+}
+
+/** Result of `preview_winscp_ini`. `sites` carry the stored-secret marker instead of passwords. */
+export interface WinScpImportResult {
+  total_sessions: number;
+  /** Sessions whose saved WinSCP password was recovered. */
+  decrypted_passwords: number;
+  /** Sessions that authenticate with a private key file. */
+  key_auth_sessions: number;
+  /** WinSCP folders, '/'-separated. */
+  folders: string[];
+  sites: ConnectionConfig[];
+  /** Stored passwords that could not be recovered; those sites are imported without one. */
+  undecrypted_passwords?: number;
+  /** Key sites whose key is a PuTTY .ppk file (must be converted to OpenSSH format). */
+  ppk_key_sessions?: number;
+  /** Key sites whose key file does not exist on this computer. */
+  missing_key_files?: number;
+  /** WinSCP protects its passwords with a master password: no password was imported. */
+  master_password_protected?: boolean;
+  /** Entries left out (workspace entries, or sessions beyond the import limit). */
+  skipped_sessions?: number;
 }
 
 export type SyncDirection = 'local_to_remote' | 'remote_to_local' | 'both';

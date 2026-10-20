@@ -1,9 +1,21 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useId } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
+import { isTauri } from '@tauri-apps/api/core';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { Plus, X, HardDrive, Lock, Cloud, Server, LayoutGrid, Columns2, ArrowLeftRight } from 'lucide-react';
 import { ConnectionConfig } from '../types.ts';
-import { tabDragManager, DraggingTabState } from '../utils/tabDragManager.ts';
+import {
+  tabDragManager,
+  DraggingTabState,
+  fileDragTabs,
+  TabSpringState,
+  SPRING_DELAY_MS,
+  osDragPointToCss,
+  osFileDrag,
+  overlayBlocksDrop,
+} from '../utils/tabDragManager.ts';
+import { notify } from './ui/toast.tsx';
 
 export interface ActiveSession {
   id: string;
@@ -86,9 +98,11 @@ export const SessionTabs: React.FC<SessionTabsProps> = ({
   onReorderTabs,
   isFocused = false,
 }) => {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [dragState, setDragState] = useState<DraggingTabState | null>(tabDragManager.getState());
   const tabsContainerRef = useRef<HTMLDivElement>(null);
+  const stripRef = useRef<HTMLDivElement>(null);
+  const stripId = useId();
   const pendingDragRef = useRef<{
     pointerId: number;
     startX: number;
@@ -112,6 +126,91 @@ export const SessionTabs: React.FC<SessionTabsProps> = ({
   }, [onMoveTab, onReorderTabs]);
 
   useEffect(() => tabDragManager.subscribe(setDragState), []);
+
+  // ---- Spring-loaded tabs: files dragged onto a tab open it after a short rest; a drop on a tab
+  // sends the files to that session's folder (see fileDragTabs in tabDragManager.ts).
+  const activeIdRef = useRef(activeSessionId);
+  activeIdRef.current = activeSessionId;
+  const onSelectRef = useRef(onSelectSession);
+  onSelectRef.current = onSelectSession;
+  const stripPane = variant === 'pane' ? paneId : undefined;
+
+  useEffect(
+    () =>
+      fileDragTabs.register(stripId, {
+        paneId: stripPane,
+        isActive: (sid) => sid === activeIdRef.current,
+        activate: (sid) => onSelectRef.current(sid),
+      }),
+    [stripId, stripPane]
+  );
+
+  const [spring, setSpring] = useState<TabSpringState | null>(null);
+  useEffect(
+    () =>
+      fileDragTabs.subscribe((s) => {
+        const mine = s && s.stripId === stripId ? s : null;
+        setSpring((prev) => (prev === mine ? prev : mine));
+      }),
+    [stripId]
+  );
+
+  // Files from Finder/Explorer over this strip's tabs (each strip handles its own tabs)
+  useEffect(() => {
+    if (!isTauri()) return;
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+
+    const tabAt = (pos: { x: number; y: number }) => {
+      const { x, y } = osDragPointToCss(pos);
+      const r = stripRef.current?.getBoundingClientRect();
+      if (!r || x < r.left || x > r.right || y < r.top || y > r.bottom || overlayBlocksDrop()) return null;
+      const hit = fileDragTabs.hitTest(document.elementFromPoint(x, y));
+      return hit && hit.stripId === stripId ? hit : null;
+    };
+
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        const p = event.payload;
+        // Shared drag state: a strip mounted mid-drag never sees the drag's single 'enter'
+        const carriesFiles = osFileDrag.track(p);
+        if (p.type === 'leave') {
+          fileDragTabs.clearFrom(stripId);
+          return;
+        }
+        if (!carriesFiles) return;
+        const hit = tabAt(p.position);
+        if (p.type === 'drop') {
+          fileDragTabs.clearFrom(stripId);
+          if (!hit || !p.paths?.length) return;
+          const pt = (i18n.language || '').startsWith('pt');
+          void fileDragTabs.deliver(hit, 'local', p.paths, 'ask', { sourceLabel: pt ? 'Este computador' : 'This computer' }).then((r) => {
+            if (r === 'timeout') {
+              notify.info(
+                pt ? 'A pasta ainda está abrindo' : 'The folder is still opening',
+                pt ? 'Solte de novo quando a lista aparecer.' : 'Drop again when the list appears.'
+              );
+            }
+          });
+          return;
+        }
+        if (hit) fileDragTabs.hover(hit);
+        else fileDragTabs.clearFrom(stripId);
+      })
+      .then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {
+        /* drag-drop events unavailable (web preview) */
+      });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+      fileDragTabs.clearFrom(stripId);
+    };
+  }, [stripId, i18n]);
 
   // Escape cancels an in-progress drag (listener added once per drag, not on every pointer move)
   const isDraggingFromHere = !!dragState && dragState.sourcePane === paneId;
@@ -287,6 +386,8 @@ export const SessionTabs: React.FC<SessionTabsProps> = ({
   const renderTab = (sess: ActiveSession, idx: number) => {
     const isActive = sess.id === activeSessionId;
     const isThisTabDragging = isSourcePane && dragState?.sessionId === sess.id;
+    // Files dragged over this tab: tinted; a bar fills while it is about to open
+    const springHere = spring?.sessionId === sess.id ? spring : null;
     const closable = sess.id !== 'local' && !!onCloseSession;
     const otherPane = paneId === 'left' ? 'right' : 'left';
 
@@ -321,7 +422,9 @@ export const SessionTabs: React.FC<SessionTabsProps> = ({
           className={cx(
             'group relative flex items-center gap-1.5 h-7 pl-2.5 rounded-md text-[12.5px] shrink-0 max-w-[220px] transition-colors select-none outline-none focus-visible:ring-2 focus-visible:ring-rust-500/40',
             closable || (onMoveTab && paneId) ? 'pr-1' : 'pr-2.5',
-            isActive
+            springHere
+              ? 'bg-rust-500/10 text-ink ring-1 ring-rust-500/50'
+              : isActive
               ? 'bg-surface-raised text-ink shadow-xs ring-1 ring-line dark:bg-dark-700'
               : 'text-ink-muted hover:text-ink hover:bg-dark-650/60',
             isThisTabDragging && 'opacity-40',
@@ -366,8 +469,16 @@ export const SessionTabs: React.FC<SessionTabsProps> = ({
             </button>
           )}
 
-          {isActive && isFocused && (
-            <span className="absolute left-2 right-2 bottom-0 h-[2px] rounded-full bg-rust-500" aria-hidden />
+          {springHere?.springing ? (
+            <span
+              key={springHere.token}
+              className="absolute left-2 right-2 bottom-0 h-[2px] rounded-full bg-rust-500 animate-spring-fill"
+              style={{ animationDuration: `${SPRING_DELAY_MS}ms` }}
+              aria-hidden
+            />
+          ) : (
+            isActive &&
+            isFocused && <span className="absolute left-2 right-2 bottom-0 h-[2px] rounded-full bg-rust-500" aria-hidden />
           )}
         </div>
       </React.Fragment>
@@ -377,7 +488,9 @@ export const SessionTabs: React.FC<SessionTabsProps> = ({
   if (variant === 'pane') {
     return (
       <div
+        ref={stripRef}
         data-pane-tabs-id={paneId}
+        data-tab-strip-id={stripId /* TAB_STRIP_ATTR: file drags find this strip's tabs */}
         className={cx(
           'h-9 shrink-0 pl-1.5 pr-1.5 flex items-center justify-between select-none overflow-hidden relative border-b transition-colors',
           isCrossPaneHover ? 'bg-rust-500/[0.06] border-rust-500/40' : 'bg-dark-900 border-line'
@@ -444,7 +557,11 @@ export const SessionTabs: React.FC<SessionTabsProps> = ({
 
   // --- Global Variant (Explorer Mode) ---
   return (
-    <div className="h-9 shrink-0 bg-dark-900 border-b border-line px-1.5 flex items-center justify-between select-none">
+    <div
+      ref={stripRef}
+      data-tab-strip-id={stripId /* TAB_STRIP_ATTR: file drags find this strip's tabs */}
+      className="h-9 shrink-0 bg-dark-900 border-b border-line px-1.5 flex items-center justify-between select-none"
+    >
       <div
         ref={tabsContainerRef}
         role="tablist"

@@ -1110,6 +1110,7 @@ mod tests {
                 auth: AuthMethod::Password("SuperSecretP@ss123!".to_string()),
                 remote_root: "/var/www/html".to_string(),
                 tls_fingerprint: None,
+                group: Some("Production/Web".to_string()),
             },
             ConnectionConfig {
                 id: "site-2".to_string(),
@@ -1121,6 +1122,7 @@ mod tests {
                 auth: AuthMethod::Password("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
                 remote_root: "prod-bucket".to_string(),
                 tls_fingerprint: None,
+                group: Some("Cloud/Storage".to_string()),
             },
             ConnectionConfig {
                 id: "site-3".to_string(),
@@ -1135,6 +1137,7 @@ mod tests {
                 },
                 remote_root: "/root".to_string(),
                 tls_fingerprint: None,
+                group: None,
             },
         ]
     }
@@ -1728,6 +1731,94 @@ mod tests {
         assert_eq!(reloaded.unwrap().len(), 3);
         assert!(!dir.path().join(DEVICE_KEY_FILE).exists());
         assert_eq!(store.get().unwrap(), None, "test item removed");
+    }
+
+    /// Writes `sites_json` (the plaintext an older build serialized) as the local vault
+    /// in `dir`, encrypted with that folder's device key.
+    fn write_raw_local_vault(dir: &Path, sites_json: &str, site_count: usize) {
+        let key = get_or_create_device_key_in(dir).unwrap();
+        let envelope = encrypt_bytes_with_iterations(
+            sites_json.as_bytes(),
+            &key,
+            site_count,
+            LOCAL_VAULT_KDF_ITERATIONS,
+        )
+        .unwrap();
+        fs::write(
+            dir.join(LOCAL_VAULT_FILE),
+            serde_json::to_string_pretty(&envelope).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_export_round_trip_keeps_site_groups() {
+        let envelope =
+            encrypt_sites_with_iterations(&sample_sites(), "GroupPass", TEST_ITERATIONS).unwrap();
+        let json = serialize_vault_to_json(&envelope).unwrap();
+        let back = decrypt_sites(&parse_vault_from_json(&json).unwrap(), "GroupPass").unwrap();
+        let groups: Vec<_> = back.iter().map(|s| s.group.as_deref()).collect();
+        assert_eq!(
+            groups,
+            vec![Some("Production/Web"), Some("Cloud/Storage"), None]
+        );
+    }
+
+    #[test]
+    fn test_old_vault_without_groups_loads_and_keeps_groups_on_save() {
+        // Plaintext exactly as builds before site folders wrote it: no `group`, no
+        // `tls_fingerprint`.
+        let old_format = r#"[
+            {"id":"local","name":"Local Machine","protocol":"local","host":"localhost",
+             "port":0,"username":"me","auth":{"type":"None"},"remote_root":"/"},
+            {"id":"web-1","name":"Web","protocol":"sftp","host":"web.example.com","port":22,
+             "username":"deploy","auth":{"type":"Password","value":"OldSecret!"},
+             "remote_root":"/var/www"}
+        ]"#;
+        let dir = tempdir().unwrap();
+        write_raw_local_vault(dir.path(), old_format, 2);
+
+        let mut sites = load_vault_in(dir.path()).unwrap();
+        assert_eq!(sites.len(), 2);
+        assert!(sites.iter().all(|s| s.group.is_none()));
+        assert!(matches!(&sites[1].auth, AuthMethod::Password(p) if p == "OldSecret!"));
+
+        // Filing the site into a folder survives a save and a reload.
+        sites[1].group = Some("Clientes/São Paulo".to_string());
+        save_vault_in(dir.path(), &sites).unwrap();
+        let reloaded = load_vault_in(dir.path()).unwrap();
+        assert_eq!(reloaded[0].group, None);
+        assert_eq!(reloaded[1].group.as_deref(), Some("Clientes/São Paulo"));
+        assert!(matches!(&reloaded[1].auth, AuthMethod::Password(p) if p == "OldSecret!"));
+        // The previous (group-less) version is the backup.
+        let bak = fs::read_to_string(dir.path().join(LOCAL_VAULT_BACKUP_FILE)).unwrap();
+        let key = read_device_key_in(dir.path()).unwrap().unwrap();
+        assert!(decrypt_local_envelope(&bak, &key)
+            .unwrap()
+            .iter()
+            .all(|s| s.group.is_none()));
+    }
+
+    #[test]
+    fn test_vault_written_by_the_september_build_keeps_its_groups() {
+        // That build serialized `group` on every site, `null` included.
+        let wip_format = r#"[
+            {"id":"a","name":"A","protocol":"sftp","host":"a.example.com","port":22,
+             "username":"u","auth":{"type":"None"},"remote_root":"/","group":null},
+            {"id":"winscp-1","name":"B","protocol":"ftp","host":"b.example.com","port":21,
+             "username":"u","auth":{"type":"Password","value":"pw"},"remote_root":"/",
+             "group":"Suporte/Dedicado"}
+        ]"#;
+        let dir = tempdir().unwrap();
+        write_raw_local_vault(dir.path(), wip_format, 2);
+        let sites = load_vault_in(dir.path()).unwrap();
+        assert_eq!(sites[0].group, None);
+        assert_eq!(sites[1].group.as_deref(), Some("Suporte/Dedicado"));
+
+        save_vault_in(dir.path(), &sites).unwrap();
+        let reloaded = load_vault_in(dir.path()).unwrap();
+        assert_eq!(reloaded[1].group.as_deref(), Some("Suporte/Dedicado"));
+        assert_eq!(reloaded[0].group, None);
     }
 
     #[test]

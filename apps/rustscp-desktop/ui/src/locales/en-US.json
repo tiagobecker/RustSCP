@@ -211,7 +211,9 @@
     "externalEditorHelp": "Command used by “Open in external editor”. Leave empty to use the system default.",
     "nativeTerminal": "System terminal",
     "nativeTerminalHelp": "“Open in system Terminal” launches your OS terminal with the current SSH session and folder.",
-    "done": "Done"
+    "done": "Done",
+    "preferExternalEditor": "Open files in the external editor",
+    "preferExternalEditorDesc": "Edit, F4 and double-click use it instead of the built-in editor."
   },
   "sessionTabs": {
     "paneLeft": "Left pane",
@@ -310,7 +312,17 @@
     "ftpsHint": "FTP over TLS (explicit): user name, password and files are encrypted",
     "tlsFingerprint": "Trusted certificate (SHA-256)",
     "tlsFingerprintHint": "Only for a server with a self-signed certificate. Certificates your system trusts are always accepted. If the connection reports an untrusted certificate, compare its fingerprint with the server's and paste it here.",
-    "errFingerprint": "The trusted certificate must be a SHA-256 fingerprint (64 hexadecimal digits)."
+    "errFingerprint": "The trusted certificate must be a SHA-256 fingerprint (64 hexadecimal digits).",
+    "folder": "Folder",
+    "folderHint": "Groups this connection in the site list. Use / for subfolders; leave empty for the top level.",
+    "folderPlaceholder": "e.g. Production/Web",
+    "folderSuggestions": "Existing folders",
+    "collapseFolders": "Collapse all folders",
+    "expandFolders": "Expand all folders",
+    "filterHint": "Filter by name, server, user or folder",
+    "clearFilter": "Clear filter",
+    "importWinscp": "Import from WinSCP…",
+    "winscpHint": "Bring over your WinSCP sites, folders and saved passwords"
   },
   "virtualDisk": {
     "title": "Native Virtual Disk & Network Drive",

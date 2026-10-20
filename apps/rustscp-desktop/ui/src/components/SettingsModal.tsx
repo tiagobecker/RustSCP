@@ -16,6 +16,9 @@ interface SettingsModalProps {
   onToggleRememberLastRemoteDir: (enabled: boolean) => void;
   externalEditorCmd: string;
   onSaveExternalEditorCmd: (cmd: string) => void;
+  /** Edit / F4 / double-click open the external editor instead of the built-in one */
+  preferExternalEditor?: boolean;
+  onTogglePreferExternalEditor?: (enabled: boolean) => void;
   onOpenRemoteTrashModal?: () => void;
   onOpenAbout?: () => void;
 }
@@ -44,6 +47,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onToggleRememberLastRemoteDir,
   externalEditorCmd,
   onSaveExternalEditorCmd,
+  preferExternalEditor = false,
+  onTogglePreferExternalEditor,
   onOpenRemoteTrashModal,
   onOpenAbout,
 }) => {
@@ -221,6 +226,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       ))}
                     </div>
                   </SettingsRow>
+                  {onTogglePreferExternalEditor && (
+                    <SettingsRow
+                      label={t('settings.preferExternalEditor', 'Open files in the external editor')}
+                      description={t('settings.preferExternalEditorDesc', 'Edit, F4 and double-click use it instead of the built-in editor.')}
+                    >
+                      <Toggle
+                        checked={preferExternalEditor}
+                        onChange={onTogglePreferExternalEditor}
+                        label={t('settings.preferExternalEditor', 'Open files in the external editor')}
+                      />
+                    </SettingsRow>
+                  )}
                 </SettingsGroup>
 
                 <SettingsGroup
