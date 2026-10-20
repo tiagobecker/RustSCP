@@ -256,6 +256,7 @@ export interface VaultSecurityInfo {
   vault_path: string;
   site_count: number;
   has_custom_master_password: boolean;
+  /** 'macos-keychain' (key_path names the Keychain item) or 'file' (key_path is the 0600 key file). */
   key_storage?: string;
   key_path?: string;
   export_kdf_iterations?: number;

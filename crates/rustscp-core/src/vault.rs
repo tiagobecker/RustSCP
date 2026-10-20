@@ -38,8 +38,11 @@ pub const MAX_PASSWORD_KDF_ITERATIONS: u32 = 10_000_000;
 pub const LOCAL_VAULT_KDF_ITERATIONS: u32 = 1;
 pub const SALT_LEN: usize = 32;
 pub const NONCE_LEN: usize = 12;
-/// Where the local device key lives. It is a plain file next to the vault, not an OS keychain.
-pub const DEVICE_KEY_STORAGE: &str = "file";
+/// `key_storage` value: the device key is the file `.vault_key` next to the vault (0600).
+/// Windows and Linux always use it; macOS only when the Keychain cannot be used.
+pub const DEVICE_KEY_STORAGE_FILE: &str = "file";
+/// `key_storage` value: the device key is an item in the macOS login Keychain.
+pub const DEVICE_KEY_STORAGE_KEYCHAIN: &str = "macos-keychain";
 
 const LOCAL_VAULT_FILE: &str = "sites.vault";
 const DEVICE_KEY_FILE: &str = ".vault_key";
@@ -71,6 +74,10 @@ pub enum VaultError {
     /// The envelope names a cipher or KDF this build does not implement.
     #[error("Unsupported vault algorithm: {0}")]
     UnsupportedAlgorithm(String),
+    /// The device key is kept in the OS keychain, which could not be read (locked, or
+    /// access denied). Nothing is created or overwritten: the vault stays as it is.
+    #[error("The saved-sites key could not be read from the macOS Keychain ({0}); the saved sites were left untouched. Allow RustSCP to access the Keychain and restart it")]
+    KeychainUnavailable(String),
 }
 
 impl VaultError {
@@ -87,6 +94,7 @@ impl VaultError {
             VaultError::DeviceKeyMissing(_) => "vault.device_key_missing",
             VaultError::KdfOutOfRange(_) => "vault.kdf_out_of_range",
             VaultError::UnsupportedAlgorithm(_) => "vault.unsupported_algorithm",
+            VaultError::KeychainUnavailable(_) => "vault.keychain_unavailable",
         }
     }
 }
@@ -112,8 +120,8 @@ pub struct VaultEnvelope {
 ///
 /// The fields describe the local `sites.vault` as it is on disk. `kdf`/`kdf_iterations`
 /// come from the file's own envelope; `key_storage`/`key_path` say where the device key
-/// lives (a plain file next to the vault). `load_error`/`backup_path` are filled by the
-/// app when the vault could not be loaded at startup and was moved aside.
+/// really is (the macOS Keychain, or a file next to the vault). `load_error`/`backup_path`
+/// are filled by the app when the vault could not be loaded at startup.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VaultSecurityInfo {
     pub is_encrypted: bool,
@@ -123,7 +131,8 @@ pub struct VaultSecurityInfo {
     pub vault_path: String,
     pub site_count: usize,
     pub has_custom_master_password: bool,
-    /// "file": the device key is stored in `key_path`, next to the vault.
+    /// [`DEVICE_KEY_STORAGE_FILE`] (`key_path` is the key file) or
+    /// [`DEVICE_KEY_STORAGE_KEYCHAIN`] (`key_path` names the Keychain item).
     #[serde(default)]
     pub key_storage: String,
     #[serde(default)]
@@ -494,14 +503,266 @@ fn read_device_key_in(dir: &Path) -> Result<Option<String>, VaultError> {
     }
 }
 
-/// Returns the device key stored in `dir`, creating one only when no vault exists yet.
-fn get_or_create_device_key_in(dir: &Path) -> Result<String, VaultError> {
-    ensure_private_dir(dir)?;
-    if let Some(key) = read_device_key_in(dir)? {
-        return Ok(key);
+/// Where a device key lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyStorage {
+    File,
+    Keychain,
+}
+
+impl KeyStorage {
+    fn as_str(self) -> &'static str {
+        match self {
+            KeyStorage::File => DEVICE_KEY_STORAGE_FILE,
+            KeyStorage::Keychain => DEVICE_KEY_STORAGE_KEYCHAIN,
+        }
+    }
+}
+
+/// A secure OS store for the device key of one vault (the macOS Keychain). Unit tests
+/// use an in-memory store, so they never touch the real Keychain.
+trait KeyStore {
+    /// Where the key is, for people ("macOS Keychain, item ...").
+    fn location(&self) -> String;
+    /// The stored key, `None` when there is none, `Err` when the store cannot be read.
+    fn get(&self) -> Result<Option<String>, String>;
+    /// Stores `key` unless a key is already stored (never replaces one): `Ok(false)`
+    /// means another key was there first.
+    fn add(&self, key: &str) -> Result<bool, String>;
+}
+
+/// The OS key store for the vault in `dir`: the macOS Keychain on macOS, none on
+/// Windows and Linux (they keep the 0600 key file). Unit tests get none.
+fn platform_key_store(dir: &Path) -> Option<Box<dyn KeyStore>> {
+    #[cfg(all(target_os = "macos", not(test)))]
+    {
+        Some(Box::new(keychain::MacKeychain::for_vault_dir(dir)))
+    }
+    #[cfg(not(all(target_os = "macos", not(test))))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod keychain {
+    use super::KeyStore;
+    use core_foundation::data::CFData;
+    use security_framework::item::{ItemAddOptions, ItemAddValue, ItemClass};
+    use security_framework::passwords::{generic_password, PasswordOptions};
+    use std::path::Path;
+
+    const SERVICE: &str = "com.rustscp.desktop.vault";
+    const LABEL: &str = "RustSCP saved-sites key";
+    const ERR_SEC_DUPLICATE_ITEM: i32 = -25299;
+    const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+
+    /// A generic password in the login keychain. The account is the vault's folder, so
+    /// separate config folders (RUSTSCP_CONFIG_DIR) never share or overwrite a key.
+    pub(super) struct MacKeychain {
+        account: String,
     }
 
+    impl MacKeychain {
+        pub(super) fn for_vault_dir(dir: &Path) -> Self {
+            Self {
+                account: dir.to_string_lossy().into_owned(),
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) fn delete(&self) {
+            let _ = security_framework::passwords::delete_generic_password(SERVICE, &self.account);
+        }
+    }
+
+    fn describe(e: security_framework::base::Error) -> String {
+        format!("{e} (OSStatus {})", e.code())
+    }
+
+    impl KeyStore for MacKeychain {
+        fn location(&self) -> String {
+            format!("macOS Keychain (login keychain), item \"{LABEL}\"")
+        }
+
+        fn get(&self) -> Result<Option<String>, String> {
+            match generic_password(PasswordOptions::new_generic_password(
+                SERVICE,
+                &self.account,
+            )) {
+                Ok(bytes) => String::from_utf8(bytes)
+                    .map(|k| Some(k.trim().to_string()).filter(|k| !k.is_empty()))
+                    .map_err(|_| "the Keychain item does not hold a text key".to_string()),
+                Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
+                Err(e) => Err(describe(e)),
+            }
+        }
+
+        fn add(&self, key: &str) -> Result<bool, String> {
+            // SecItemAdd, not the add-or-update of set_generic_password: a key that is
+            // already stored may protect a vault and must never be replaced.
+            let mut item = ItemAddOptions::new(ItemAddValue::Data {
+                class: ItemClass::generic_password(),
+                data: CFData::from_buffer(key.as_bytes()),
+            });
+            item.set_service(SERVICE)
+                .set_account_name(&self.account)
+                .set_label(LABEL)
+                .set_comment("Decrypts RustSCP's saved sites (sites.vault)");
+            match item.add() {
+                Ok(()) => Ok(true),
+                Err(e) if e.code() == ERR_SEC_DUPLICATE_ITEM => Ok(false),
+                Err(e) => Err(describe(e)),
+            }
+        }
+    }
+}
+
+/// The device key of a vault and where it was found.
+struct DeviceKey {
+    key: String,
+    storage: KeyStorage,
+}
+
+fn remove_key_file(dir: &Path) {
+    match fs::remove_file(dir.join(DEVICE_KEY_FILE)) {
+        Ok(()) => sync_dir(dir),
+        Err(e) => tracing::warn!("could not delete the old vault key file: {e}"),
+    }
+}
+
+/// Moves the key of `.vault_key` into `store`: adds it, reads it back, and only then
+/// deletes the file. On any failure the file stays and is used (and retried) next time.
+fn migrate_key_file(dir: &Path, store: &dyn KeyStore, key: &str) -> KeyStorage {
+    if let Err(e) = store.add(key) {
+        tracing::warn!(
+            "could not move the vault key into the {}: {e}",
+            store.location()
+        );
+        return KeyStorage::File;
+    }
+    match store.get() {
+        Ok(Some(stored)) if stored == key => {
+            remove_key_file(dir);
+            tracing::info!("vault key moved into the {}", store.location());
+            KeyStorage::Keychain
+        }
+        Ok(_) => {
+            tracing::warn!(
+                "the {} holds a different vault key; the key file is kept",
+                store.location()
+            );
+            KeyStorage::File
+        }
+        Err(e) => {
+            tracing::warn!(
+                "could not verify the vault key in the {}: {e}",
+                store.location()
+            );
+            KeyStorage::File
+        }
+    }
+}
+
+/// Finds the device key of the vault in `dir` without ever creating one.
+///
+/// With a `store`, a key still in `.vault_key` is moved into it when `migrate` is set
+/// (the file is deleted once the store returns the same key). A store that cannot be
+/// read falls back to the key file; without one that is [`VaultError::KeychainUnavailable`].
+fn resolve_device_key(
+    dir: &Path,
+    store: Option<&dyn KeyStore>,
+    migrate: bool,
+) -> Result<Option<DeviceKey>, VaultError> {
+    let file_key = read_device_key_in(dir)?;
+    let from_file = |key: String| DeviceKey {
+        key,
+        storage: KeyStorage::File,
+    };
+    let Some(store) = store else {
+        return Ok(file_key.map(from_file));
+    };
+    let stored = match store.get() {
+        Ok(stored) => stored,
+        Err(e) => {
+            return match file_key {
+                Some(key) => {
+                    tracing::warn!(
+                        "{} unavailable ({e}); using the vault key file",
+                        store.location()
+                    );
+                    Ok(Some(from_file(key)))
+                }
+                None => Err(VaultError::KeychainUnavailable(e)),
+            }
+        }
+    };
+    let from_store = |key: String| DeviceKey {
+        key,
+        storage: KeyStorage::Keychain,
+    };
+    Ok(match (stored, file_key) {
+        (None, None) => None,
+        (Some(key), None) => Some(from_store(key)),
+        (None, Some(key)) => {
+            let storage = if migrate {
+                migrate_key_file(dir, store, &key)
+            } else {
+                KeyStorage::File
+            };
+            Some(DeviceKey { key, storage })
+        }
+        (Some(stored), Some(file)) if stored == file => {
+            // A migration that stopped before deleting the file.
+            if migrate {
+                remove_key_file(dir);
+            }
+            Some(from_store(stored))
+        }
+        (Some(stored), Some(file)) => {
+            // Two different keys (e.g. an older RustSCP made a new key file). Use the one
+            // that opens the vault and delete neither: the other may open a copy of it.
+            let vault = fs::read_to_string(dir.join(LOCAL_VAULT_FILE)).ok();
+            let opens = |key: &str| {
+                vault
+                    .as_deref()
+                    .is_some_and(|v| decrypt_local_envelope(v, key).is_ok())
+            };
+            tracing::warn!(
+                "the {} and {} hold different vault keys; both are kept",
+                store.location(),
+                DEVICE_KEY_FILE
+            );
+            if !opens(&stored) && opens(&file) {
+                Some(from_file(file))
+            } else {
+                Some(from_store(stored))
+            }
+        }
+    })
+}
+
+/// Returns the vault's device key, creating one only when no vault exists yet. A new
+/// key goes into `store` when there is one (the key file is the fallback).
+fn get_or_create_device_key_with(
+    dir: &Path,
+    store: Option<&dyn KeyStore>,
+) -> Result<String, VaultError> {
+    ensure_private_dir(dir)?;
     let vault_path = dir.join(LOCAL_VAULT_FILE);
+    let mut store = store;
+    match resolve_device_key(dir, store, true) {
+        Ok(Some(found)) => return Ok(found.key),
+        Ok(None) => {}
+        // No vault depends on the unreadable store yet: a key file will do.
+        Err(VaultError::KeychainUnavailable(e)) if !vault_path.exists() => {
+            tracing::warn!("Keychain unavailable ({e}); the new vault key is kept in a file");
+            store = None;
+        }
+        Err(e) => return Err(e),
+    }
+
     if vault_path.exists() {
         // Never generate a new key over an existing vault: anything saved with it would
         // replace the vault that the lost key could still open.
@@ -513,6 +774,22 @@ fn get_or_create_device_key_in(dir: &Path) -> Result<String, VaultError> {
     let mut random_bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut random_bytes);
     let key_hex = hex::encode(random_bytes);
+
+    if let Some(store) = store {
+        match store.add(&key_hex) {
+            Ok(true) => return Ok(key_hex),
+            // Another RustSCP process stored one first: use theirs.
+            Ok(false) => {
+                return store.get().ok().flatten().ok_or_else(|| {
+                    VaultError::Other("the Keychain reported a vault key it does not return".into())
+                })
+            }
+            Err(e) => tracing::warn!(
+                "could not store the new vault key in the {} ({e}); using a key file",
+                store.location()
+            ),
+        }
+    }
 
     let key_path = dir.join(DEVICE_KEY_FILE);
     if key_path.exists() {
@@ -537,12 +814,22 @@ fn get_or_create_device_key_in(dir: &Path) -> Result<String, VaultError> {
     }
 }
 
-/// Obtém ou gera a chave local do dispositivo com permissões estritas (0600).
+/// File-only variant (no key store), as on Windows and Linux.
+#[cfg(test)]
+fn get_or_create_device_key_in(dir: &Path) -> Result<String, VaultError> {
+    get_or_create_device_key_with(dir, None)
+}
+
+/// Obtém ou gera a chave local do dispositivo: no macOS fica no Keychain; no Windows e
+/// no Linux num arquivo com permissões estritas (0600).
 ///
-/// A new key is created only when no `sites.vault` exists; when the vault exists but the
-/// key file is missing or blank this returns [`VaultError::DeviceKeyMissing`].
+/// A new key is created only when no `sites.vault` exists; when the vault exists but its
+/// key is missing this returns [`VaultError::DeviceKeyMissing`]. A key file left by an
+/// older version is moved into the Keychain (and deleted) on macOS.
 pub fn get_or_create_device_key() -> Result<String, VaultError> {
-    get_or_create_device_key_in(&get_rustscp_config_dir())
+    let dir = get_rustscp_config_dir();
+    let store = platform_key_store(&dir);
+    get_or_create_device_key_with(&dir, store.as_deref())
 }
 
 fn unix_timestamp() -> u64 {
@@ -594,11 +881,16 @@ fn decrypt_local_envelope(
     Ok(serde_json::from_slice(&plaintext)?)
 }
 
-fn save_vault_in(dir: &Path, sites: &[ConnectionConfig]) -> Result<(), VaultError> {
+fn save_vault_with(
+    dir: &Path,
+    store: Option<&dyn KeyStore>,
+    sites: &[ConnectionConfig],
+) -> Result<(), VaultError> {
     ensure_private_dir(dir)?;
     let vault_path = dir.join(LOCAL_VAULT_FILE);
-    // Refuses (DeviceKeyMissing) instead of inventing a key when the vault exists.
-    let device_key = get_or_create_device_key_in(dir)?;
+    // Refuses (DeviceKeyMissing, KeychainUnavailable) instead of inventing a key when
+    // the vault exists.
+    let device_key = get_or_create_device_key_with(dir, store)?;
 
     // Safety net: never overwrite a vault this key cannot open. Keep it as
     // `.corrupt-<ts>` and keep the last good version as `.bak`.
@@ -630,7 +922,10 @@ fn save_vault_in(dir: &Path, sites: &[ConnectionConfig]) -> Result<(), VaultErro
     Ok(())
 }
 
-fn load_vault_in(dir: &Path) -> Result<Vec<ConnectionConfig>, VaultError> {
+fn load_vault_with(
+    dir: &Path,
+    store: Option<&dyn KeyStore>,
+) -> Result<Vec<ConnectionConfig>, VaultError> {
     let vault_path = dir.join(LOCAL_VAULT_FILE);
     let json_str = match fs::read_to_string(&vault_path) {
         Ok(s) => s,
@@ -638,9 +933,21 @@ fn load_vault_in(dir: &Path) -> Result<Vec<ConnectionConfig>, VaultError> {
         Err(e) => return Err(VaultError::IoError(e)),
     };
     // Loading never creates a key: a vault without its key is an error, not "empty".
-    let device_key = read_device_key_in(dir)?
+    // An old key file is moved into the Keychain here, on the first load.
+    let device_key = resolve_device_key(dir, store, true)?
         .ok_or_else(|| VaultError::DeviceKeyMissing(vault_path.to_string_lossy().to_string()))?;
-    decrypt_local_envelope(&json_str, &device_key)
+    decrypt_local_envelope(&json_str, &device_key.key)
+}
+
+/// File-only variants (no key store), as on Windows and Linux.
+#[cfg(test)]
+fn save_vault_in(dir: &Path, sites: &[ConnectionConfig]) -> Result<(), VaultError> {
+    save_vault_with(dir, None, sites)
+}
+
+#[cfg(test)]
+fn load_vault_in(dir: &Path) -> Result<Vec<ConnectionConfig>, VaultError> {
+    load_vault_with(dir, None)
 }
 
 /// Salva a lista de sites no cofre local criptografado.
@@ -650,16 +957,21 @@ fn load_vault_in(dir: &Path) -> Result<Vec<ConnectionConfig>, VaultError> {
 /// an existing vault that the current key cannot open is preserved as
 /// `sites.vault.corrupt-<unix_ts>` before the new one is written.
 pub fn save_local_vault(sites: &[ConnectionConfig]) -> Result<(), VaultError> {
-    save_vault_in(&get_rustscp_config_dir(), sites)
+    let dir = get_rustscp_config_dir();
+    let store = platform_key_store(&dir);
+    save_vault_with(&dir, store.as_deref(), sites)
 }
 
 /// Carrega a lista de sites do cofre local criptografado.
 ///
 /// Returns an empty list only when `sites.vault` does not exist. Every other problem
-/// (unreadable file, missing key, wrong key, corrupt JSON) is an error, so callers must
-/// not treat a failure as "no sites".
+/// (unreadable file, missing key, wrong key, corrupt JSON, Keychain unavailable) is an
+/// error, so callers must not treat a failure as "no sites". On macOS a key file left by
+/// an older version is moved into the Keychain and deleted.
 pub fn load_local_vault() -> Result<Vec<ConnectionConfig>, VaultError> {
-    load_vault_in(&get_rustscp_config_dir())
+    let dir = get_rustscp_config_dir();
+    let store = platform_key_store(&dir);
+    load_vault_with(&dir, store.as_deref())
 }
 
 /// [`save_local_vault`] on a blocking thread.
@@ -676,7 +988,11 @@ pub async fn load_local_vault_async() -> Result<Vec<ConnectionConfig>, VaultErro
         .map_err(|e| VaultError::Other(format!("vault worker failed: {e}")))?
 }
 
-fn vault_security_info_in(dir: &Path, site_count: usize) -> VaultSecurityInfo {
+fn vault_security_info_with(
+    dir: &Path,
+    store: Option<&dyn KeyStore>,
+    site_count: usize,
+) -> VaultSecurityInfo {
     let vault_path = dir.join(LOCAL_VAULT_FILE);
     let key_path = dir.join(DEVICE_KEY_FILE);
     let header = fs::read_to_string(&vault_path)
@@ -692,16 +1008,60 @@ fn vault_security_info_in(dir: &Path, site_count: usize) -> VaultSecurityInfo {
         ),
     };
 
-    let protection_note = format!(
-        "Saved sites are encrypted with {VAULT_CIPHER} using a random 256-bit device key. \
-         The key is stored unencrypted in {} (permissions 0600 on macOS/Linux), in the same \
-         folder as the vault, not in the OS keychain. This protects the vault file if it \
-         leaks on its own, but anyone or anything that can read both files (backups of this \
-         folder, other software running as your user) can decrypt it. No master password \
-         is used. Exported .rustscp-vault files are protected by your export password with \
-         {VAULT_KDF} ({EXPORT_KDF_ITERATIONS} iterations).",
-        key_path.display()
+    // Where the key really is now (no migration from here), or where a new one would go.
+    let (storage, unavailable) = match resolve_device_key(dir, store, false) {
+        Ok(Some(found)) => (found.storage, None),
+        Ok(None) if store.is_some() => (KeyStorage::Keychain, None),
+        Ok(None) => (KeyStorage::File, None),
+        Err(e) => (KeyStorage::Keychain, Some(e.to_string())),
+    };
+    let export = format!(
+        "No master password is used. Exported .rustscp-vault files are protected by your \
+         export password with {VAULT_KDF} ({EXPORT_KDF_ITERATIONS} iterations)."
     );
+    let (key_location, protection_note) = match (storage, store) {
+        (KeyStorage::Keychain, Some(store)) => {
+            let mut note = format!(
+                "Saved sites are encrypted with {VAULT_CIPHER} using a random 256-bit device \
+                 key kept in the {}, not in a file next to the vault, so the vault file or a \
+                 backup of its folder cannot be decrypted on its own. The login keychain is \
+                 unlocked while you are logged in: RustSCP reads the key without asking, and \
+                 macOS asks you before other apps can. Backups made while older versions kept \
+                 the key in {} still contain that key. {export}",
+                store.location(),
+                key_path.display()
+            );
+            if let Some(e) = unavailable {
+                note.push_str(&format!(" The Keychain cannot be read right now: {e}"));
+            } else if key_path.exists() {
+                note.push_str(&format!(
+                    " A separate key file is also present at {} and was kept because it holds \
+                     a different key.",
+                    key_path.display()
+                ));
+            }
+            (store.location(), note)
+        }
+        _ => {
+            let mut note = format!(
+                "Saved sites are encrypted with {VAULT_CIPHER} using a random 256-bit device \
+                 key. The key is stored unencrypted in {} (permissions 0600 on macOS/Linux), in \
+                 the same folder as the vault, not in the OS keychain. This protects the vault \
+                 file if it leaks on its own, but anyone or anything that can read both files \
+                 (backups of this folder, other software running as your user) can decrypt it. \
+                 {export}",
+                key_path.display()
+            );
+            if let Some(store) = store {
+                note.push_str(&format!(
+                    " RustSCP moves the key into the {} when it next opens the vault; it has not \
+                     been able to yet.",
+                    store.location()
+                ));
+            }
+            (key_path.to_string_lossy().to_string(), note)
+        }
+    };
 
     VaultSecurityInfo {
         is_encrypted: header.is_some(),
@@ -711,8 +1071,8 @@ fn vault_security_info_in(dir: &Path, site_count: usize) -> VaultSecurityInfo {
         vault_path: vault_path.to_string_lossy().to_string(),
         site_count,
         has_custom_master_password: false,
-        key_storage: DEVICE_KEY_STORAGE.to_string(),
-        key_path: key_path.to_string_lossy().to_string(),
+        key_storage: storage.as_str().to_string(),
+        key_path: key_location,
         export_kdf_iterations: EXPORT_KDF_ITERATIONS,
         protection_note,
         load_error: None,
@@ -721,10 +1081,12 @@ fn vault_security_info_in(dir: &Path, site_count: usize) -> VaultSecurityInfo {
 }
 
 /// Honest description of the local vault as it is on disk (cipher/KDF read from the
-/// file's envelope, key location, export KDF). `load_error`/`backup_path` are left `None`
-/// for the caller to fill.
+/// file's envelope, where the key really is, export KDF). `load_error`/`backup_path` are
+/// left `None` for the caller to fill.
 pub fn local_vault_security_info(site_count: usize) -> VaultSecurityInfo {
-    vault_security_info_in(&get_rustscp_config_dir(), site_count)
+    let dir = get_rustscp_config_dir();
+    let store = platform_key_store(&dir);
+    vault_security_info_with(&dir, store.as_deref(), site_count)
 }
 
 #[cfg(test)]
@@ -1105,11 +1467,267 @@ mod tests {
     #[test]
     fn test_security_info_without_vault() {
         let dir = tempdir().unwrap();
-        let info = vault_security_info_in(dir.path(), 0);
+        let info = vault_security_info_with(dir.path(), None, 0);
         assert!(!info.is_encrypted);
-        assert_eq!(info.key_storage, DEVICE_KEY_STORAGE);
+        assert_eq!(info.key_storage, DEVICE_KEY_STORAGE_FILE);
         assert!(info.load_error.is_none());
         assert!(info.backup_path.is_none());
+    }
+
+    /// In-memory stand-in for the macOS Keychain.
+    #[derive(Default)]
+    struct MemoryStore {
+        key: std::sync::Mutex<Option<String>>,
+        fail_get: bool,
+        fail_add: bool,
+    }
+
+    impl MemoryStore {
+        fn holding(key: &str) -> Self {
+            let store = Self::default();
+            *store.key.lock().unwrap() = Some(key.to_string());
+            store
+        }
+
+        fn stored(&self) -> Option<String> {
+            self.key.lock().unwrap().clone()
+        }
+    }
+
+    impl KeyStore for MemoryStore {
+        fn location(&self) -> String {
+            "test keychain".to_string()
+        }
+
+        fn get(&self) -> Result<Option<String>, String> {
+            if self.fail_get {
+                return Err("keychain locked".to_string());
+            }
+            Ok(self.stored())
+        }
+
+        fn add(&self, key: &str) -> Result<bool, String> {
+            if self.fail_add {
+                return Err("write refused".to_string());
+            }
+            let mut slot = self.key.lock().unwrap();
+            if slot.is_some() {
+                return Ok(false);
+            }
+            *slot = Some(key.to_string());
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn test_existing_key_file_is_moved_into_the_keychain_and_deleted() {
+        let dir = tempdir().unwrap();
+        // A vault written by a version that kept the key in .vault_key.
+        save_vault_in(dir.path(), &sample_sites()).unwrap();
+        let old_key = read_device_key_in(dir.path()).unwrap().unwrap();
+        let vault_before = fs::read(dir.path().join(LOCAL_VAULT_FILE)).unwrap();
+
+        // Asking where the key is does not move it.
+        let store = MemoryStore::default();
+        let info = vault_security_info_with(dir.path(), Some(&store), 3);
+        assert_eq!(info.key_storage, DEVICE_KEY_STORAGE_FILE);
+        assert!(info.protection_note.contains("has not been able to yet"));
+        assert!(store.stored().is_none());
+
+        // The first load moves it: same key in the store, file gone, vault untouched.
+        assert_eq!(load_vault_with(dir.path(), Some(&store)).unwrap().len(), 3);
+        assert_eq!(store.stored().as_deref(), Some(old_key.as_str()));
+        assert!(
+            !dir.path().join(DEVICE_KEY_FILE).exists(),
+            "key file is deleted"
+        );
+        assert_eq!(
+            fs::read(dir.path().join(LOCAL_VAULT_FILE)).unwrap(),
+            vault_before
+        );
+
+        // Existing vaults keep loading and saving with the key from the store.
+        assert_eq!(load_vault_with(dir.path(), Some(&store)).unwrap().len(), 3);
+        save_vault_with(dir.path(), Some(&store), &sample_sites()[..2]).unwrap();
+        assert_eq!(load_vault_with(dir.path(), Some(&store)).unwrap().len(), 2);
+        assert!(
+            !dir.path().join(DEVICE_KEY_FILE).exists(),
+            "no key file comes back"
+        );
+        let bak = fs::read_to_string(dir.path().join(LOCAL_VAULT_BACKUP_FILE)).unwrap();
+        assert_eq!(decrypt_local_envelope(&bak, &old_key).unwrap().len(), 3);
+
+        let info = vault_security_info_with(dir.path(), Some(&store), 2);
+        assert_eq!(info.key_storage, DEVICE_KEY_STORAGE_KEYCHAIN);
+        assert_eq!(info.key_path, "test keychain");
+        assert!(info
+            .protection_note
+            .contains("not in a file next to the vault"));
+        assert!(!info.protection_note.contains("stored unencrypted"));
+    }
+
+    #[test]
+    fn test_new_vault_key_goes_to_the_keychain_not_a_file() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::default();
+        assert_eq!(
+            vault_security_info_with(dir.path(), Some(&store), 0).key_storage,
+            DEVICE_KEY_STORAGE_KEYCHAIN
+        );
+        save_vault_with(dir.path(), Some(&store), &sample_sites()).unwrap();
+        let key = store.stored().expect("key stored");
+        assert_eq!(key.len(), 64);
+        assert!(!dir.path().join(DEVICE_KEY_FILE).exists());
+        assert_eq!(load_vault_with(dir.path(), Some(&store)).unwrap().len(), 3);
+        // Without the store the vault cannot be opened, and no key is invented for it.
+        assert!(matches!(
+            load_vault_in(dir.path()),
+            Err(VaultError::DeviceKeyMissing(_))
+        ));
+        assert!(matches!(
+            save_vault_in(dir.path(), &[]),
+            Err(VaultError::DeviceKeyMissing(_))
+        ));
+    }
+
+    #[test]
+    fn test_keychain_write_failure_keeps_the_key_file() {
+        let dir = tempdir().unwrap();
+        save_vault_in(dir.path(), &sample_sites()).unwrap();
+        let key = read_device_key_in(dir.path()).unwrap().unwrap();
+        let store = MemoryStore {
+            fail_add: true,
+            ..Default::default()
+        };
+        assert_eq!(load_vault_with(dir.path(), Some(&store)).unwrap().len(), 3);
+        assert_eq!(read_device_key_in(dir.path()).unwrap(), Some(key));
+        save_vault_with(dir.path(), Some(&store), &sample_sites()).unwrap();
+        assert_eq!(
+            vault_security_info_with(dir.path(), Some(&store), 3).key_storage,
+            DEVICE_KEY_STORAGE_FILE
+        );
+
+        // A brand-new vault falls back to a key file too.
+        let fresh = tempdir().unwrap();
+        save_vault_with(fresh.path(), Some(&store), &sample_sites()).unwrap();
+        assert!(fresh.path().join(DEVICE_KEY_FILE).exists());
+        assert_eq!(
+            load_vault_with(fresh.path(), Some(&store)).unwrap().len(),
+            3
+        );
+    }
+
+    #[test]
+    fn test_unreadable_keychain_never_replaces_the_vault() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::default();
+        save_vault_with(dir.path(), Some(&store), &sample_sites()).unwrap();
+        let vault_path = dir.path().join(LOCAL_VAULT_FILE);
+        let original = fs::read(&vault_path).unwrap();
+
+        let locked = MemoryStore {
+            fail_get: true,
+            ..MemoryStore::holding(&store.stored().unwrap())
+        };
+        assert!(matches!(
+            load_vault_with(dir.path(), Some(&locked)),
+            Err(VaultError::KeychainUnavailable(_))
+        ));
+        assert!(matches!(
+            save_vault_with(dir.path(), Some(&locked), &[]),
+            Err(VaultError::KeychainUnavailable(_))
+        ));
+        assert_eq!(fs::read(&vault_path).unwrap(), original, "vault untouched");
+        assert!(
+            !dir.path().join(DEVICE_KEY_FILE).exists(),
+            "no key invented"
+        );
+        let info = vault_security_info_with(dir.path(), Some(&locked), 3);
+        assert_eq!(info.key_storage, DEVICE_KEY_STORAGE_KEYCHAIN);
+        assert!(info.protection_note.contains("cannot be read right now"));
+        assert_eq!(
+            VaultError::KeychainUnavailable(String::new()).code(),
+            "vault.keychain_unavailable"
+        );
+
+        // A key file that is still there keeps working while the keychain is locked.
+        let legacy = tempdir().unwrap();
+        save_vault_in(legacy.path(), &sample_sites()).unwrap();
+        assert_eq!(
+            load_vault_with(legacy.path(), Some(&locked)).unwrap().len(),
+            3
+        );
+        assert!(legacy.path().join(DEVICE_KEY_FILE).exists());
+
+        // With no vault yet, an unreadable keychain falls back to a key file.
+        let fresh = tempdir().unwrap();
+        save_vault_with(fresh.path(), Some(&locked), &sample_sites()).unwrap();
+        assert!(fresh.path().join(DEVICE_KEY_FILE).exists());
+    }
+
+    #[test]
+    fn test_interrupted_migration_and_conflicting_keys() {
+        // The key reached the keychain but the file was not deleted yet.
+        let dir = tempdir().unwrap();
+        save_vault_in(dir.path(), &sample_sites()).unwrap();
+        let key = read_device_key_in(dir.path()).unwrap().unwrap();
+        let store = MemoryStore::holding(&key);
+        assert_eq!(load_vault_with(dir.path(), Some(&store)).unwrap().len(), 3);
+        assert!(!dir.path().join(DEVICE_KEY_FILE).exists());
+
+        // Different keys: the one that opens the vault wins and nothing is deleted.
+        let other = "cd".repeat(32);
+        let dir = tempdir().unwrap();
+        save_vault_in(dir.path(), &sample_sites()).unwrap();
+        let file_key = read_device_key_in(dir.path()).unwrap().unwrap();
+        let store = MemoryStore::holding(&other);
+        assert_eq!(load_vault_with(dir.path(), Some(&store)).unwrap().len(), 3);
+        assert_eq!(
+            read_device_key_in(dir.path()).unwrap(),
+            Some(file_key.clone())
+        );
+        assert_eq!(store.stored(), Some(other.clone()));
+        assert_eq!(
+            vault_security_info_with(dir.path(), Some(&store), 3).key_storage,
+            DEVICE_KEY_STORAGE_FILE
+        );
+
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::default();
+        save_vault_with(dir.path(), Some(&store), &sample_sites()).unwrap();
+        fs::write(dir.path().join(DEVICE_KEY_FILE), &other).unwrap();
+        assert_eq!(load_vault_with(dir.path(), Some(&store)).unwrap().len(), 3);
+        assert!(dir.path().join(DEVICE_KEY_FILE).exists());
+        let info = vault_security_info_with(dir.path(), Some(&store), 3);
+        assert_eq!(info.key_storage, DEVICE_KEY_STORAGE_KEYCHAIN);
+        assert!(info.protection_note.contains("different key"));
+    }
+
+    /// Round trip through the real login keychain with a throwaway item. Not run by
+    /// default (it writes to the Keychain): `cargo test -p rustscp-core real_keychain -- --ignored`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn test_real_keychain_round_trip() {
+        let dir = tempdir().unwrap();
+        let store = keychain::MacKeychain::for_vault_dir(dir.path());
+        store.delete();
+        assert_eq!(store.get().unwrap(), None);
+        save_vault_in(dir.path(), &sample_sites()).unwrap();
+        let key = read_device_key_in(dir.path()).unwrap().unwrap();
+
+        let loaded = load_vault_with(dir.path(), Some(&store));
+        let stored = store.get();
+        let second_add = store.add("ef".repeat(32).as_str());
+        let reloaded = load_vault_with(dir.path(), Some(&store));
+        store.delete();
+
+        assert_eq!(loaded.unwrap().len(), 3);
+        assert_eq!(stored.unwrap().as_deref(), Some(key.as_str()));
+        assert_eq!(second_add, Ok(false), "an existing key is never replaced");
+        assert_eq!(reloaded.unwrap().len(), 3);
+        assert!(!dir.path().join(DEVICE_KEY_FILE).exists());
+        assert_eq!(store.get().unwrap(), None, "test item removed");
     }
 
     #[test]

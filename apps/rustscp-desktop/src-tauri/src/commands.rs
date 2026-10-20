@@ -572,35 +572,70 @@ pub struct AppState {
     pub vault_load_error: Option<String>,
     /// Where the unreadable vault was moved (`sites.vault.corrupt-<unix_ts>`).
     pub vault_backup_path: Option<String>,
+    /// Set when the vault was left in place unread (its key is in the Keychain, which
+    /// could not be read). Saving would replace it with the sites in memory, so every
+    /// save is refused with this message until RustSCP restarts.
+    pub vault_save_blocked: Option<String>,
+}
+
+/// What [`load_saved_sites_at_startup`] found.
+struct StartupVault {
+    sites: Vec<ConnectionConfig>,
+    load_error: Option<String>,
+    backup_path: Option<String>,
+    save_blocked: Option<String>,
 }
 
 /// Loads the saved sites. An unreadable vault is never treated as "no sites": it is moved
 /// aside as `sites.vault.corrupt-<unix_ts>` (the key file is kept) and the error is
-/// returned so the UI can warn the user. Returns `(sites, load_error, backup_path)`.
-fn load_saved_sites_at_startup() -> (Vec<ConnectionConfig>, Option<String>, Option<String>) {
-    match rustscp_core::load_local_vault() {
-        Ok(sites) => (sites, None, None),
-        Err(err) => {
-            let message = err.to_string();
-            tracing::error!("could not load the local sites vault: {message}");
-            match rustscp_core::vault::quarantine_local_vault() {
-                Ok(moved) => {
-                    let backup = moved.map(|p| p.to_string_lossy().to_string());
-                    if let Some(path) = &backup {
-                        tracing::warn!("unreadable vault preserved as {path}");
-                    }
-                    (Vec::new(), Some(message), backup)
-                }
-                Err(move_err) => {
-                    tracing::error!("could not move the unreadable vault aside: {move_err}");
-                    (
-                        Vec::new(),
-                        Some(format!(
-                            "{message} (the vault file could not be moved aside: {move_err})"
-                        )),
-                        None,
-                    )
-                }
+/// returned so the UI can warn the user. When only the Keychain holding its key could not
+/// be read, the vault is intact: it stays in place and saving is blocked instead.
+fn load_saved_sites_at_startup() -> StartupVault {
+    let err = match rustscp_core::load_local_vault() {
+        Ok(sites) => {
+            return StartupVault {
+                sites,
+                load_error: None,
+                backup_path: None,
+                save_blocked: None,
+            }
+        }
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    tracing::error!("could not load the local sites vault: {message}");
+    if matches!(err, rustscp_core::VaultError::KeychainUnavailable(_)) {
+        return StartupVault {
+            sites: Vec::new(),
+            load_error: Some(message.clone()),
+            backup_path: None,
+            save_blocked: Some(format!(
+                "Saved sites are not changed in this session: {message}"
+            )),
+        };
+    }
+    match rustscp_core::vault::quarantine_local_vault() {
+        Ok(moved) => {
+            let backup = moved.map(|p| p.to_string_lossy().to_string());
+            if let Some(path) = &backup {
+                tracing::warn!("unreadable vault preserved as {path}");
+            }
+            StartupVault {
+                sites: Vec::new(),
+                load_error: Some(message),
+                backup_path: backup,
+                save_blocked: None,
+            }
+        }
+        Err(move_err) => {
+            tracing::error!("could not move the unreadable vault aside: {move_err}");
+            StartupVault {
+                sites: Vec::new(),
+                load_error: Some(format!(
+                    "{message} (the vault file could not be moved aside: {move_err})"
+                )),
+                backup_path: None,
+                save_blocked: None,
             }
         }
     }
@@ -620,7 +655,12 @@ impl AppState {
         active.insert("local".to_string(), local_driver.clone());
         configs.insert("local".to_string(), local_cfg.clone());
 
-        let (loaded_sites, vault_load_error, vault_backup_path) = load_saved_sites_at_startup();
+        let StartupVault {
+            sites: loaded_sites,
+            load_error: vault_load_error,
+            backup_path: vault_backup_path,
+            save_blocked: vault_save_blocked,
+        } = load_saved_sites_at_startup();
         let mut initial_sites: Vec<ConnectionConfig> = loaded_sites
             .into_iter()
             .map(|mut site| {
@@ -652,6 +692,7 @@ impl AppState {
             mcp_approvals: Arc::new(McpApprovals::default()),
             vault_load_error,
             vault_backup_path,
+            vault_save_blocked,
         }
     }
 }
@@ -1115,6 +1156,15 @@ pub async fn disconnect_session(
     Ok(())
 }
 
+/// Refuses to write the vault when it was left unread at startup (see
+/// [`AppState::vault_save_blocked`]).
+fn ensure_vault_writable(state: &AppState) -> Result<(), String> {
+    match &state.vault_save_blocked {
+        Some(reason) => Err(reason.clone()),
+        None => Ok(()),
+    }
+}
+
 #[tauri::command]
 pub async fn get_saved_sites(
     state: tauri::State<'_, AppState>,
@@ -1129,6 +1179,7 @@ pub async fn save_site(
     state: tauri::State<'_, AppState>,
     config: ConnectionConfig,
 ) -> Result<(), String> {
+    ensure_vault_writable(&state)?;
     let mut config = config;
     config.id = normalize_site_id(&config.id);
     // The write guard serializes saves (the newest list is always the one on disk); the
@@ -1152,6 +1203,7 @@ pub async fn save_site(
 
 #[tauri::command]
 pub async fn delete_site(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    ensure_vault_writable(&state)?;
     let mut sites = state.saved_sites.write().await;
     let mut updated = sites.clone();
     updated.retain(|s| s.id != id);
@@ -1193,6 +1245,7 @@ pub async fn import_sites_vault(
     if password.trim().is_empty() {
         return Err("A senha do cofre é obrigatória para descriptografar os dados.".to_string());
     }
+    ensure_vault_writable(&state)?;
     let envelope = rustscp_core::parse_vault_from_json(vault_json.trim())
         .map_err(|e| format!("Arquivo de cofre inválido ou corrompido: {e}"))?;
     let imported_sites =
