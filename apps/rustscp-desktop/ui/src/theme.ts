@@ -55,6 +55,11 @@ export function initThemeWatcher(onThemeChange?: (mode: ThemeMode) => void): () 
     }
   };
 
-  mediaQuery.addEventListener('change', listener);
-  return () => mediaQuery.removeEventListener('change', listener);
+  // Older WebKit (macOS 10.15 WKWebView) only has the deprecated addListener/removeListener
+  if (typeof mediaQuery.addEventListener === 'function') {
+    mediaQuery.addEventListener('change', listener);
+    return () => mediaQuery.removeEventListener('change', listener);
+  }
+  mediaQuery.addListener(listener);
+  return () => mediaQuery.removeListener(listener);
 }

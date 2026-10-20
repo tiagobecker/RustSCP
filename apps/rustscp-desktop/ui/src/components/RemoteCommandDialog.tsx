@@ -1,133 +1,208 @@
-import React, { useState } from 'react';
-import { 
-  X, 
-  Terminal, 
-  Play, 
-  
-  CheckCircle, 
-  AlertCircle 
-} from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Play, Terminal } from 'lucide-react';
+import { Modal } from './ui/Modal.tsx';
+import { Button } from './ui/controls.tsx';
+import { plainTextInputProps } from '../utils/inputHardening.ts';
+import { CommandOutput, CommandResult } from './automation/CommandOutput.tsx';
 
 interface RemoteCommandDialogProps {
   isOpen: boolean;
   onClose: () => void;
   remoteSessionName: string;
   onExecute: (cmd: string) => Promise<{ exit_code: number; stdout: string; stderr: string }>;
+  /** false when the command runs on this computer (local session); shown clearly in the title */
+  isRemote?: boolean;
+  /** Folder the command runs in (the caller applies it); shown in the prompt */
+  cwd?: string;
 }
 
-export const RemoteCommandDialog: React.FC<RemoteCommandDialogProps> = ({
-  isOpen,
-  onClose,
-  remoteSessionName,
-  onExecute,
-}) => {
-  const [command, setCommand] = useState<string>('uname -a');
-  const [stdout, setStdout] = useState<string>('');
-  const [stderr, setStderr] = useState<string>('');
-  const [exitCode, setExitCode] = useState<number | null>(null);
-  const [isRunning, setIsRunning] = useState<boolean>(false);
+const HISTORY_KEY = 'rustscp_remote_command_history';
+const HISTORY_MAX = 50;
+
+function loadHistory(): string[] {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.filter((x) => typeof x === 'string').slice(0, HISTORY_MAX) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveHistory(items: string[]) {
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(items.slice(0, HISTORY_MAX)));
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+export const RemoteCommandDialog: React.FC<RemoteCommandDialogProps> = ({ isOpen, onClose, remoteSessionName, onExecute, isRemote, cwd }) => {
+  const { i18n } = useTranslation();
+  const isPt = i18n.language.startsWith('pt');
+  const isLocal = isRemote === false;
+
+  const [command, setCommand] = useState('uname -a');
+  const [result, setResult] = useState<CommandResult | null>(null);
+  const [isRunning, setIsRunning] = useState(false);
+  const [history, setHistory] = useState<string[]>(loadHistory);
+  const [historyIndex, setHistoryIndex] = useState(-1);
+  const runIdRef = useRef(0);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // Closing detaches from a command that is still running, so reopening starts clean
+  useEffect(() => {
+    if (!isOpen) {
+      runIdRef.current++;
+      setIsRunning(false);
+      setHistoryIndex(-1);
+    }
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
   const handleRun = async () => {
-    if (!command.trim()) return;
+    if (isRunning) return;
+    const cmd = command.trim();
+    if (!cmd) return;
+    const id = ++runIdRef.current;
     setIsRunning(true);
-    setStdout('Executando no servidor...\n');
-    setStderr('');
-    setExitCode(null);
-
+    setResult(null);
+    setHistoryIndex(-1);
+    setHistory((prev) => {
+      const next = [cmd, ...prev.filter((h) => h !== cmd)].slice(0, HISTORY_MAX);
+      saveHistory(next);
+      return next;
+    });
     try {
-      const res = await onExecute(command);
-      setStdout(res.stdout);
-      setStderr(res.stderr);
-      setExitCode(res.exit_code);
-    } catch (err: any) {
-      setStderr(err.toString());
-      setExitCode(-1);
+      const res = await onExecute(cmd);
+      if (id !== runIdRef.current) return;
+      setResult({ stdout: res.stdout || '', stderr: res.stderr || '', exitCode: res.exit_code });
+    } catch (err) {
+      if (id !== runIdRef.current) return;
+      setResult({ stdout: '', stderr: String(err), exitCode: -1 });
     } finally {
-      setIsRunning(false);
+      if (id === runIdRef.current) {
+        setIsRunning(false);
+        requestAnimationFrame(() => inputRef.current?.focus());
+      }
     }
   };
 
+  const handleStopWaiting = () => {
+    runIdRef.current++;
+    setIsRunning(false);
+    setResult({
+      stdout: '',
+      stderr: isPt
+        ? 'Parou de aguardar. O comando pode continuar rodando.'
+        : 'Stopped waiting. The command may still be running.',
+      exitCode: -1,
+    });
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (!isRunning) void handleRun();
+    } else if (e.key === 'ArrowUp') {
+      if (history.length === 0) return;
+      e.preventDefault();
+      const next = Math.min(historyIndex + 1, history.length - 1);
+      setHistoryIndex(next);
+      setCommand(history[next]);
+    } else if (e.key === 'ArrowDown') {
+      if (historyIndex < 0) return;
+      e.preventDefault();
+      const next = historyIndex - 1;
+      setHistoryIndex(next);
+      setCommand(next >= 0 ? history[next] : '');
+    }
+  };
+
+  const title = isLocal ? (isPt ? 'Executar comando neste computador' : 'Run command on this computer') : isPt ? 'Executar comando remoto' : 'Run remote command';
+
   return (
-    <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-      <div className="bg-white dark:bg-dark-800 border border-slate-300 dark:border-dark-600 rounded-xl max-w-3xl w-full shadow-2xl flex flex-col h-[520px] overflow-hidden">
-        {/* Header */}
-        <div className="px-5 py-3 border-b border-slate-200 dark:border-dark-700 flex items-center justify-between bg-slate-100 dark:bg-dark-750">
-          <div className="flex items-center space-x-2.5">
-            <Terminal className="w-5 h-5 text-amber-500 dark:text-amber-400" />
-            <div>
-              <h3 className="font-bold text-slate-900 dark:text-slate-100 text-xs">Executar Comando Remoto</h3>
-              <p className="text-[10px] text-slate-500 dark:text-slate-400">Canal SSH Remoto: {remoteSessionName}</p>
-            </div>
-          </div>
-          <button onClick={onClose} className="text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white p-1 rounded-md hover:bg-slate-200 dark:hover:bg-dark-700 transition-colors">
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-
-        {/* Input Bar */}
-        <div className="p-4 bg-slate-50 dark:bg-dark-900 border-b border-slate-200 dark:border-dark-700 space-y-2">
-          <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300">
-            Comando Shell Linux / Bash:
+    <Modal
+      isOpen={isOpen}
+      onClose={onClose}
+      size="xl"
+      icon={<Terminal className="w-5 h-5" />}
+      title={title}
+      subtitle={<span className="font-mono text-[12px]">{remoteSessionName}</span>}
+      initialFocusRef={inputRef}
+      footer={
+        <Button variant="secondary" onClick={onClose}>
+          {isPt ? 'Fechar' : 'Close'}
+        </Button>
+      }
+    >
+      <div className="space-y-3">
+        {isLocal && (
+          <p className="rounded-lg bg-amber-500/10 px-3 py-2 text-[12.5px] text-amber-800 dark:text-amber-300">
+            {isPt
+              ? 'Nenhum servidor SSH está ativo: o comando roda no seu computador, não em um servidor.'
+              : 'No SSH server is active: the command runs on your computer, not on a server.'}
+          </p>
+        )}
+        <div>
+          <label htmlFor="remote-command-input" className="ui-label">
+            {isPt ? 'Comando de shell' : 'Shell command'}
           </label>
-          <div className="flex items-center space-x-2">
-            <input
-              type="text"
-              value={command}
-              onChange={(e) => setCommand(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') handleRun();
-              }}
-              placeholder="Ex: df -h, systemctl restart nginx, ps aux | grep node"
-              autoFocus
-              autoCapitalize="none"
-              autoCorrect="off"
-              spellCheck={false}
-              autoComplete="off"
-              className="flex-1 bg-white dark:bg-dark-800 border border-slate-300 dark:border-dark-700 rounded px-3 py-1.5 text-xs font-mono text-emerald-600 dark:text-emerald-400 focus:outline-none focus:border-sky-500"
-            />
-            <button
-              onClick={handleRun}
-              disabled={isRunning}
-              className="flex items-center space-x-1.5 px-4 py-1.5 rounded bg-sky-600 hover:bg-sky-500 text-white font-bold text-xs shadow-md disabled:opacity-40"
-            >
-              <Play className={`w-3.5 h-3.5 ${isRunning ? 'animate-pulse' : ''}`} />
-              <span>{isRunning ? 'Executando...' : 'Executar'}</span>
-            </button>
-          </div>
-        </div>
-
-        {/* Console Output */}
-        <div className="flex-1 bg-black/90 p-4 font-mono text-xs overflow-y-auto space-y-2 select-text">
-          {stdout && (
-            <pre className="text-slate-200 whitespace-pre-wrap leading-5">{stdout}</pre>
-          )}
-          {stderr && (
-            <pre className="text-red-400 whitespace-pre-wrap leading-5">{stderr}</pre>
-          )}
-          {!stdout && !stderr && (
-            <span className="text-slate-500 dark:text-slate-600 font-sans text-xs">
-              Digite um comando acima e pressione Enter para executar diretamente na sessão SSH remota.
-            </span>
-          )}
-        </div>
-
-        {/* Footer */}
-        <div className="px-5 py-2.5 border-t border-slate-200 dark:border-dark-700 bg-slate-100 dark:bg-dark-750 flex items-center justify-between text-xs font-mono">
-          <div className="flex items-center space-x-2">
-            {exitCode !== null && (
-              <span className={`flex items-center space-x-1 ${exitCode === 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'}`}>
-                {exitCode === 0 ? <CheckCircle className="w-3.5 h-3.5" /> : <AlertCircle className="w-3.5 h-3.5" />}
-                <span>Código de Saída: {exitCode}</span>
+          <div className="flex items-center gap-2">
+            {cwd && (
+              <span className="font-mono text-[12px] text-ink-muted max-w-[35%] truncate select-none" title={cwd}>
+                {cwd} $
               </span>
             )}
+            <input
+              id="remote-command-input"
+              ref={inputRef}
+              type="text"
+              {...plainTextInputProps}
+              value={command}
+              onChange={(e) => {
+                setCommand(e.target.value);
+                setHistoryIndex(-1);
+              }}
+              onKeyDown={handleKeyDown}
+              placeholder={isPt ? 'ex.: df -h, systemctl status nginx, ps aux | grep node' : 'e.g. df -h, systemctl status nginx, ps aux | grep node'}
+              className="ui-input flex-1 font-mono text-[12.5px]"
+            />
+            <Button variant="primary" onClick={() => void handleRun()} disabled={!command.trim()} loading={isRunning} icon={<Play className="w-3.5 h-3.5" />}>
+              {isRunning ? (isPt ? 'Executando…' : 'Running…') : isPt ? 'Executar' : 'Run'}
+            </Button>
           </div>
-          <button onClick={onClose} className="px-3 py-1 rounded text-slate-700 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-dark-700 font-sans transition-colors">
-            Fechar
-          </button>
+          <span className="ui-hint">
+            {isPt ? 'Enter executa · ↑ e ↓ percorrem o histórico' : 'Enter runs · ↑ and ↓ browse history'}
+          </span>
         </div>
+
+        <CommandOutput
+          result={result}
+          running={isRunning}
+          isPt={isPt}
+          onClear={() => setResult(null)}
+          bodyClassName="h-72"
+          placeholder={
+            isLocal
+              ? isPt
+                ? 'Digite um comando e pressione Enter para executar neste computador.'
+                : 'Type a command and press Enter to run it on this computer.'
+              : isPt
+                ? 'Digite um comando e pressione Enter para executar no servidor.'
+                : 'Type a command and press Enter to run it on the server.'
+          }
+          actions={
+            isRunning ? (
+              <button type="button" className="ui-btn ui-btn-ghost ui-btn-sm" onClick={handleStopWaiting}>
+                {isPt ? 'Parar de aguardar' : 'Stop waiting'}
+              </button>
+            ) : null
+          }
+        />
       </div>
-    </div>
+    </Modal>
   );
 };

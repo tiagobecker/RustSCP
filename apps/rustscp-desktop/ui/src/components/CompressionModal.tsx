@@ -1,13 +1,8 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useId, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { 
-  X, 
-  Archive, 
-  Check, 
-  FileText, 
-  ArrowDownToLine, 
-  RefreshCw 
-} from 'lucide-react';
+import { Archive, ArrowDownToLine, FileText, AlertTriangle } from 'lucide-react';
+import { Modal } from './ui/Modal.tsx';
+import { Button, Disclosure, Field, Segmented, Select, TextInput, Toggle } from './ui/controls.tsx';
 
 interface CompressionModalProps {
   isOpen: boolean;
@@ -19,6 +14,41 @@ interface CompressionModalProps {
   isRemote: boolean;
   onCompress: (items: string[], format: string, outputName: string) => Promise<void>;
   onExtract: (archivePath: string, destSubfolder?: string) => Promise<void>;
+}
+
+type ArchiveFormat = 'zip' | 'tar.gz' | 'tar.bz2' | 'tar.xz' | 'tar';
+
+const FORMATS: { id: ArchiveFormat; ext: string; en: string; pt: string }[] = [
+  { id: 'zip', ext: '.zip', en: 'Opens anywhere (Windows, macOS, Linux)', pt: 'Abre em qualquer sistema (Windows, macOS, Linux)' },
+  { id: 'tar.gz', ext: '.tar.gz', en: 'Standard on Linux servers', pt: 'Padrão em servidores Linux' },
+  { id: 'tar.bz2', ext: '.tar.bz2', en: 'Smaller, slower (bzip2)', pt: 'Menor, mais lento (bzip2)' },
+  { id: 'tar.xz', ext: '.tar.xz', en: 'Smallest, slowest (xz)', pt: 'O menor, mais lento (xz)' },
+  { id: 'tar', ext: '.tar', en: 'No compression', pt: 'Sem compressão' },
+];
+
+const ARCHIVE_EXT_RE = /\.(tar\.gz|tgz|tar\.bz2|tbz2|tar\.xz|txz|tar|zip)$/i;
+
+const FORMAT_BY_EXT: Record<string, ArchiveFormat> = {
+  zip: 'zip',
+  'tar.gz': 'tar.gz',
+  tgz: 'tar.gz',
+  'tar.bz2': 'tar.bz2',
+  tbz2: 'tar.bz2',
+  'tar.xz': 'tar.xz',
+  txz: 'tar.xz',
+  tar: 'tar',
+};
+
+const baseName = (p: string) => p.split('/').pop()?.split('\\').pop() || p;
+
+function extOf(format: ArchiveFormat): string {
+  return FORMATS.find((f) => f.id === format)?.ext ?? '.tar.gz';
+}
+
+/** Swaps (or adds) the archive extension, keeping whatever name the user typed. */
+function withExtension(name: string, format: ArchiveFormat): string {
+  const stem = name.trim().replace(ARCHIVE_EXT_RE, '');
+  return `${stem || 'archive'}${extOf(format)}`;
 }
 
 export const CompressionModal: React.FC<CompressionModalProps> = ({
@@ -33,10 +63,12 @@ export const CompressionModal: React.FC<CompressionModalProps> = ({
   onExtract,
 }) => {
   const { i18n } = useTranslation();
-  const isPt = i18n.language.startsWith('pt');
+  const isPt = (i18n.language || 'en').toLowerCase().startsWith('pt');
+  const tr = (pt: string, en: string) => (isPt ? pt : en);
+  const formId = useId();
 
   // Compress state
-  const [format, setFormat] = useState<string>('tar.gz');
+  const [format, setFormat] = useState<ArchiveFormat>('tar.gz');
   const [outputName, setOutputName] = useState<string>('');
 
   // Extract state
@@ -46,218 +78,213 @@ export const CompressionModal: React.FC<CompressionModalProps> = ({
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string>('');
 
+  const itemsKey = targetItems.join('\n');
+
+  // Suggest names when the dialog opens for new items (not when the format changes)
   useEffect(() => {
+    if (!isOpen) return;
     if (mode === 'compress') {
-      const firstItem = targetItems[0]?.split('/').pop()?.split('\\').pop() || 'archive';
-      const stem = firstItem.includes('.') ? firstItem.substring(0, firstItem.lastIndexOf('.')) : firstItem;
-      const ext = format === 'zip' ? '.zip' : format === 'tar.bz2' ? '.tar.bz2' : format === 'tar.xz' ? '.tar.xz' : format === 'tar' ? '.tar' : '.tar.gz';
-      setOutputName(`${stem}${ext}`);
-    } else if (mode === 'extract' && archivePath) {
-      const base = archivePath.split('/').pop()?.split('\\').pop() || '';
-      const folderName = base.replace(/\.(tar\.gz|tgz|tar\.bz2|tbz2|tar\.xz|txz|tar|zip)$/i, '');
-      setDestSubfolder(folderName);
+      const first = targetItems[0] ? baseName(targetItems[0]) : 'archive';
+      const stem = targetItems.length > 1 ? baseName(currentDir.replace(/[\\/]+$/, '')) || 'archive' : first.includes('.') && !first.startsWith('.') ? first.slice(0, first.lastIndexOf('.')) : first;
+      setOutputName(withExtension(stem, format));
+    } else if (archivePath) {
+      setDestSubfolder(baseName(archivePath).replace(ARCHIVE_EXT_RE, '') || 'extracted');
+      setExtractToFolder(true);
     }
     setErrorMessage('');
-  }, [mode, targetItems, archivePath, format]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, mode, itemsKey, archivePath]);
 
-  if (!isOpen) return null;
+  const changeFormat = (next: ArchiveFormat) => {
+    setFormat(next);
+    setOutputName((name) => withExtension(name, next));
+  };
+
+  /** A typed extension picks the format; a name without one gets the current format's. */
+  const resolveName = (raw: string): { name: string; format: ArchiveFormat } => {
+    const name = raw.trim();
+    const m = ARCHIVE_EXT_RE.exec(name);
+    const detected = m ? FORMAT_BY_EXT[m[1].toLowerCase()] : undefined;
+    return detected ? { name, format: detected } : { name: withExtension(name, format), format };
+  };
+
+  const normalizeName = () => {
+    if (!outputName.trim()) return;
+    const r = resolveName(outputName);
+    if (r.format !== format) setFormat(r.format);
+    setOutputName(r.name);
+  };
+
+  const trimmedName = outputName.trim();
+  const trimmedFolder = destSubfolder.trim();
+  const nameError =
+    mode === 'compress' && /[\\/]/.test(trimmedName)
+      ? tr('O nome não pode conter / ou \\.', 'The name can’t contain / or \\.')
+      : mode === 'extract' && extractToFolder && (/[\\/]/.test(trimmedFolder) || trimmedFolder === '.' || trimmedFolder === '..')
+      ? tr('Use apenas um nome de pasta, sem / ou \\.', 'Use a single folder name, without / or \\.')
+      : '';
+  const canSubmit =
+    !isProcessing &&
+    !nameError &&
+    (mode === 'compress' ? targetItems.length > 0 && trimmedName.length > 0 : !!archivePath && (!extractToFolder || trimmedFolder.length > 0));
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!canSubmit) return;
     setIsProcessing(true);
     setErrorMessage('');
     try {
       if (mode === 'compress') {
-        const itemNames = targetItems.map((p) => p.split('/').pop()?.split('\\').pop() || p);
-        await onCompress(itemNames, format, outputName);
+        const r = resolveName(trimmedName);
+        await onCompress(targetItems.map(baseName), r.format, r.name);
       } else {
-        await onExtract(archivePath, extractToFolder ? destSubfolder : undefined);
+        await onExtract(archivePath, extractToFolder ? trimmedFolder : undefined);
       }
       onClose();
-    } catch (err: any) {
-      setErrorMessage(String(err));
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
     } finally {
       setIsProcessing(false);
     }
   };
 
+  const where = `${isRemote ? tr('Servidor', 'Server') : tr('Este computador', 'This computer')} · ${currentDir}`;
+  const isAdvancedFormat = format !== 'zip' && format !== 'tar.gz';
+
   return (
-    <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-3 animate-in fade-in duration-150">
-      <div className="bg-white dark:bg-dark-800 border border-slate-300 dark:border-dark-600 rounded-xl shadow-2xl max-w-lg w-full overflow-hidden flex flex-col text-slate-900 dark:text-slate-100">
-        {/* Header */}
-        <div className="px-5 py-3.5 border-b border-slate-200 dark:border-dark-600 bg-slate-100 dark:bg-dark-750 flex items-center justify-between select-none">
-          <div className="flex items-center space-x-2.5">
-            <div className="p-2 rounded-lg bg-rust-500/15 text-rust-500 dark:text-rust-400 border border-rust-500/30">
-              {mode === 'compress' ? <Archive className="w-5 h-5" /> : <ArrowDownToLine className="w-5 h-5" />}
+    <Modal
+      isOpen={isOpen}
+      onClose={() => !isProcessing && onClose()}
+      size="md"
+      icon={mode === 'compress' ? <Archive className="w-4 h-4" /> : <ArrowDownToLine className="w-4 h-4" />}
+      title={
+        mode === 'compress'
+          ? targetItems.length === 1
+            ? tr('Compactar 1 item', 'Compress 1 item')
+            : tr(`Compactar ${targetItems.length} itens`, `Compress ${targetItems.length} items`)
+          : tr('Extrair arquivo compactado', 'Extract archive')
+      }
+      subtitle={
+        <span className="block font-mono text-[11.5px] truncate" title={where}>
+          {where}
+        </span>
+      }
+      dismissOnBackdrop={!isProcessing}
+      dismissOnEscape={!isProcessing}
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose} disabled={isProcessing}>
+            {tr('Cancelar', 'Cancel')}
+          </Button>
+          <Button type="submit" form={formId} variant="primary" loading={isProcessing} disabled={!canSubmit}>
+            {isProcessing
+              ? mode === 'compress'
+                ? tr('Compactando…', 'Compressing…')
+                : tr('Extraindo…', 'Extracting…')
+              : mode === 'compress'
+              ? tr('Compactar', 'Compress')
+              : tr('Extrair', 'Extract')}
+          </Button>
+        </>
+      }
+    >
+      <form id={formId} onSubmit={handleSubmit} className="space-y-4">
+        {mode === 'compress' ? (
+          <>
+            <div className="ui-card px-3 py-2 max-h-28 overflow-y-auto space-y-1">
+              {targetItems.map((item) => (
+                <div key={item} className="flex items-center gap-2 text-[12px] text-ink min-w-0" title={item}>
+                  <FileText className="w-3.5 h-3.5 text-ink-faint shrink-0" />
+                  <span className="font-mono truncate">{baseName(item)}</span>
+                </div>
+              ))}
             </div>
+
+            <Field label={tr('Nome do arquivo', 'Archive name')} error={nameError || undefined}>
+              {(id) => (
+                <TextInput id={id} mono value={outputName} onChange={(e) => setOutputName(e.target.value)} onBlur={normalizeName} />
+              )}
+            </Field>
+
             <div>
-              <div className="flex items-center gap-2">
-                <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
-                  {mode === 'compress' 
-                    ? (isPt ? 'Compactar Arquivos' : 'Compress Files') 
-                    : (isPt ? 'Extrair Arquivo Compactado' : 'Extract Archive')}
-                </h3>
-                <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-200 dark:bg-dark-700 text-slate-700 dark:text-slate-300 font-mono">
-                  {isRemote ? (isPt ? 'Remoto' : 'Remote') : 'Local'}
-                </span>
-              </div>
-              <span className="text-[11px] text-slate-500 dark:text-slate-400 font-mono truncate max-w-xs block">
-                {currentDir}
+              <span className="ui-label">{tr('Formato', 'Format')}</span>
+              <Segmented<ArchiveFormat>
+                ariaLabel={tr('Formato', 'Format')}
+                value={isAdvancedFormat ? ('' as ArchiveFormat) : format}
+                onChange={changeFormat}
+                options={[
+                  { value: 'zip', label: 'Zip', title: tr(FORMATS[0].pt, FORMATS[0].en) },
+                  { value: 'tar.gz', label: 'Tar.gz', title: tr(FORMATS[1].pt, FORMATS[1].en) },
+                ]}
+              />
+              <span className="ui-hint">
+                {(() => {
+                  const f = FORMATS.find((x) => x.id === format);
+                  return f ? `${f.ext} · ${tr(f.pt, f.en)}` : '';
+                })()}
               </span>
             </div>
-          </div>
 
-          <button
-            onClick={onClose}
-            className="p-1 rounded-lg hover:bg-slate-200 dark:hover:bg-dark-700 text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white transition-colors"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-
-        {/* Form Body */}
-        <form onSubmit={handleSubmit} className="p-5 space-y-4 text-xs">
-          {mode === 'compress' ? (
-            <>
-              {/* Selected Items Summary */}
-              <div className="bg-slate-50 dark:bg-dark-900 border border-slate-200 dark:border-dark-600 rounded-lg p-3 space-y-1.5">
-                <span className="text-slate-600 dark:text-slate-400 font-medium">
-                  {isPt ? 'Itens Selecionados para Compactação:' : 'Items to Compress:'}
-                </span>
-                <div className="max-h-24 overflow-y-auto space-y-1 pr-1">
-                  {targetItems.map((item, idx) => (
-                    <div key={idx} className="flex items-center space-x-1.5 text-slate-800 dark:text-slate-200 font-mono text-[11px] truncate">
-                      <FileText className="w-3.5 h-3.5 text-rust-500 dark:text-rust-400 shrink-0" />
-                      <span className="truncate">{item.split('/').pop()?.split('\\').pop()}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              {/* Format Selection */}
-              <div className="space-y-1.5">
-                <label className="font-semibold text-slate-700 dark:text-slate-300">
-                  {isPt ? 'Formato de Compactação' : 'Archive Format'}
-                </label>
-                <div className="grid grid-cols-2 gap-2">
-                  {[
-                    { id: 'tar.gz', label: '.tar.gz', desc: 'Tar + Gzip (Linux Standard)' },
-                    { id: 'zip', label: '.zip', desc: 'Universal (Windows / Mac / Linux)' },
-                    { id: 'tar.bz2', label: '.tar.bz2', desc: 'Bzip2 (High Ratio)' },
-                    { id: 'tar.xz', label: '.tar.xz', desc: 'XZ (Maximum Compression)' },
-                  ].map((fmt) => (
-                    <button
-                      type="button"
-                      key={fmt.id}
-                      onClick={() => setFormat(fmt.id)}
-                      className={`p-2.5 rounded-lg border text-left transition-all ${
-                        format === fmt.id
-                          ? 'bg-rust-500/15 border-rust-500 text-rust-600 dark:text-rust-400 shadow-sm'
-                          : 'bg-slate-50 dark:bg-dark-700/60 border-slate-200 dark:border-dark-600 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-dark-700'
-                      }`}
-                    >
-                      <div className="font-mono font-bold text-xs">{fmt.label}</div>
-                      <div className="text-[10px] text-slate-500 dark:text-slate-400 mt-0.5 truncate">{fmt.desc}</div>
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              {/* Output Name */}
-              <div className="space-y-1">
-                <label className="font-semibold text-slate-700 dark:text-slate-300">
-                  {isPt ? 'Nome do Arquivo Gerado' : 'Archive Output Name'}
-                </label>
-                <input
-                  type="text"
-                  value={outputName}
-                  onChange={(e) => setOutputName(e.target.value)}
-                  className="w-full bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-600 rounded-lg px-3 py-2 text-slate-900 dark:text-slate-100 font-mono focus:outline-none focus:border-rust-500 text-xs shadow-sm"
-                />
-              </div>
-            </>
-          ) : (
-            <>
-              {/* Extract Source Archive */}
-              <div className="bg-slate-50 dark:bg-dark-900 border border-slate-200 dark:border-dark-600 rounded-lg p-3 space-y-1">
-                <span className="text-slate-600 dark:text-slate-400 font-medium">
-                  {isPt ? 'Arquivo a ser extraído:' : 'Archive to Extract:'}
-                </span>
-                <div className="font-mono text-rust-600 dark:text-rust-300 truncate font-semibold">
-                  {archivePath.split('/').pop()?.split('\\').pop()}
-                </div>
-              </div>
-
-              {/* Extract Destination Options */}
-              <div className="space-y-2">
-                <label className="flex items-center space-x-2 cursor-pointer text-slate-700 dark:text-slate-300">
-                  <input
-                    type="checkbox"
-                    checked={extractToFolder}
-                    onChange={(e) => setExtractToFolder(e.target.checked)}
-                    className="rounded border-slate-300 dark:border-dark-600 text-rust-500 focus:ring-rust-500"
-                  />
-                  <span>{isPt ? 'Extrair dentro de uma subpasta' : 'Extract into subfolder'}</span>
-                </label>
-
-                {extractToFolder && (
-                  <div className="space-y-1 pl-5">
-                    <label className="text-[11px] text-slate-600 dark:text-slate-400">
-                      {isPt ? 'Nome da subpasta:' : 'Subfolder name:'}
-                    </label>
-                    <input
-                      type="text"
-                      value={destSubfolder}
-                      onChange={(e) => setDestSubfolder(e.target.value)}
-                      className="w-full bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-600 rounded-lg px-3 py-1.5 text-slate-900 dark:text-slate-100 font-mono focus:outline-none focus:border-rust-500 text-xs shadow-sm"
-                    />
-                  </div>
+            <Disclosure label={tr('Avançado', 'Advanced')} defaultOpen={isAdvancedFormat}>
+              <Field label={tr('Todos os formatos', 'All formats')}>
+                {(id) => (
+                  <Select id={id} value={format} onChange={(e) => changeFormat(e.target.value as ArchiveFormat)}>
+                    {FORMATS.map((f) => (
+                      <option key={f.id} value={f.id}>
+                        {f.ext} — {tr(f.pt, f.en)}
+                      </option>
+                    ))}
+                  </Select>
                 )}
-              </div>
-            </>
-          )}
-
-          {/* Error Message */}
-          {errorMessage && (
-            <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-2.5 text-red-600 dark:text-red-400 text-xs">
-              {errorMessage}
+              </Field>
+            </Disclosure>
+          </>
+        ) : (
+          <>
+            <div className="ui-card px-3 py-2 flex items-center gap-2 min-w-0">
+              <Archive className="w-3.5 h-3.5 text-ink-faint shrink-0" />
+              <span className="font-mono text-[12px] text-ink truncate" title={archivePath}>
+                {baseName(archivePath)}
+              </span>
             </div>
-          )}
 
-          {/* Footer Buttons */}
-          <div className="pt-2 border-t border-slate-200 dark:border-dark-700 flex items-center justify-end space-x-2">
-            <button
-              type="button"
-              onClick={onClose}
-              className="px-4 py-2 rounded-lg bg-slate-200 hover:bg-slate-300 text-slate-700 dark:bg-dark-700 dark:hover:bg-dark-600 dark:text-slate-300 font-semibold text-xs border border-slate-300 dark:border-slate-600 transition-colors"
-            >
-              {isPt ? 'Cancelar' : 'Cancel'}
-            </button>
+            <div className="flex items-center gap-3">
+              <div className="flex-1 min-w-0">
+                <div className="text-[13px] text-ink">{tr('Extrair para uma pasta nova', 'Extract into a new folder')}</div>
+                <div className="text-[11.5px] text-ink-faint">{tr('Mantém a pasta atual organizada.', 'Keeps the current folder tidy.')}</div>
+              </div>
+              <Toggle checked={extractToFolder} onChange={setExtractToFolder} label={tr('Extrair para uma pasta nova', 'Extract into a new folder')} />
+            </div>
 
-            <button
-              type="submit"
-              disabled={isProcessing}
-              className="flex items-center space-x-1.5 px-4 py-2 rounded-lg bg-rust-600 hover:bg-rust-500 disabled:opacity-40 text-white font-bold text-xs transition-all shadow-md"
-            >
-              {isProcessing ? (
-                <>
-                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                  <span>{isPt ? 'Processando...' : 'Processing...'}</span>
-                </>
-              ) : (
-                <>
-                  <Check className="w-3.5 h-3.5" />
-                  <span>
-                    {mode === 'compress' 
-                      ? (isPt ? 'Iniciar Compactação' : 'Start Compression') 
-                      : (isPt ? 'Extrair Arquivos' : 'Extract Files')}
-                  </span>
-                </>
-              )}
-            </button>
+            {extractToFolder ? (
+              <Field
+                label={tr('Nome da pasta', 'Folder name')}
+                error={nameError || undefined}
+                hint={tr('Se a pasta já existir, arquivos com o mesmo nome dentro dela são substituídos.', 'If the folder already exists, files with the same name inside it are replaced.')}
+              >
+                {(id) => <TextInput id={id} mono value={destSubfolder} onChange={(e) => setDestSubfolder(e.target.value)} />}
+              </Field>
+            ) : (
+              <div className="flex items-start gap-2 rounded-lg bg-amber-500/10 px-3 py-2 text-[12.5px] text-ink" role="note">
+                <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0 text-amber-600 dark:text-amber-400" />
+                <span>
+                  {tr(
+                    'Os arquivos são extraídos direto na pasta atual. Arquivos com o mesmo nome são substituídos sem aviso.',
+                    'Files are extracted straight into the current folder. Files with the same name are replaced without warning.'
+                  )}
+                </span>
+              </div>
+            )}
+          </>
+        )}
+
+        {errorMessage && (
+          <div className="flex items-start gap-2 rounded-lg bg-red-500/10 px-3 py-2 text-[12.5px] text-red-700 dark:text-red-300" role="alert">
+            <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+            <span className="min-w-0 break-words">{errorMessage}</span>
           </div>
-        </form>
-      </div>
-    </div>
+        )}
+      </form>
+    </Modal>
   );
 };

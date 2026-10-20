@@ -3,9 +3,22 @@ import { initReactI18next } from 'react-i18next';
 import enUS from './locales/en-US.json';
 import ptBR from './locales/pt-BR.json';
 
-const savedLang = localStorage.getItem('rustscp_language');
-const browserLang = navigator.language.toLowerCase();
+function readSavedLanguage(): string | null {
+  try {
+    return localStorage.getItem('rustscp_language');
+  } catch {
+    return null;
+  }
+}
+
+const savedLang = readSavedLanguage();
+const browserLang = (typeof navigator !== 'undefined' ? navigator.language : 'en-US').toLowerCase();
 const defaultLang = savedLang || (browserLang.startsWith('pt') ? 'pt-BR' : 'en-US');
+
+/** Keeps <html lang> in sync so VoiceOver pronunciation and spellcheck follow the UI language. */
+function syncDocumentLang(lng: string) {
+  if (typeof document !== 'undefined' && lng) document.documentElement.lang = lng;
+}
 
 i18n.use(initReactI18next).init({
   resources: {
@@ -19,8 +32,15 @@ i18n.use(initReactI18next).init({
   },
 });
 
+syncDocumentLang(defaultLang);
+
 i18n.on('languageChanged', (lng) => {
-  localStorage.setItem('rustscp_language', lng);
+  syncDocumentLang(lng);
+  try {
+    localStorage.setItem('rustscp_language', lng);
+  } catch {
+    // storage unavailable: the choice still applies for this session
+  }
 });
 
 export default i18n;

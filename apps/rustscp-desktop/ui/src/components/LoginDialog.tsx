@@ -1,38 +1,51 @@
-import React, { useState, useRef } from 'react';
-import { 
-  X, 
-  Server, 
-  Cloud, 
-  Lock, 
-  FolderPlus, 
-  Trash2, 
-  Eye, 
-  EyeOff, 
-  Check,
+import React, { useMemo, useRef, useState } from 'react';
+import {
+  Server,
+  Cloud,
   HardDrive,
-  ShieldCheck,
-  Download,
-  Upload,
-  Pencil,
-  Save,
+  Trash2,
+  Eye,
+  EyeOff,
+  Check,
   Plus,
   FolderOpen,
-  XCircle,
+  AlertCircle,
+  Search,
+  ArrowDownUp,
+  KeyRound,
+  Loader2,
+  X,
 } from 'lucide-react';
 import { ConnectionConfig, Protocol } from '../types.ts';
 import { VaultModal } from './VaultModal.tsx';
 import { invoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
+import { Modal } from './ui/Modal.tsx';
+import { Button, Disclosure, Field, Segmented, TextInput } from './ui/controls.tsx';
+import { plainTextInputProps } from '../utils/inputHardening.ts';
+import { STORED_SECRET, isStoredSecret } from '../utils/secrets.ts';
 
 interface LoginDialogProps {
   isOpen: boolean;
   onClose: () => void;
   savedSites: ConnectionConfig[];
-  onConnect: (config: ConnectionConfig) => Promise<void>;
+  /** `attempt.cancelled` flips to true if the user stops the attempt; the caller should then drop the session. */
+  onConnect: (config: ConnectionConfig, attempt?: { cancelled: boolean }) => Promise<void>;
   onSaveSite: (config: ConnectionConfig) => Promise<void>;
   onDeleteSite: (id: string) => Promise<void>;
   onSitesUpdated?: (sites: ConnectionConfig[]) => void;
 }
+
+type AuthMode = 'password' | 'key' | 'agent';
+
+const DEFAULT_PORTS: Record<string, number> = { sftp: 22, scp: 22, ftp: 21, s3: 443, local: 0, webdav: 443 };
+const isSsh = (p: Protocol) => p === 'sftp' || p === 'scp';
+
+const ProtocolIcon: React.FC<{ protocol: Protocol; className?: string }> = ({ protocol, className = 'w-4 h-4' }) => {
+  if (protocol === 's3') return <Cloud className={className} />;
+  if (protocol === 'local') return <HardDrive className={className} />;
+  return <Server className={className} />;
+};
 
 export const LoginDialog: React.FC<LoginDialogProps> = ({
   isOpen,
@@ -48,29 +61,59 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
 
   const [selectedSiteId, setSelectedSiteId] = useState<string>('new');
   const [protocol, setProtocol] = useState<Protocol>('sftp');
-  const [siteName, setSiteName] = useState<string>('My Server');
+  const [siteName, setSiteName] = useState<string>('');
   const [host, setHost] = useState<string>('');
-  const [port, setPort] = useState<number>(22);
+  const [port, setPort] = useState<string>('22');
   const [username, setUsername] = useState<string>('');
   const [password, setPassword] = useState<string>('');
+  // True while the saved secret is kept server-side and the user has not typed a new one
+  const [passwordStored, setPasswordStored] = useState<boolean>(false);
+  const [passphraseStored, setPassphraseStored] = useState<boolean>(false);
+  const [authMode, setAuthMode] = useState<AuthMode>('password');
   const [privateKeyPath, setPrivateKeyPath] = useState<string>('');
-  const [remoteRoot, setRemoteRoot] = useState<string>('/');
+  const [passphrase, setPassphrase] = useState<string>('');
+  const [remoteRoot, setRemoteRoot] = useState<string>('');
   const [showPassword, setShowPassword] = useState<boolean>(false);
   const [isConnecting, setIsConnecting] = useState<boolean>(false);
   const [isSaving, setIsSaving] = useState<boolean>(false);
   const [saveSuccess, setSaveSuccess] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string>('');
+  const [filter, setFilter] = useState('');
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+  // True once the user edits the form; Escape then no longer discards the draft
+  const [isDirty, setIsDirty] = useState(false);
 
   const connectAttemptIdRef = useRef<number>(0);
+  const attemptTokenRef = useRef<{ cancelled: boolean } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const hostRef = useRef<HTMLInputElement>(null);
+
+  const visibleSites = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    const list = [...savedSites].sort((a, b) => {
+      if (a.id === 'local') return -1;
+      if (b.id === 'local') return 1;
+      return a.name.localeCompare(b.name);
+    });
+    if (!q) return list;
+    return list.filter((s) => `${s.name} ${s.host} ${s.username}`.toLowerCase().includes(q));
+  }, [savedSites, filter]);
 
   if (!isOpen) return null;
 
   const handleProtocolChange = (p: Protocol) => {
+    // Only replace the port when it still holds the previous protocol's default
+    const prevDefault = DEFAULT_PORTS[protocol];
+    if (!port.trim() || Number(port) === prevDefault) setPort(String(DEFAULT_PORTS[p] ?? 22));
+    if (!isSsh(p) && authMode !== 'password') setAuthMode('password');
     setProtocol(p);
-    if (p === 'sftp' || p === 'scp') setPort(22);
-    else if (p === 'ftp') setPort(21);
-    else if (p === 's3') setPort(443);
+    setErrorMessage('');
+    setIsDirty(true);
+  };
+
+  const handleRemoteRootChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setRemoteRoot(e.target.value);
+    setIsDirty(true);
   };
 
   const handleSelectSite = (site: ConnectionConfig) => {
@@ -78,109 +121,204 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
     setSiteName(site.name);
     setProtocol(site.protocol);
     setHost(site.host);
-    setPort(site.port);
+    setPort(String(site.port || DEFAULT_PORTS[site.protocol] || ''));
     setUsername(site.username);
-    setRemoteRoot(site.remote_root);
+    setRemoteRoot(site.remote_root || '');
+    setErrorMessage('');
+    setShowPassword(false);
+    setPendingDeleteId(null);
+    setPasswordStored(false);
+    setPassphraseStored(false);
     if (site.auth.type === 'Password') {
-      setPassword(site.auth.value);
+      setAuthMode('password');
+      const stored = isStoredSecret(site.auth.value);
+      setPasswordStored(stored);
+      setPassword(stored ? '' : site.auth.value || '');
       setPrivateKeyPath('');
+      setPassphrase('');
     } else if (site.auth.type === 'PrivateKey') {
-      setPrivateKeyPath(site.auth.value.path || '');
+      setAuthMode('key');
+      setPrivateKeyPath(site.auth.value?.path || '');
+      const stored = isStoredSecret(site.auth.value?.passphrase);
+      setPassphraseStored(stored);
+      setPassphrase(stored ? '' : site.auth.value?.passphrase || '');
       setPassword('');
+    } else {
+      setAuthMode(isSsh(site.protocol) ? 'agent' : 'password');
+      setPassword('');
+      setPrivateKeyPath('');
+      setPassphrase('');
     }
+    setIsDirty(false);
+  };
+
+  const resetForm = () => {
+    setSelectedSiteId('new');
+    setSiteName('');
+    setProtocol('sftp');
+    setHost('');
+    setPort('22');
+    setUsername('');
+    setPassword('');
+    setPasswordStored(false);
+    setPassphraseStored(false);
+    setAuthMode('password');
+    setPrivateKeyPath('');
+    setPassphrase('');
+    setRemoteRoot('');
+    setErrorMessage('');
+    setShowPassword(false);
+    setPendingDeleteId(null);
+    setIsDirty(false);
   };
 
   const handleNewSite = () => {
-    setSelectedSiteId('new');
-    setSiteName('Nova Conexão');
-    setProtocol('sftp');
-    setHost('');
-    setPort(22);
-    setUsername('');
-    setPassword('');
-    setPrivateKeyPath('');
-    setRemoteRoot('');
+    resetForm();
+    setTimeout(() => hostRef.current?.focus(), 30);
+  };
+
+  /** Accepts pasted `user@host:port`, `sftp://user@host:2222/path` or `s3://endpoint` and splits it into fields. */
+  const splitHostInput = (raw: string) => {
+    const value = raw.trim();
+    const m = value.match(/^(?:(sftp|scp|ftp|s3|https?):\/\/)?(?:([^@\s/]+)@)?([^:/\s]+)(?::(\d{1,5}))?(\/[^\s]*)?$/i);
+    if (!m || !(m[1] || m[2] || m[4] || m[5])) return;
+    const [, scheme, user, h, p, path] = m;
+    if (scheme && !/^https?$/i.test(scheme)) handleProtocolChange(scheme.toLowerCase() as Protocol);
+    if (/^https?$/i.test(scheme || '')) return; // S3 endpoints keep their URL form
+    setHost(h);
+    if (user && !username) setUsername(user);
+    if (p) setPort(p);
+    if (path && path !== '/' && !remoteRoot) setRemoteRoot(path);
+  };
+
+  const buildAuth = (): ConnectionConfig['auth'] => {
+    // AuthMethod::None is a unit variant: serde accepts a missing or null `value`, never ''
+    if (protocol === 'local') return { type: 'None', value: null };
+    if (isSsh(protocol) && authMode === 'key' && privateKeyPath.trim()) {
+      const pp = passphrase ? passphrase : passphraseStored ? STORED_SECRET : null;
+      return { type: 'PrivateKey', value: { path: privateKeyPath.trim(), passphrase: pp } };
+    }
+    if (isSsh(protocol) && authMode === 'agent') return { type: 'None', value: null };
+    if (password) return { type: 'Password', value: password };
+    if (passwordStored) return { type: 'Password', value: STORED_SECRET };
+    return { type: 'None', value: null };
   };
 
   const buildConfig = (): ConnectionConfig => {
+    const trimmedHost = host.trim();
+    const trimmedUser = username.trim();
+    const parsedPort = parseInt(port, 10);
+    const fallbackName = trimmedHost ? `${trimmedUser ? `${trimmedUser}@` : ''}${trimmedHost}` : t('loginDialog.newConnection');
     return {
       id: selectedSiteId === 'new' ? `site-${Date.now()}` : selectedSiteId,
-      name: siteName || (host ? `${protocol.toUpperCase()} - ${host}` : 'New Site'),
+      name: siteName.trim() || fallbackName,
       protocol,
-      host: host.trim(),
-      port,
-      username: username.trim(),
-      auth: privateKeyPath.trim()
-        ? { type: 'PrivateKey', value: { path: privateKeyPath.trim() } }
-        : password
-        ? { type: 'Password', value: password }
-        : { type: 'None', value: '' },
+      host: protocol === 'local' ? 'localhost' : trimmedHost,
+      port: Number.isFinite(parsedPort) ? parsedPort : DEFAULT_PORTS[protocol] ?? 22,
+      username: trimmedUser,
+      auth: buildAuth(),
       remote_root: remoteRoot.trim(),
     };
   };
 
-  const handleConnect = async () => {
+  const validate = (): string | null => {
+    if (protocol === 'local') return null;
+    if (!host.trim()) return t('loginDialog.errHost', 'Enter the server address.');
+    const p = parseInt(port, 10);
+    if (!Number.isFinite(p) || p < 1 || p > 65535) return t('loginDialog.errPort', 'Port must be a number between 1 and 65535.');
+    if (isSsh(protocol) && authMode === 'key' && !privateKeyPath.trim()) return t('loginDialog.errKey', 'Choose a private key file.');
+    return null;
+  };
+
+  const runConnect = async (cfg: ConnectionConfig) => {
+    if (isConnecting) return;
     setErrorMessage('');
-    if (!host && protocol !== 'local') {
-      setErrorMessage('Por favor, informe o endereço do Host ou Endpoint.');
-      return;
-    }
     const currentAttempt = ++connectAttemptIdRef.current;
+    const token = { cancelled: false };
+    attemptTokenRef.current = token;
     setIsConnecting(true);
     try {
-      const cfg = buildConfig();
-      await onConnect(cfg);
+      await onConnect(cfg, token);
       if (connectAttemptIdRef.current === currentAttempt) {
+        resetForm();
         onClose();
       }
     } catch (err: any) {
-      if (connectAttemptIdRef.current === currentAttempt) {
-        setErrorMessage(err.toString());
-      }
+      if (connectAttemptIdRef.current === currentAttempt) setErrorMessage(String(err?.message ?? err));
     } finally {
-      if (connectAttemptIdRef.current === currentAttempt) {
-        setIsConnecting(false);
-      }
+      if (connectAttemptIdRef.current === currentAttempt) setIsConnecting(false);
     }
+  };
+
+  const handleConnect = () => {
+    const invalid = validate();
+    if (invalid) {
+      setErrorMessage(invalid);
+      return;
+    }
+    runConnect(buildConfig());
   };
 
   const handleCancelConnect = () => {
+    if (attemptTokenRef.current) attemptTokenRef.current.cancelled = true;
     connectAttemptIdRef.current++;
     setIsConnecting(false);
-    setErrorMessage('Tentativa de conexão cancelada pelo usuário. Você pode corrigir a porta, host ou credenciais e tentar novamente.');
+    setErrorMessage(t('loginDialog.cancelledMsg', 'Connection attempt cancelled. You can adjust the details and try again.'));
   };
 
   const handleClose = () => {
-    if (isConnecting) {
-      handleCancelConnect();
-    }
+    if (isConnecting) handleCancelConnect();
+    // Do not keep typed credentials around after the dialog closes
+    resetForm();
     onClose();
   };
 
-  const handleSave = async () => {
-    setErrorMessage('');
-    if (!host && protocol !== 'local') {
-      setErrorMessage('Por favor, informe o endereço do Host ou Endpoint antes de salvar.');
+  // Escape (the only dismiss path the Modal shell has here, since backdrop clicks are off):
+  // close only when no typed draft would be lost; with a draft it just stops a running attempt.
+  // Close/Cancel buttons still call handleClose directly.
+  const handleEscape = () => {
+    if (!isDirty) {
+      handleClose();
       return;
     }
+    if (isConnecting) handleCancelConnect();
+  };
+
+  const handleSave = async () => {
+    const invalid = validate();
+    if (invalid) {
+      setErrorMessage(invalid);
+      return;
+    }
+    setErrorMessage('');
     setIsSaving(true);
     try {
       const cfg = buildConfig();
       await onSaveSite(cfg);
       setSelectedSiteId(cfg.id);
+      setSiteName(cfg.name);
+      setIsDirty(false);
       setSaveSuccess(true);
-      setTimeout(() => setSaveSuccess(false), 2500);
+      setTimeout(() => setSaveSuccess(false), 2000);
     } catch (err: any) {
-      setErrorMessage(err.toString());
+      setErrorMessage(String(err?.message ?? err));
     } finally {
       setIsSaving(false);
     }
   };
 
   const handleDelete = async (id: string) => {
-    await onDeleteSite(id);
-    if (selectedSiteId === id) {
-      handleNewSite();
+    if (pendingDeleteId !== id) {
+      setPendingDeleteId(id);
+      setTimeout(() => setPendingDeleteId((cur) => (cur === id ? null : cur)), 3000);
+      return;
+    }
+    setPendingDeleteId(null);
+    try {
+      await onDeleteSite(id);
+      if (selectedSiteId === id) handleNewSite();
+    } catch (err: any) {
+      setErrorMessage(String(err?.message ?? err));
     }
   };
 
@@ -189,6 +327,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
       const selected = await invoke<string | null>('pick_key_file');
       if (selected) {
         setPrivateKeyPath(selected);
+        setIsDirty(true);
       }
     } catch (err) {
       console.warn('Native picker failed or not in Tauri environment:', err);
@@ -196,429 +335,406 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
     }
   };
 
+  const onFormKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey && (e.target as HTMLElement).tagName === 'INPUT') {
+      e.preventDefault();
+      handleConnect();
+    }
+  };
+
+  const isNew = selectedSiteId === 'new';
+  const isS3 = protocol === 's3';
+  const isLocal = protocol === 'local';
+
+  const protocolOptions: Array<{ value: Protocol; label: string; title?: string }> = [
+    { value: 'sftp', label: 'SFTP' },
+    { value: 'scp', label: 'SCP', title: t('loginDialog.scpHint', 'SCP runs over the same SSH connection') },
+    { value: 'ftp', label: 'FTP', title: t('loginDialog.ftpHint', 'Plain FTP: user name, password and files travel unencrypted') },
+    { value: 's3', label: 'S3', title: 'Amazon S3, Cloudflare R2, MinIO, Wasabi, B2' },
+    { value: 'local', label: t('loginDialog.localShort', 'Local') },
+  ];
+
   return (
-    <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-in fade-in duration-150">
-      <div className="bg-white dark:bg-dark-800 border border-slate-300 dark:border-dark-600 rounded-xl max-w-4xl w-full shadow-2xl flex flex-col h-[580px] overflow-hidden">
-        {/* Title Bar */}
-        <div className="px-5 py-3 border-b border-slate-200 dark:border-dark-700 flex items-center justify-between bg-slate-100 dark:bg-dark-750 select-none">
-          <div className="flex items-center space-x-2.5">
-            <img src="/icon.png" alt="RustSCP" className="w-5 h-5 object-contain" />
-            <h3 className="font-bold text-slate-900 dark:text-slate-100 text-sm">
-              {t('loginDialog.title')} / {t('loginDialog.connect')}
-            </h3>
+    <Modal isOpen={isOpen} onClose={handleEscape} size="2xl" padded={false} className="h-[min(600px,calc(100vh-2rem))]" dismissOnBackdrop={false}>
+      <div className="flex h-full min-h-0">
+        {/* Saved sites */}
+        <aside className="w-60 shrink-0 bg-dark-850 border-r border-line flex flex-col select-none">
+          <div className="px-4 pt-4 pb-2 flex items-center justify-between">
+            <h2 className="text-[15px] font-semibold text-ink">{t('loginDialog.title', 'Site Manager')}</h2>
+            <button type="button" onClick={handleNewSite} className="ui-icon-btn ui-icon-btn-sm" title={t('loginDialog.newConnection')} aria-label={t('loginDialog.newConnection')}>
+              <Plus className="w-4 h-4" />
+            </button>
           </div>
-          <button 
-            type="button"
-            onClick={handleClose} 
-            className="text-slate-500 hover:text-slate-950 dark:text-slate-400 dark:hover:text-white p-1 rounded-md hover:bg-slate-200 dark:hover:bg-dark-700 transition-colors"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        </div>
 
-        {/* Dialog Body */}
-        <div className="flex flex-1 overflow-hidden">
-          {/* Left: Saved Sites Tree */}
-          <div className="w-64 bg-slate-50 dark:bg-dark-900 border-r border-slate-200 dark:border-dark-700 flex flex-col p-3 select-none">
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-[11px] font-bold text-slate-700 dark:text-slate-400 uppercase tracking-wider">
-                {t('loginDialog.savedSites')}
-              </span>
-              <button
-                type="button"
-                onClick={handleNewSite}
-                title={t('loginDialog.newConnection')}
-                className="flex items-center space-x-1 px-2 py-0.5 rounded bg-rust-500/15 text-rust-700 dark:text-rust-400 hover:bg-rust-500/25 border border-rust-500/30 text-xs font-semibold transition-colors"
-              >
-                <FolderPlus className="w-3 h-3" />
-                <span>{t('loginDialog.newConnection')}</span>
-              </button>
+          {savedSites.length > 6 && (
+            <div className="px-3 pb-2">
+              <div className="relative">
+                <Search className="w-3.5 h-3.5 text-ink-faint absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  {...plainTextInputProps}
+                  value={filter}
+                  onChange={(e) => setFilter(e.target.value)}
+                  placeholder={t('loginDialog.filter', 'Filter')}
+                  className="ui-input h-7 pl-7 text-[12.5px]"
+                />
+              </div>
             </div>
+          )}
 
-            <div className="flex-1 overflow-y-auto space-y-1">
-              <button
-                type="button"
-                onClick={handleNewSite}
-                className={`w-full text-left px-2.5 py-1.5 rounded text-xs flex items-center space-x-2 transition-colors ${
-                  selectedSiteId === 'new'
-                    ? 'bg-rust-600 text-white font-semibold shadow-sm'
-                    : 'text-slate-700 dark:text-slate-300 hover:bg-slate-200/80 dark:hover:bg-dark-800 hover:text-slate-950 dark:hover:text-white'
-                }`}
-              >
-                <Server className="w-3.5 h-3.5" />
-                <span>[ {t('loginDialog.newConnection')} ]</span>
-              </button>
+          <div className="flex-1 overflow-y-auto px-2 pb-2 space-y-0.5">
+            <button
+              type="button"
+              onClick={handleNewSite}
+              className={`w-full flex items-center gap-2.5 px-2.5 h-9 rounded-lg text-[13px] transition-colors ${
+                isNew ? 'bg-dark-650 text-ink font-medium' : 'text-ink-muted hover:text-ink hover:bg-dark-650/50'
+              }`}
+            >
+              <Plus className="w-4 h-4 shrink-0" />
+              <span className="truncate">{t('loginDialog.newConnection')}</span>
+            </button>
 
-              {savedSites.map((site) => (
+            {visibleSites.map((site) => {
+              const selected = selectedSiteId === site.id;
+              const confirming = pendingDeleteId === site.id;
+              return (
                 <div
                   key={site.id}
+                  role="button"
+                  tabIndex={0}
                   onClick={() => handleSelectSite(site)}
-                  className={`group flex items-center justify-between px-2.5 py-1.5 rounded text-xs cursor-pointer transition-colors ${
-                    selectedSiteId === site.id
-                      ? 'bg-rust-500/15 text-rust-700 dark:text-rust-300 border border-rust-500/40 font-semibold'
-                      : 'text-slate-700 dark:text-slate-300 hover:bg-slate-200/80 dark:hover:bg-dark-800 hover:text-slate-950 dark:hover:text-white'
+                  onDoubleClick={() => {
+                    handleSelectSite(site);
+                    runConnect(site);
+                  }}
+                  onKeyDown={(e) => e.key === 'Enter' && handleSelectSite(site)}
+                  className={`group flex items-center gap-2.5 px-2.5 h-11 rounded-lg cursor-pointer transition-colors ${
+                    selected ? 'bg-dark-650 text-ink' : 'text-ink hover:bg-dark-650/50'
                   }`}
+                  title={t('loginDialog.doubleClickHint', 'Double-click to connect')}
                 >
-                  <div className="flex items-center space-x-2 truncate">
-                    {site.protocol === 's3' ? (
-                      <Cloud className="w-3.5 h-3.5 text-amber-500 dark:text-amber-400 shrink-0" />
-                    ) : site.protocol === 'local' ? (
-                      <HardDrive className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
-                    ) : (
-                      <Lock className="w-3.5 h-3.5 text-rust-600 dark:text-rust-500 shrink-0" />
+                  <ProtocolIcon protocol={site.protocol} className={`w-4 h-4 shrink-0 ${selected ? 'text-rust-500' : 'text-ink-faint'}`} />
+                  <div className="flex-1 min-w-0">
+                    <div className={`text-[13px] truncate ${selected ? 'font-medium' : ''}`}>{site.name}</div>
+                    {site.protocol !== 'local' && (
+                      <div className="text-[11px] text-ink-faint truncate">
+                        {site.username ? `${site.username}@` : ''}
+                        {site.host}
+                      </div>
                     )}
-                    <span className="truncate">{site.name}</span>
                   </div>
-
                   {site.id !== 'local' && (
-                    <div className="flex items-center space-x-1 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleSelectSite(site);
-                        }}
-                        title={t('loginDialog.editMode')}
-                        className="p-1 hover:text-sky-600 dark:hover:text-sky-400 text-slate-500 dark:text-slate-400 rounded hover:bg-slate-200 dark:hover:bg-dark-700"
-                      >
-                        <Pencil className="w-3 h-3" />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleDelete(site.id);
-                        }}
-                        title={t('dualPane.delete')}
-                        className="p-1 hover:text-rose-600 dark:hover:text-rose-400 text-slate-500 dark:text-slate-400 rounded hover:bg-slate-200 dark:hover:bg-dark-700"
-                      >
-                        <Trash2 className="w-3 h-3" />
-                      </button>
-                    </div>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDelete(site.id);
+                      }}
+                      title={confirming ? t('loginDialog.confirmDelete', 'Click again to delete') : t('dualPane.delete')}
+                      aria-label={t('dualPane.delete')}
+                      className={`shrink-0 h-6 rounded-md flex items-center justify-center transition-all ${
+                        confirming
+                          ? 'px-2 bg-red-600 text-white text-[11px] font-medium opacity-100'
+                          : 'w-6 text-ink-faint hover:text-red-600 dark:hover:text-red-400 hover:bg-dark-600/60 opacity-0 group-hover:opacity-100 focus:opacity-100'
+                      }`}
+                    >
+                      {confirming ? t('loginDialog.deleteShort', 'Delete') : <Trash2 className="w-3.5 h-3.5" />}
+                    </button>
                   )}
                 </div>
-              ))}
+              );
+            })}
+            {visibleSites.length === 0 && filter && (
+              <div className="px-3 py-6 text-center text-[12px] text-ink-faint">{t('loginDialog.noMatches', 'No matching sites')}</div>
+            )}
+          </div>
+
+          <div className="p-2 border-t border-line">
+            <button
+              type="button"
+              onClick={() => setIsVaultModalOpen(true)}
+              className="w-full flex items-center gap-2 px-2.5 h-8 rounded-lg text-[12.5px] text-ink-muted hover:text-ink hover:bg-dark-650/50 transition-colors"
+              title={t('loginDialog.vaultHint', 'Encrypted (AES-256) export/import for macOS, Windows and Linux')}
+            >
+              <ArrowDownUp className="w-3.5 h-3.5" />
+              {t('loginDialog.importExport', 'Import / Export…')}
+            </button>
+          </div>
+        </aside>
+
+        {/* Connection form */}
+        <div className="flex-1 min-w-0 flex flex-col">
+          <div className="flex-1 overflow-y-auto px-7 pt-5 pb-6" onKeyDown={onFormKeyDown}>
+            <div className="flex items-center justify-between mb-5">
+              <div className="min-w-0">
+                <div className="text-[12px] text-ink-faint">{isNew ? t('loginDialog.newConnection') : t('loginDialog.editing', 'Editing')}</div>
+                <input
+                  {...plainTextInputProps}
+                  value={siteName}
+                  onChange={(e) => {
+                    setSiteName(e.target.value);
+                    setIsDirty(true);
+                  }}
+                  placeholder={t('loginDialog.namePlaceholder', 'Untitled connection')}
+                  aria-label={t('loginDialog.siteName')}
+                  className="w-full h-9 bg-transparent text-[17px] font-semibold text-ink placeholder:text-ink-faint outline-none rounded-md -ml-1 px-1 hover:bg-dark-650/40 focus:bg-dark-650/40 transition-colors"
+                />
+              </div>
+              <button type="button" onClick={handleClose} className="ui-icon-btn ui-icon-btn-sm self-start" aria-label={t('loginDialog.cancel')}>
+                <X className="w-4 h-4" />
+              </button>
             </div>
 
-            {/* Vault & Portability Actions */}
-            <div className="pt-2.5 mt-2 border-t border-slate-200 dark:border-dark-700/80 space-y-1.5 shrink-0">
-              <div className="flex items-center justify-between px-1 text-[10px] text-emerald-700 dark:text-emerald-400 font-mono">
-                <span className="flex items-center gap-1">
-                  <ShieldCheck className="w-3 h-3" />
-                  <span>{t('loginDialog.vaultBadge')}</span>
-                </span>
-                <span className="text-slate-500 text-[9px]">Universal</span>
-              </div>
+            <div className="space-y-4 max-w-[560px]">
+              <Field label={t('loginDialog.protocol')}>
+                {() => <Segmented<Protocol> ariaLabel={t('loginDialog.protocol')} value={protocol} onChange={handleProtocolChange} options={protocolOptions} className="w-full" />}
+              </Field>
 
-              <div className="grid grid-cols-2 gap-1.5">
-                <button
-                  type="button"
-                  onClick={() => setIsVaultModalOpen(true)}
-                  className="flex items-center justify-center gap-1 px-2 py-1.5 rounded bg-white hover:bg-slate-100 dark:bg-dark-800 dark:hover:bg-dark-700 text-slate-800 dark:text-slate-300 hover:text-slate-950 dark:hover:text-white text-[11px] font-medium border border-slate-200 dark:border-dark-600 transition-colors shadow-sm"
-                  title="Exportar conexões cifradas para Mac, Windows e Linux"
-                >
-                  <Download className="w-3 h-3 text-sky-600 dark:text-sky-400" />
-                  <span>{t('loginDialog.exportVault')}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setIsVaultModalOpen(true)}
-                  className="flex items-center justify-center gap-1 px-2 py-1.5 rounded bg-white hover:bg-slate-100 dark:bg-dark-800 dark:hover:bg-dark-700 text-slate-800 dark:text-slate-300 hover:text-slate-950 dark:hover:text-white text-[11px] font-medium border border-slate-200 dark:border-dark-600 transition-colors shadow-sm"
-                  title="Importar arquivo de cofre .rustscp-vault"
-                >
-                  <Upload className="w-3 h-3 text-emerald-600 dark:text-emerald-400" />
-                  <span>{t('loginDialog.importVault')}</span>
-                </button>
-              </div>
+              {errorMessage && (
+                <div role="alert" className="flex items-start gap-2 px-3 py-2.5 rounded-lg bg-red-500/10 text-red-700 dark:text-red-300 text-[12.5px] select-text">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-px" />
+                  <span className="flex-1 break-words">{errorMessage}</span>
+                </div>
+              )}
+
+              {protocol === 'ftp' && (
+                <p className="flex items-start gap-2 text-[12px] text-amber-700 dark:text-amber-400 leading-snug">
+                  <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-px" />
+                  {t('loginDialog.ftpWarning', 'FTP is not encrypted: your password and files travel in clear text. Prefer SFTP when the server supports it.')}
+                </p>
+              )}
+
+              {isLocal ? (
+                <p className="text-[13px] text-ink-muted leading-relaxed">
+                  {t('loginDialog.localDesc', 'Opens a new tab browsing the files on this computer.')}
+                </p>
+              ) : (
+                <>
+                  <div className="grid grid-cols-[1fr_96px] gap-3">
+                    <Field label={isS3 ? t('loginDialog.endpoint', 'Endpoint') : t('loginDialog.host')}>
+                      {(id) => (
+                        <TextInput
+                          id={id}
+                          ref={hostRef}
+                          mono
+                          value={host}
+                          onChange={(e) => {
+                            setHost(e.target.value);
+                            setIsDirty(true);
+                          }}
+                          onBlur={(e) => splitHostInput(e.target.value)}
+                          placeholder={isS3 ? 's3.amazonaws.com' : 'example.com'}
+                          data-autofocus
+                        />
+                      )}
+                    </Field>
+                    <Field label={t('loginDialog.port')}>
+                      {(id) => (
+                        <TextInput
+                          id={id}
+                          mono
+                          inputMode="numeric"
+                          value={port}
+                          onChange={(e) => {
+                            setPort(e.target.value.replace(/[^0-9]/g, '').slice(0, 5));
+                            setIsDirty(true);
+                          }}
+                          placeholder={String(DEFAULT_PORTS[protocol] ?? '')}
+                        />
+                      )}
+                    </Field>
+                  </div>
+
+                  {isSsh(protocol) && (
+                    <Field label={t('loginDialog.authType')}>
+                      {() => (
+                        <Segmented<AuthMode>
+                          ariaLabel={t('loginDialog.authType')}
+                          value={authMode}
+                          onChange={(m) => {
+                            setAuthMode(m);
+                            setIsDirty(true);
+                          }}
+                          options={[
+                            { value: 'password', label: t('loginDialog.password') },
+                            { value: 'key', label: t('loginDialog.keyFile', 'Key file') },
+                            { value: 'agent', label: t('loginDialog.sshAgent', 'SSH agent') },
+                          ]}
+                        />
+                      )}
+                    </Field>
+                  )}
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <Field label={isS3 ? 'Access Key ID' : t('loginDialog.username')}>
+                      {(id) => (
+                        <TextInput
+                          id={id}
+                          mono
+                          value={username}
+                          onChange={(e) => {
+                            setUsername(e.target.value);
+                            setIsDirty(true);
+                          }}
+                          placeholder={isS3 ? 'AKIA…' : protocol === 'ftp' ? 'anonymous' : 'root'}
+                        />
+                      )}
+                    </Field>
+
+                    {(!isSsh(protocol) || authMode === 'password') && (
+                      <Field label={isS3 ? 'Secret Access Key' : t('loginDialog.password')}>
+                        {(id) => (
+                          <div className="relative">
+                            <TextInput
+                              id={id}
+                              mono
+                              type={showPassword ? 'text' : 'password'}
+                              value={password}
+                              onChange={(e) => {
+                                setPassword(e.target.value);
+                                if (e.target.value) setPasswordStored(false);
+                                setIsDirty(true);
+                              }}
+                              placeholder={passwordStored ? t('loginDialog.savedSecret', 'Saved — type to replace') : undefined}
+                              className="pr-8"
+                            />
+                            <button
+                              type="button"
+                              disabled={passwordStored && !password}
+                              onClick={() => setShowPassword((s) => !s)}
+                              className="absolute right-1 top-1/2 -translate-y-1/2 ui-icon-btn ui-icon-btn-sm !w-6 !h-6"
+                              aria-label={showPassword ? t('loginDialog.hidePassword', 'Hide password') : t('loginDialog.showPassword', 'Show password')}
+                            >
+                              {showPassword ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                            </button>
+                          </div>
+                        )}
+                      </Field>
+                    )}
+
+                    {isSsh(protocol) && authMode === 'agent' && (
+                      <p className="self-end pb-2 text-[12px] text-ink-faint leading-snug">
+                        {t('loginDialog.agentDesc', 'Uses the identities loaded in your running SSH agent.')}
+                      </p>
+                    )}
+                  </div>
+
+                  {isSsh(protocol) && authMode === 'key' && (
+                    <div className="space-y-3">
+                      <Field label={t('loginDialog.privateKey')} hint={t('loginDialog.keyFileHelper')}>
+                        {(id) => (
+                          <div className="flex items-center gap-2">
+                            <TextInput
+                              id={id}
+                              mono
+                              value={privateKeyPath}
+                              onChange={(e) => {
+                                setPrivateKeyPath(e.target.value);
+                                setIsDirty(true);
+                              }}
+                              placeholder="~/.ssh/id_ed25519"
+                            />
+                            <Button onClick={handlePickPrivateKey} icon={<FolderOpen className="w-3.5 h-3.5" />}>
+                              {t('loginDialog.browseKey')}
+                            </Button>
+                          </div>
+                        )}
+                      </Field>
+                      <input
+                        type="file"
+                        ref={fileInputRef}
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (file) {
+                            setPrivateKeyPath((file as any).path || file.name);
+                            setIsDirty(true);
+                          }
+                        }}
+                        className="hidden"
+                      />
+                      <Field label={t('loginDialog.passphrase', 'Key passphrase')} hint={t('loginDialog.passphraseHint', 'Only if the key is encrypted.')}>
+                        {(id) => (
+                          <TextInput
+                            id={id}
+                            mono
+                            type="password"
+                            value={passphrase}
+                            onChange={(e) => {
+                              setPassphrase(e.target.value);
+                              if (e.target.value) setPassphraseStored(false);
+                              setIsDirty(true);
+                            }}
+                            placeholder={passphraseStored ? t('loginDialog.savedSecret', 'Saved — type to replace') : undefined}
+                            className="max-w-[280px]"
+                          />
+                        )}
+                      </Field>
+                    </div>
+                  )}
+
+                  {isS3 && (
+                    <Field label={t('loginDialog.defaultBucket')} hint={t('loginDialog.bucketHint', 'Leave empty to list all buckets.')}>
+                      {(id) => (
+                        <TextInput id={id} mono value={remoteRoot} onChange={handleRemoteRootChange} placeholder="my-bucket" />
+                      )}
+                    </Field>
+                  )}
+
+                  {!isS3 && (
+                    <Disclosure label={t('loginDialog.advancedTab')} defaultOpen={!!remoteRoot}>
+                      <Field label={t('loginDialog.remoteRoot')} hint={t('loginDialog.remoteRootHelper')}>
+                        {(id) => (
+                          <TextInput id={id} mono value={remoteRoot} onChange={handleRemoteRootChange} placeholder="~" />
+                        )}
+                      </Field>
+                    </Disclosure>
+                  )}
+                </>
+              )}
             </div>
           </div>
 
-          {/* Right: Connection Properties Form */}
-          <div className="flex-1 p-5 overflow-y-auto space-y-4 bg-white dark:bg-dark-850">
-            {/* Header: Modo Edição ou Nova Conexão */}
-            <div className="flex items-center justify-between pb-3 border-b border-slate-200 dark:border-dark-700">
-              <div className="flex items-center space-x-2">
-                {selectedSiteId !== 'new' ? (
-                  <div className="flex items-center space-x-2">
-                    <span className="flex items-center gap-1 px-2.5 py-1 rounded bg-amber-500/15 text-amber-800 dark:text-amber-400 border border-amber-500/30 text-xs font-semibold">
-                      <Pencil className="w-3.5 h-3.5" />
-                      {t('loginDialog.editMode')}
-                    </span>
-                    <span className="text-xs text-slate-900 dark:text-slate-200 font-semibold truncate max-w-[220px]">
-                      {siteName || t('loginDialog.newConnection')}
-                    </span>
-                  </div>
-                ) : (
-                  <span className="flex items-center gap-1 px-2.5 py-1 rounded bg-sky-500/15 text-sky-800 dark:text-sky-400 border border-sky-500/30 text-xs font-semibold">
-                    <Plus className="w-3.5 h-3.5" />
-                    {t('loginDialog.newConnection')}
-                  </span>
-                )}
-              </div>
-
-              {selectedSiteId !== 'new' && (
-                <button
-                  type="button"
-                  onClick={handleNewSite}
-                  className="text-xs text-slate-600 dark:text-slate-400 hover:text-slate-950 dark:hover:text-white flex items-center space-x-1 px-2.5 py-1 rounded bg-slate-100 hover:bg-slate-200 dark:bg-dark-700/70 dark:hover:bg-dark-700 border border-slate-200 dark:border-dark-600 transition-colors shadow-sm"
-                  title="Limpar formulário e criar uma nova conexão"
-                >
-                  <Plus className="w-3.5 h-3.5 text-rust-600 dark:text-rust-400" />
-                  <span>{t('loginDialog.newConnection')}</span>
-                </button>
+          {/* Footer */}
+          <div className="flex items-center gap-2 px-5 py-3.5 border-t border-line shrink-0 select-none">
+            <div className="flex-1 min-w-0 flex items-center gap-2 text-[12.5px]">
+              {isConnecting ? (
+                <span className="flex items-center gap-2 text-ink-muted truncate">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                  {t('loginDialog.connecting')} {host || ''}
+                </span>
+              ) : saveSuccess ? (
+                <span className="flex items-center gap-1.5 text-emerald-700 dark:text-emerald-400">
+                  <Check className="w-3.5 h-3.5" />
+                  {t('loginDialog.savedSuccess')}
+                </span>
+              ) : (
+                <span className="flex items-center gap-1.5 text-ink-faint truncate" title={t('loginDialog.vaultHint', 'Encrypted (AES-256) export/import for macOS, Windows and Linux')}>
+                  <KeyRound className="w-3.5 h-3.5 shrink-0" />
+                  {t('loginDialog.vaultBadge')}
+                </span>
               )}
             </div>
 
-            {errorMessage && (
-              <div className="p-3 bg-rose-500/15 border border-rose-500/30 rounded-lg text-rose-700 dark:text-rose-300 text-xs font-medium flex items-start gap-2">
-                <XCircle className="w-4 h-4 shrink-0 mt-0.5 text-rose-600 dark:text-rose-400" />
-                <span className="flex-1">{errorMessage}</span>
-              </div>
-            )}
-
-            {/* Site Name & Protocol */}
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                  {t('loginDialog.siteName')}
-                </label>
-                <input
-                  type="text"
-                  value={siteName}
-                  onChange={(e) => setSiteName(e.target.value)}
-                  placeholder="Ex: Hetzner Production VPS"
-                  className="w-full bg-slate-50/50 dark:bg-dark-900 border border-slate-300 dark:border-dark-600 rounded px-2.5 py-1.5 text-xs text-slate-900 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 shadow-sm"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                  {t('loginDialog.protocol')}
-                </label>
-                <select
-                  value={protocol}
-                  onChange={(e) => handleProtocolChange(e.target.value as Protocol)}
-                  className="w-full bg-slate-50/50 dark:bg-dark-900 border border-slate-300 dark:border-dark-600 rounded px-2.5 py-1.5 text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 shadow-sm"
-                >
-                  <option value="sftp">SFTP - SSH File Transfer Protocol</option>
-                  <option value="scp">SCP - Secure Copy Protocol</option>
-                  <option value="s3">Amazon S3 / Cloudflare R2 / MinIO</option>
-                  <option value="ftp">FTP - File Transfer Protocol</option>
-                  <option value="local">Local Filesystem</option>
-                </select>
-              </div>
-            </div>
-
-            {/* Host & Port */}
-            <div className="grid grid-cols-4 gap-4">
-              <div className="col-span-3">
-                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                  {protocol === 's3' ? 'S3 Endpoint URL / Host' : t('loginDialog.host')}
-                </label>
-                <input
-                  type="text"
-                  value={host}
-                  onChange={(e) => setHost(e.target.value)}
-                  placeholder={
-                    protocol === 's3'
-                      ? 'https://s3.amazonaws.com ou https://<account>.r2.cloudflarestorage.com'
-                      : 'vps.servidor.com ou 192.168.1.100'
-                  }
-                  className="w-full bg-slate-50/50 dark:bg-dark-900 border border-slate-300 dark:border-dark-600 rounded px-2.5 py-1.5 text-xs font-mono text-slate-900 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 shadow-sm"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">{t('loginDialog.port')}</label>
-                <input
-                  type="number"
-                  value={port}
-                  onChange={(e) => setPort(parseInt(e.target.value) || 22)}
-                  className="w-full bg-slate-50/50 dark:bg-dark-900 border border-slate-300 dark:border-dark-600 rounded px-2.5 py-1.5 text-xs font-mono text-slate-900 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 shadow-sm"
-                />
-              </div>
-            </div>
-
-            {/* User & Password / Secret */}
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                  {protocol === 's3' ? 'Access Key ID' : t('loginDialog.username')}
-                </label>
-                <input
-                  type="text"
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                  placeholder={protocol === 's3' ? 'AKIAIOSFODNN7EXAMPLE' : 'root ou ubuntu'}
-                  className="w-full bg-slate-50/50 dark:bg-dark-900 border border-slate-300 dark:border-dark-600 rounded px-2.5 py-1.5 text-xs font-mono text-slate-900 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 shadow-sm"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                  {protocol === 's3' ? 'Secret Access Key' : t('loginDialog.password')}
-                </label>
-                <div className="relative">
-                  <input
-                    type={showPassword ? 'text' : 'password'}
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    placeholder="••••••••••••"
-                    className="w-full bg-slate-50/50 dark:bg-dark-900 border border-slate-300 dark:border-dark-600 rounded px-2.5 py-1.5 text-xs font-mono text-slate-900 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 shadow-sm pr-8"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowPassword(!showPassword)}
-                    className="absolute right-2 top-2 text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200"
-                  >
-                    {showPassword ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            {/* Private Key & Remote Directory */}
-            {protocol !== 's3' && (
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                    {t('loginDialog.privateKey')}
-                  </label>
-                  <div className="flex items-center space-x-2">
-                    <input
-                      type="text"
-                      value={privateKeyPath}
-                      onChange={(e) => setPrivateKeyPath(e.target.value)}
-                      placeholder="~/.ssh/id_ed25519 ou /path/to/key.pem"
-                      className="flex-1 bg-slate-50/50 dark:bg-dark-900 border border-slate-300 dark:border-dark-600 rounded px-2.5 py-1.5 text-xs font-mono text-slate-900 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 shadow-sm"
-                    />
-                    <button
-                      type="button"
-                      onClick={handlePickPrivateKey}
-                      className="px-3 py-1.5 rounded bg-slate-100 hover:bg-slate-200 dark:bg-dark-700 dark:hover:bg-dark-650 text-slate-700 dark:text-slate-300 hover:text-slate-950 dark:hover:text-white text-xs font-medium border border-slate-300 dark:border-dark-600 flex items-center space-x-1.5 shrink-0 transition-colors shadow-sm"
-                      title={t('loginDialog.browseKey')}
-                    >
-                      <FolderOpen className="w-3.5 h-3.5 text-sky-600 dark:text-sky-400" />
-                      <span>{t('loginDialog.browseKey')}</span>
-                    </button>
-                  </div>
-                  <input
-                    type="file"
-                    ref={fileInputRef}
-                    onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      if (file) {
-                        setPrivateKeyPath((file as any).path || file.name);
-                      }
-                    }}
-                    className="hidden"
-                  />
-                  <span className="text-[10px] text-slate-500 dark:text-slate-400 block mt-1">
-                    {t('loginDialog.keyFileHelper')}
-                  </span>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                    {t('loginDialog.remoteRoot')}
-                  </label>
-                  <input
-                    type="text"
-                    value={remoteRoot}
-                    onChange={(e) => setRemoteRoot(e.target.value)}
-                    placeholder="Padrão do Servidor (Home do Usuário ~)"
-                    className="w-full bg-slate-50/50 dark:bg-dark-900 border border-slate-300 dark:border-dark-600 rounded px-2.5 py-1.5 text-xs font-mono text-slate-900 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 shadow-sm"
-                  />
-                  <span className="text-[10px] text-slate-500 dark:text-slate-400 block mt-1">
-                    {t('loginDialog.remoteRootHelper')}
-                  </span>
-                </div>
-              </div>
-            )}
-
-            {protocol === 's3' && (
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                  {t('loginDialog.defaultBucket')}
-                </label>
-                <input
-                  type="text"
-                  value={remoteRoot}
-                  onChange={(e) => setRemoteRoot(e.target.value)}
-                  placeholder="meu-bucket ou deixe vazio para listar todos"
-                  className="w-full bg-slate-50/50 dark:bg-dark-900 border border-slate-300 dark:border-dark-600 rounded px-2.5 py-1.5 text-xs font-mono text-slate-900 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 shadow-sm"
-                />
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* Footer */}
-        <div className="px-5 py-3 border-t border-slate-200 dark:border-dark-700 bg-slate-100 dark:bg-dark-750 flex items-center justify-between select-none">
-          <div className="flex items-center gap-2.5">
-            <div className="flex items-center gap-1.5 px-2.5 py-1 bg-emerald-500/15 border border-emerald-500/30 text-emerald-800 dark:text-emerald-400 rounded-lg text-xs font-mono">
-              <ShieldCheck className="w-3.5 h-3.5" />
-              <span>{t('loginDialog.vaultBadge')}</span>
-            </div>
-            {saveSuccess && (
-              <span className="text-xs text-emerald-700 dark:text-emerald-400 font-medium flex items-center gap-1">
-                <Check className="w-3.5 h-3.5" />
-                <span>{t('loginDialog.savedSuccess')}</span>
-              </span>
-            )}
-            {isConnecting && (
-              <span className="text-xs text-rust-700 dark:text-rust-400 flex items-center gap-1.5 font-medium animate-pulse">
-                <Server className="w-3.5 h-3.5 animate-spin" />
-                <span>{t('loginDialog.connecting')} {host || '...'}</span>
-              </span>
-            )}
-          </div>
-
-          <div className="flex items-center space-x-2">
             {isConnecting ? (
-              <button
-                type="button"
-                onClick={handleCancelConnect}
-                className="px-4 py-1.5 rounded text-xs font-bold bg-rose-600 hover:bg-rose-500 text-white shadow-lg transition-all flex items-center space-x-1.5 border border-rose-500/40 animate-in fade-in duration-100"
-                title={t('loginDialog.cancelConnecting')}
-              >
-                <XCircle className="w-3.5 h-3.5" />
-                <span>{t('loginDialog.cancelConnecting')}</span>
-              </button>
+              <Button variant="secondary" onClick={handleCancelConnect}>
+                {t('loginDialog.cancelConnecting')}
+              </Button>
             ) : (
               <>
-                <button
-                  type="button"
-                  onClick={handleClose}
-                  className="px-3.5 py-1.5 rounded text-xs font-medium text-slate-600 dark:text-slate-400 hover:text-slate-950 dark:hover:text-slate-200 hover:bg-slate-200 dark:hover:bg-dark-700 transition-colors"
-                >
+                <Button variant="ghost" onClick={handleClose}>
                   {t('loginDialog.cancel')}
-                </button>
-                <button
-                  type="button"
-                  onClick={handleSave}
-                  disabled={isSaving}
-                  className="flex items-center space-x-1.5 px-3.5 py-1.5 rounded bg-white hover:bg-slate-50 dark:bg-dark-700 dark:hover:bg-dark-650 text-slate-800 dark:text-slate-200 hover:text-slate-950 dark:hover:text-white text-xs font-semibold border border-slate-300 dark:border-dark-600 transition-colors shadow-sm disabled:opacity-50"
-                  title={selectedSiteId !== 'new' ? t('loginDialog.saveChanges') : t('loginDialog.save')}
-                >
-                  <Save className="w-3.5 h-3.5 text-sky-600 dark:text-sky-400" />
-                  <span>{selectedSiteId !== 'new' ? t('loginDialog.saveChanges') : t('loginDialog.save')}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={handleConnect}
-                  className="px-5 py-1.5 rounded text-xs font-bold bg-rust-600 hover:bg-rust-500 text-white shadow-lg transition-all flex items-center space-x-1.5 border border-rust-500/40"
-                >
-                  <Server className="w-3.5 h-3.5" />
-                  <span>{t('loginDialog.connect')}</span>
-                </button>
+                </Button>
+                <Button variant="secondary" onClick={handleSave} loading={isSaving}>
+                  {isNew ? t('loginDialog.save') : t('loginDialog.saveChanges')}
+                </Button>
+                <Button variant="primary" onClick={handleConnect}>
+                  {t('loginDialog.connect')}
+                </Button>
               </>
             )}
           </div>
         </div>
       </div>
 
-      {/* Vault Modal for Universal Export / Import */}
       {isVaultModalOpen && (
         <VaultModal
           isOpen={isVaultModalOpen}
@@ -629,6 +745,6 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
           }}
         />
       )}
-    </div>
+    </Modal>
   );
 };

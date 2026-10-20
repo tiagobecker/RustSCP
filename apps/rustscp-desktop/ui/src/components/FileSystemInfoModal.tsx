@@ -1,7 +1,10 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
-import { HardDrive, Shield, X, Copy, Check, Server } from 'lucide-react';
+import { HardDrive, Copy, Check, RefreshCw, AlertTriangle } from 'lucide-react';
+import { Modal } from './ui/Modal.tsx';
+import { Button, Disclosure, IconButton } from './ui/controls.tsx';
+import { notify } from './ui/toast.tsx';
 
 interface FileSystemInfo {
   path: string;
@@ -26,228 +29,230 @@ interface FileSystemInfoModalProps {
   path: string;
 }
 
-export const FileSystemInfoModal: React.FC<FileSystemInfoModalProps> = ({
-  isOpen,
-  onClose,
-  sessionId,
-  path,
-}) => {
-  const { i18n } = useTranslation();
-  const isPt = i18n.language.startsWith('pt');
+function formatBytes(bytes: number): string {
+  if (!bytes) return '0 B';
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ['KB', 'MB', 'GB', 'TB', 'PB'];
+  let v = bytes / 1024;
+  let u = 0;
+  while (v >= 1024 && u < units.length - 1) {
+    v /= 1024;
+    u++;
+  }
+  return `${v >= 100 ? Math.round(v) : v.toFixed(1)} ${units[u]}`;
+}
 
-  const [activeTab, setActiveTab] = useState<'space' | 'protocol'>('space');
+async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export const FileSystemInfoModal: React.FC<FileSystemInfoModalProps> = ({ isOpen, onClose, sessionId, path }) => {
+  const { i18n } = useTranslation();
+  const isPt = (i18n.language || 'en').toLowerCase().startsWith('pt');
+  const tr = (pt: string, en: string) => (isPt ? pt : en);
+
   const [info, setInfo] = useState<FileSystemInfo | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
-
-  useEffect(() => {
-    if (isOpen) {
-      loadInfo();
-    }
-  }, [isOpen, sessionId, path]);
+  const [copied, setCopied] = useState<string | null>(null);
+  const requestSeq = useRef(0);
+  const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const loadInfo = async () => {
+    const seq = ++requestSeq.current;
     setLoading(true);
     setError(null);
     try {
-      const res = await invoke<FileSystemInfo>('get_filesystem_info', {
-        sessionId,
-        path: path || '/',
-      });
+      const res = await invoke<FileSystemInfo>('get_filesystem_info', { sessionId, path: path || '/' });
+      if (seq !== requestSeq.current) return; // a newer request (other session/path) is in flight
       setInfo(res);
-    } catch (err: any) {
-      setError(err.toString());
+    } catch (err) {
+      if (seq !== requestSeq.current) return;
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      if (seq === requestSeq.current) setLoading(false);
     }
   };
 
-  const formatBytes = (bytes: number) => {
-    if (bytes === 0) return '0 B';
-    const k = 1024;
-    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  useEffect(() => {
+    requestSeq.current++;
+    setInfo(null);
+    setError(null);
+    if (isOpen) void loadInfo();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, sessionId, path]);
+
+  useEffect(
+    () => () => {
+      if (copiedTimer.current) clearTimeout(copiedTimer.current);
+    },
+    []
+  );
+
+  const hasSpace = !!info && info.total_bytes > 0;
+  const usedPct = hasSpace ? Math.min(100, Math.round((info!.used_bytes / info!.total_bytes) * 100)) : 0;
+  const na = tr('Não disponível', 'Not available');
+
+  const handleCopy = async (key: string, text: string) => {
+    if (await copyText(text)) {
+      setCopied(key);
+      if (copiedTimer.current) clearTimeout(copiedTimer.current);
+      copiedTimer.current = setTimeout(() => setCopied(null), 1800);
+    } else {
+      notify.error(tr('Não foi possível copiar', 'Could not copy'), tr('A área de transferência não está disponível.', 'The clipboard is not available.'));
+    }
   };
 
-  const getUsedPercentage = () => {
-    if (!info || info.total_bytes === 0) return 0;
-    return Math.min(100, Math.round((info.used_bytes / info.total_bytes) * 100));
+  const summaryText = () => {
+    if (!info) return '';
+    return [
+      'RustSCP server & filesystem information',
+      `Path: ${info.path}`,
+      `Total space: ${hasSpace ? formatBytes(info.total_bytes) : 'N/A'}`,
+      `Used space: ${hasSpace ? `${formatBytes(info.used_bytes)} (${usedPct}%)` : 'N/A'}`,
+      `Available space: ${hasSpace ? formatBytes(info.available_bytes) : 'N/A'}`,
+      `Inodes (free / total): ${info.free_inodes != null ? `${info.free_inodes} / ${info.total_inodes ?? '?'}` : 'N/A'}`,
+      `Protocol: ${info.protocol_name} (${info.protocol_version})`,
+      `SSH host key (SHA-256): ${info.host_key_fingerprint_sha256 || 'N/A'}`,
+      `SSH host key (MD5): ${info.host_key_fingerprint_md5 || 'N/A'}`,
+      `Cipher: ${info.cipher_name || 'N/A'}`,
+      `Compression: ${info.compression_name || 'N/A'}`,
+    ].join('\n');
   };
 
-  const handleCopyClipboard = () => {
-    if (!info) return;
-    const text = `RustSCP Server & Filesystem Information
-Path: ${info.path}
-Total Space: ${formatBytes(info.total_bytes)}
-Used Space: ${formatBytes(info.used_bytes)} (${getUsedPercentage()}%)
-Free Space: ${formatBytes(info.available_bytes)}
-Protocol: ${info.protocol_name} (${info.protocol_version})
-SSH Host Key (SHA-256): ${info.host_key_fingerprint_sha256 || 'N/A'}
-SSH Host Key (MD5): ${info.host_key_fingerprint_md5 || 'N/A'}
-Cipher: ${info.cipher_name || 'N/A'}
-Compression: ${info.compression_name || 'N/A'}`;
+  const barColor = usedPct > 90 ? 'bg-red-500' : usedPct > 75 ? 'bg-amber-500' : 'bg-rust-500';
 
-    navigator.clipboard.writeText(text);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
-  if (!isOpen) return null;
-
-  const usedPct = getUsedPercentage();
+  const detailRow = (label: string, value: string | null | undefined, mono?: boolean, copyKey?: string) => (
+    <div key={label} className="flex items-start gap-3 px-3.5 py-2 min-h-[36px]">
+      <span className="w-40 shrink-0 text-[12.5px] text-ink-muted pt-0.5">{label}</span>
+      <span className={`flex-1 min-w-0 break-all text-[12.5px] ${value ? 'text-ink' : 'text-ink-faint'} ${mono ? 'font-mono text-[12px] select-all' : ''}`}>
+        {value || na}
+      </span>
+      {copyKey && value && (
+        <IconButton size="sm" label={tr(`Copiar ${label}`, `Copy ${label}`)} onClick={() => void handleCopy(copyKey, value)} className="-my-1">
+          {copied === copyKey ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+        </IconButton>
+      )}
+    </div>
+  );
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
-      <div className="bg-white dark:bg-dark-800 border border-slate-300 dark:border-dark-600 rounded-xl shadow-2xl w-full max-w-2xl flex flex-col overflow-hidden text-slate-900 dark:text-slate-100 animate-in fade-in zoom-in-95 duration-150">
-        {/* Header */}
-        <div className="px-6 py-4 border-b border-slate-200 dark:border-dark-800 flex items-center justify-between bg-slate-100 dark:bg-dark-750">
-          <div className="flex items-center gap-3">
-            <div className="p-2 bg-amber-500/10 text-amber-600 dark:text-amber-400 rounded-lg border border-amber-500/20">
-              <Server className="w-5 h-5" />
-            </div>
-            <div>
-              <h2 className="text-lg font-bold text-slate-900 dark:text-slate-100 tracking-wide">
-                {isPt ? 'Informações do Sistema & Disco' : 'Server & Filesystem Info'}
-              </h2>
-              <p className="text-xs text-slate-600 dark:text-slate-400 font-mono truncate max-w-md">{path || '/'}</p>
-            </div>
-          </div>
-          <button
-            onClick={onClose}
-            className="text-slate-500 hover:text-slate-950 dark:text-slate-400 dark:hover:text-white p-1.5 rounded-lg hover:bg-slate-200 dark:hover:bg-dark-700 transition-colors"
+    <Modal
+      isOpen={isOpen}
+      onClose={onClose}
+      size="lg"
+      icon={<HardDrive className="w-4 h-4" />}
+      title={tr('Disco e servidor', 'Disk & server info')}
+      subtitle={
+        <span className="block font-mono text-[11.5px] truncate" title={path || '/'}>
+          {path || '/'}
+        </span>
+      }
+      headerActions={
+        <IconButton size="sm" label={tr('Atualizar', 'Refresh')} onClick={() => void loadInfo()} disabled={loading}>
+          <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+        </IconButton>
+      }
+      bodyClassName="space-y-4"
+      footer={
+        <>
+          <Button
+            variant="ghost"
+            className="mr-auto"
+            onClick={() => void handleCopy('all', summaryText())}
+            disabled={!info}
+            icon={copied === 'all' ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
           >
-            <X className="w-5 h-5" />
-          </button>
+            {copied === 'all' ? tr('Copiado', 'Copied') : tr('Copiar informações', 'Copy info')}
+          </Button>
+          <Button variant="secondary" onClick={onClose}>
+            {tr('Fechar', 'Close')}
+          </Button>
+        </>
+      }
+    >
+      {error ? (
+        <div className="flex items-start gap-2 rounded-lg bg-red-500/10 px-3 py-2 text-[12.5px] text-red-700 dark:text-red-300" role="alert">
+          <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+          <span className="min-w-0 break-words">{error}</span>
         </div>
-
-        {/* Tab Headers */}
-        <div className="flex items-center border-b border-slate-200 dark:border-dark-800 bg-slate-50 dark:bg-dark-900 px-6">
-          <button
-            onClick={() => setActiveTab('space')}
-            className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition-colors ${
-              activeTab === 'space'
-                ? 'border-amber-500 text-amber-600 dark:text-amber-400 bg-amber-500/10'
-                : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
-            }`}
-          >
-            <HardDrive className="w-4 h-4" />
-            {isPt ? 'Espaço em Disco' : 'Space Available'}
-          </button>
-          <button
-            onClick={() => setActiveTab('protocol')}
-            className={`flex items-center gap-2 py-3 px-4 text-xs font-bold border-b-2 transition-colors ${
-              activeTab === 'protocol'
-                ? 'border-amber-500 text-amber-600 dark:text-amber-400 bg-amber-500/10'
-                : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
-            }`}
-          >
-            <Shield className="w-4 h-4" />
-            {isPt ? 'Protocolo & Segurança' : 'Protocol & Security'}
-          </button>
-        </div>
-
-        {/* Content */}
-        <div className="p-6 space-y-5 bg-white dark:bg-dark-900">
-          {loading ? (
-            <div className="py-12 flex flex-col items-center justify-center text-slate-500 dark:text-slate-400 gap-2">
-              <Server className="w-8 h-8 animate-bounce text-amber-500 dark:text-amber-400" />
-              <span className="text-xs font-medium">{isPt ? 'Carregando informações do sistema remoto...' : 'Querying remote filesystem stats...'}</span>
-            </div>
-          ) : error ? (
-            <div className="p-4 bg-rose-500/10 border border-rose-500/20 text-rose-600 dark:text-rose-300 text-xs rounded-lg">
-              {error}
-            </div>
-          ) : info ? (
-            activeTab === 'space' ? (
-              <div className="space-y-4">
-                {/* Usage Bar */}
-                <div>
-                  <div className="flex justify-between text-xs font-semibold mb-1.5">
-                    <span className="text-slate-700 dark:text-slate-300">{isPt ? 'Uso do Disco' : 'Disk Usage'}</span>
-                    <span className="text-amber-600 dark:text-amber-400 font-mono font-bold">{usedPct}%</span>
-                  </div>
-                  <div className="w-full h-3 bg-slate-200 dark:bg-slate-950 rounded-full overflow-hidden border border-slate-300 dark:border-slate-800">
-                    <div
-                      className={`h-full transition-all duration-500 rounded-full ${
-                        usedPct > 90 ? 'bg-rose-500' : usedPct > 75 ? 'bg-amber-500' : 'bg-emerald-500'
-                      }`}
-                      style={{ width: `${usedPct}%` }}
-                    />
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-2 gap-3 pt-2">
-                  <div className="bg-slate-50 dark:bg-dark-800/60 p-3 rounded-lg border border-slate-200 dark:border-slate-800/80">
-                    <span className="text-slate-500 dark:text-slate-400 text-xs block mb-1 font-semibold">{isPt ? 'Espaço Total' : 'Total Space'}</span>
-                    <span className="font-mono text-sm font-bold text-slate-900 dark:text-slate-100">{formatBytes(info.total_bytes)}</span>
-                  </div>
-                  <div className="bg-slate-50 dark:bg-dark-800/60 p-3 rounded-lg border border-slate-200 dark:border-slate-800/80">
-                    <span className="text-slate-500 dark:text-slate-400 text-xs block mb-1 font-semibold">{isPt ? 'Espaço Disponível' : 'Available Space'}</span>
-                    <span className="font-mono text-sm font-bold text-emerald-600 dark:text-emerald-400">{formatBytes(info.available_bytes)}</span>
-                  </div>
-                  <div className="bg-slate-50 dark:bg-dark-800/60 p-3 rounded-lg border border-slate-200 dark:border-slate-800/80">
-                    <span className="text-slate-500 dark:text-slate-400 text-xs block mb-1 font-semibold">{isPt ? 'Espaço em Uso' : 'Used Space'}</span>
-                    <span className="font-mono text-sm font-bold text-amber-600 dark:text-amber-400">{formatBytes(info.used_bytes)}</span>
-                  </div>
-                  <div className="bg-slate-50 dark:bg-dark-800/60 p-3 rounded-lg border border-slate-200 dark:border-slate-800/80">
-                    <span className="text-slate-500 dark:text-slate-400 text-xs block mb-1 font-semibold">{isPt ? 'Inodes Livres / Total' : 'Free / Total Inodes'}</span>
-                    <span className="font-mono text-sm font-bold text-slate-800 dark:text-slate-300">
-                      {info.free_inodes ? `${info.free_inodes.toLocaleString()} / ${info.total_inodes?.toLocaleString()}` : 'N/A'}
+      ) : !info ? (
+        <div className="py-12 text-center text-[13px] text-ink-muted">{loading ? tr('Consultando o servidor…', 'Asking the server…') : ''}</div>
+      ) : (
+        <>
+          <div className="space-y-2">
+            {hasSpace ? (
+              <>
+                <div className="flex items-baseline justify-between gap-3">
+                  <div className="text-[15px] text-ink">
+                    <span className="font-semibold tabular-nums">{formatBytes(info.available_bytes)}</span>{' '}
+                    <span className="text-ink-muted">
+                      {tr('disponíveis de', 'available of')} <span className="tabular-nums">{formatBytes(info.total_bytes)}</span>
                     </span>
                   </div>
+                  <span className="text-[12.5px] text-ink-muted tabular-nums">{tr(`${usedPct}% usado`, `${usedPct}% used`)}</span>
                 </div>
-              </div>
+                <div
+                  className="h-2 w-full rounded-full bg-dark-650 overflow-hidden"
+                  role="meter"
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={usedPct}
+                  aria-label={tr('Espaço usado', 'Space used')}
+                >
+                  <div className={`h-full rounded-full transition-[width] duration-500 ${barColor}`} style={{ width: `${usedPct}%` }} />
+                </div>
+                <div className="flex flex-wrap gap-x-6 gap-y-1 text-[12px] text-ink-muted tabular-nums">
+                  <span>
+                    {tr('Usado', 'Used')}: <span className="text-ink">{formatBytes(info.used_bytes)}</span>
+                  </span>
+                  <span>
+                    {tr('Disponível', 'Available')}: <span className="text-ink">{formatBytes(info.available_bytes)}</span>
+                  </span>
+                  <span>
+                    {tr('Total', 'Total')}: <span className="text-ink">{formatBytes(info.total_bytes)}</span>
+                  </span>
+                </div>
+                {usedPct > 90 && (
+                  <p className="text-[12px] text-red-600 dark:text-red-400">{tr('O disco está quase cheio.', 'The disk is almost full.')}</p>
+                )}
+              </>
             ) : (
-              <div className="space-y-3">
-                <div className="bg-slate-50 dark:bg-dark-800/60 p-3 rounded-lg border border-slate-200 dark:border-slate-800/80 flex justify-between items-center">
-                  <span className="text-slate-600 dark:text-slate-400 text-xs font-semibold">{isPt ? 'Protocolo' : 'Protocol'}</span>
-                  <span className="font-mono text-xs text-slate-900 dark:text-slate-200 font-semibold">{info.protocol_name}</span>
-                </div>
-                <div className="bg-slate-50 dark:bg-dark-800/60 p-3 rounded-lg border border-slate-200 dark:border-slate-800/80 flex justify-between items-center">
-                  <span className="text-slate-600 dark:text-slate-400 text-xs font-semibold">{isPt ? 'Versão SFTP/Protocolo' : 'Protocol Version'}</span>
-                  <span className="font-mono text-xs text-slate-900 dark:text-slate-200 font-semibold">{info.protocol_version}</span>
-                </div>
-                <div className="bg-slate-50 dark:bg-dark-800/60 p-3 rounded-lg border border-slate-200 dark:border-slate-800/80">
-                  <span className="text-slate-600 dark:text-slate-400 text-xs block mb-1 font-semibold">SSH Host Key Fingerprint (SHA-256)</span>
-                  <span className="font-mono text-xs text-emerald-600 dark:text-emerald-400 break-all select-all font-semibold">
-                    {info.host_key_fingerprint_sha256 || 'N/A'}
-                  </span>
-                </div>
-                <div className="bg-slate-50 dark:bg-dark-800/60 p-3 rounded-lg border border-slate-200 dark:border-slate-800/80">
-                  <span className="text-slate-600 dark:text-slate-400 text-xs block mb-1 font-semibold">SSH Host Key Fingerprint (MD5)</span>
-                  <span className="font-mono text-xs text-amber-600 dark:text-amber-400 break-all select-all font-semibold">
-                    {info.host_key_fingerprint_md5 || 'N/A'}
-                  </span>
-                </div>
-                <div className="bg-slate-50 dark:bg-dark-800/60 p-3 rounded-lg border border-slate-200 dark:border-slate-800/80 flex justify-between items-center">
-                  <span className="text-slate-600 dark:text-slate-400 text-xs font-semibold">{isPt ? 'Cifra de Criptografia' : 'Cipher'}</span>
-                  <span className="font-mono text-xs text-slate-900 dark:text-slate-200 font-semibold">{info.cipher_name || 'N/A'}</span>
-                </div>
-              </div>
-            )
-          ) : null}
-        </div>
+              <p className="text-[13px] text-ink-muted">
+                {tr('Este servidor não informa o espaço em disco.', 'This server doesn’t report disk space.')}
+              </p>
+            )}
+            {info.free_inodes != null && info.free_inodes === 0 && (
+              <p className="text-[12px] text-red-600 dark:text-red-400">
+                {tr('Não há inodes livres: não é possível criar arquivos novos.', 'No free inodes left: new files can’t be created.')}
+              </p>
+            )}
+          </div>
 
-        {/* Footer */}
-        <div className="px-6 py-3 border-t border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-dark-750 flex items-center justify-between select-none">
-          <button
-            onClick={handleCopyClipboard}
-            disabled={!info}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-200 hover:bg-slate-300 text-slate-800 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-200 text-xs font-semibold border border-slate-300 dark:border-slate-700 transition-colors"
-          >
-            {copied ? <Check className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-            {copied ? (isPt ? 'Copiado!' : 'Copied!') : (isPt ? 'Copiar Informações' : 'Copy Information')}
-          </button>
-          <button
-            onClick={onClose}
-            className="px-4 py-1.5 rounded-lg bg-slate-200 hover:bg-slate-300 text-slate-700 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-300 text-xs font-semibold border border-slate-300 dark:border-slate-700 transition-colors"
-          >
-            {isPt ? 'Fechar' : 'Close'}
-          </button>
-        </div>
-      </div>
-    </div>
+          <Disclosure label={tr('Detalhes', 'Details')}>
+            <div className="ui-card divide-y divide-line">
+              {detailRow(
+                tr('Inodes livres / total', 'Free / total inodes'),
+                info.free_inodes != null
+                  ? `${info.free_inodes.toLocaleString()} / ${info.total_inodes != null ? info.total_inodes.toLocaleString() : '?'}`
+                  : null,
+                true
+              )}
+              {detailRow(tr('Protocolo', 'Protocol'), info.protocol_name)}
+              {detailRow(tr('Versão do protocolo', 'Protocol version'), info.protocol_version, true)}
+              {detailRow(tr('Cifra', 'Cipher'), info.cipher_name, true)}
+              {detailRow(tr('Compressão', 'Compression'), info.compression_name, true)}
+              {detailRow(tr('Chave do host (SHA-256)', 'Host key (SHA-256)'), info.host_key_fingerprint_sha256, true, 'sha256')}
+              {detailRow(tr('Chave do host (MD5)', 'Host key (MD5)'), info.host_key_fingerprint_md5, true, 'md5')}
+            </div>
+          </Disclosure>
+        </>
+      )}
+    </Modal>
   );
 };

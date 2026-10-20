@@ -19,11 +19,27 @@ pub trait VirtualFileSystem: Send + Sync + Debug {
     /// Read entire file content into memory
     async fn read_file(&self, path: &str) -> CoreResult<Bytes>;
 
-    /// Read a specific byte range (essential for seekable streaming and chunk caching)
+    /// Read a specific byte range (essential for seekable streaming and chunk caching).
+    /// Returns exactly `length` bytes unless the end of the file comes first.
     async fn read_range(&self, path: &str, offset: u64, length: u64) -> CoreResult<Bytes>;
 
     /// Write entire data buffer to file (creates or overwrites)
     async fn write_file(&self, path: &str, data: Bytes) -> CoreResult<()>;
+
+    /// True when [`write_at`](Self::write_at) is implemented, so a file can be
+    /// written chunk by chunk without holding it all in memory.
+    fn supports_write_at(&self) -> bool {
+        false
+    }
+
+    /// Positional write. `offset == 0` creates the file (or truncates an
+    /// existing one) and writes `data` at the start; later calls write `data`
+    /// at `offset` into the existing file. Callers write chunks in order.
+    async fn write_at(&self, _path: &str, _offset: u64, _data: Bytes) -> CoreResult<()> {
+        Err(crate::types::CoreError::Protocol(
+            "positional write unsupported".to_string(),
+        ))
+    }
 
     /// Create directory (creates parents if missing)
     async fn create_dir(&self, path: &str) -> CoreResult<()>;

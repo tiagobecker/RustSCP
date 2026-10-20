@@ -1,7 +1,12 @@
-import React, { useState } from 'react';
+import React, { useEffect, useId, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
-import { Link2, X } from 'lucide-react';
+import { AlertTriangle } from 'lucide-react';
+import { Modal } from './ui/Modal.tsx';
+import { Button, Disclosure, Field, TextInput } from './ui/controls.tsx';
+import { notify } from './ui/toast.tsx';
+import { basename, joinPath } from '../utils/paths.ts';
 
 interface SymlinkModalProps {
   isOpen: boolean;
@@ -12,6 +17,8 @@ interface SymlinkModalProps {
   onSuccess: () => void;
 }
 
+const isAbsolutePath = (p: string) => p.startsWith('/') || p.startsWith('\\') || /^[A-Za-z]:[\\/]/.test(p);
+
 export const SymlinkModal: React.FC<SymlinkModalProps> = ({
   isOpen,
   onClose,
@@ -21,7 +28,13 @@ export const SymlinkModal: React.FC<SymlinkModalProps> = ({
   onSuccess,
 }) => {
   const { i18n } = useTranslation();
-  const isPt = i18n.language.startsWith('pt');
+  const isPt = (i18n.language || '').startsWith('pt');
+  const tr = (pt: string, en: string) => (isPt ? pt : en);
+
+  const formId = useId();
+  const linkNameRef = useRef<HTMLInputElement>(null);
+  const targetRef = useRef<HTMLInputElement>(null);
+  const mountedRef = useRef(true);
 
   const [linkName, setLinkName] = useState('');
   const [targetPath, setTargetPath] = useState(selectedItemPath || '');
@@ -29,119 +42,147 @@ export const SymlinkModal: React.FC<SymlinkModalProps> = ({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  if (!isOpen) return null;
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
-  const handleCreate = async () => {
-    if (!linkName.trim() || !targetPath.trim()) return;
+  // App keeps this modal mounted: start from a clean form, prefilled from the selection, on every open
+  useEffect(() => {
+    if (!isOpen) return;
+    setTargetPath(selectedItemPath || '');
+    setLinkName('');
+    setIsSymbolic(true);
+    setError(null);
+    setIsSubmitting(false);
+  }, [isOpen, selectedItemPath]);
+
+  if (!isOpen || typeof document === 'undefined') return null;
+
+  const name = linkName.trim();
+  const target = targetPath.trim();
+  const fullLinkPath = name ? (isAbsolutePath(name) ? name : joinPath(currentDir, name)) : '';
+  const suggestedName = target ? basename(target) : '';
+  const canCreate = !!name && !!target && !isSubmitting;
+
+  const handleCreate = async (e?: React.FormEvent) => {
+    e?.preventDefault();
+    if (!canCreate) return;
     setIsSubmitting(true);
     setError(null);
-
     try {
-      const fullLinkPath = linkName.startsWith('/')
-        ? linkName.trim()
-        : `${currentDir.replace(/\/$/, '')}/${linkName.trim()}`;
-
       await invoke('create_symlink', {
         sessionId,
         linkPath: fullLinkPath,
-        targetPath: targetPath.trim(),
+        targetPath: target,
         isSymbolic,
       });
-
+      notify.success(isSymbolic ? tr('Link simbólico criado', 'Symbolic link created') : tr('Hard link criado', 'Hard link created'), fullLinkPath);
       onSuccess();
       onClose();
     } catch (err: any) {
-      setError(err.toString());
+      if (mountedRef.current) setError(String(err?.message ?? err));
     } finally {
-      setIsSubmitting(false);
+      if (mountedRef.current) setIsSubmitting(false);
     }
   };
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
-      <div className="bg-white dark:bg-dark-800 border border-slate-300 dark:border-dark-600 rounded-xl shadow-2xl w-full max-w-md flex flex-col overflow-hidden text-slate-900 dark:text-slate-100 animate-in fade-in zoom-in-95 duration-150">
-        <div className="px-6 py-4 border-b border-slate-200 dark:border-dark-700 flex items-center justify-between bg-slate-100 dark:bg-dark-750">
-          <div className="flex items-center gap-3">
-            <div className="p-2 bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 rounded-lg border border-cyan-500/20">
-              <Link2 className="w-5 h-5" />
-            </div>
-            <div>
-              <h2 className="text-base font-semibold tracking-wide text-slate-900 dark:text-slate-100">
-                {isPt ? 'Criar Link Simbólico / Hardlink' : 'Create Symbolic Link / Hardlink'}
-              </h2>
-              <p className="text-xs text-slate-500 dark:text-slate-400">
-                {isPt ? 'Atalho apontando para outro arquivo ou pasta' : 'Shortcut pointing to target file or directory'}
-              </p>
-            </div>
-          </div>
-          <button
-            onClick={onClose}
-            className="text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white p-1.5 rounded-lg hover:bg-slate-200 dark:hover:bg-dark-700 transition-colors"
-          >
-            <X className="w-5 h-5" />
-          </button>
-        </div>
-
-        <div className="p-6 space-y-4">
-          <div>
-            <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
-              {isPt ? 'Nome do Link (Atalho)' : 'Link Name (Shortcut)'}
-            </label>
-            <input
-              type="text"
-              value={linkName}
-              onChange={(e) => setLinkName(e.target.value)}
-              placeholder="my_symlink"
-              className="w-full bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-700 rounded-lg px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:border-cyan-500 shadow-sm"
-            />
-          </div>
-
-          <div>
-            <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
-              {isPt ? 'Apontar para o Alvo (Target Path)' : 'Point to Target (Target Path)'}
-            </label>
-            <input
-              type="text"
+  return createPortal(
+    <Modal
+      isOpen
+      onClose={onClose}
+      size="md"
+      title={tr('Criar link', 'Create link')}
+      subtitle={tr('Um atalho que aponta para outro arquivo ou pasta.', 'A shortcut that points to another file or folder.')}
+      dismissOnBackdrop={false}
+      initialFocusRef={selectedItemPath ? linkNameRef : targetRef}
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose}>
+            {tr('Cancelar', 'Cancel')}
+          </Button>
+          <Button type="submit" form={formId} variant="primary" disabled={!name || !target} loading={isSubmitting}>
+            {isSymbolic ? tr('Criar link', 'Create link') : tr('Criar hard link', 'Create hard link')}
+          </Button>
+        </>
+      }
+    >
+      <form id={formId} onSubmit={handleCreate} className="space-y-4">
+        <Field
+          label={tr('Apontar para', 'Points to')}
+          hint={tr('Caminho absoluto ou relativo à pasta do link.', "Absolute path, or relative to the link's folder.")}
+        >
+          {(id) => (
+            <TextInput
+              id={id}
+              ref={targetRef}
+              mono
               value={targetPath}
               onChange={(e) => setTargetPath(e.target.value)}
-              placeholder="/var/www/html or relative path"
-              className="w-full bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-700 rounded-lg px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:outline-none focus:border-cyan-500 font-mono shadow-sm"
+              placeholder={tr('/var/www/html ou ../pasta', '/var/www/html or ../folder')}
             />
-          </div>
+          )}
+        </Field>
 
-          <label className="flex items-center gap-2 text-xs text-slate-700 dark:text-slate-300 cursor-pointer select-none pt-1">
+        <Field
+          label={tr('Nome do link', 'Link name')}
+          hint={
+            fullLinkPath ? (
+              <>
+                {tr('Será criado em ', 'Will be created at ')}
+                <span className="font-mono break-all">{fullLinkPath}</span>
+              </>
+            ) : (
+              <>
+                {tr('Criado em ', 'Created in ')}
+                <span className="font-mono break-all">{currentDir || '/'}</span>
+                {tr(' — ou informe um caminho absoluto.', ' — or enter an absolute path.')}
+              </>
+            )
+          }
+        >
+          {(id) => (
+            <TextInput
+              id={id}
+              ref={linkNameRef}
+              mono
+              value={linkName}
+              onChange={(e) => setLinkName(e.target.value)}
+              placeholder={suggestedName ? `${suggestedName}-link` : tr('meu-link', 'my-link')}
+            />
+          )}
+        </Field>
+
+        <Disclosure label={tr('Avançado', 'Advanced')} defaultOpen={!isSymbolic}>
+          <label className="flex items-start gap-2.5 cursor-pointer select-none">
             <input
               type="checkbox"
-              checked={isSymbolic}
-              onChange={(e) => setIsSymbolic(e.target.checked)}
-              className="rounded border-slate-300 dark:border-slate-700 bg-white dark:bg-dark-900 text-cyan-600 dark:text-cyan-500 focus:ring-0"
+              className="w-3.5 h-3.5 mt-0.5 accent-rust-500"
+              checked={!isSymbolic}
+              onChange={(e) => setIsSymbolic(!e.target.checked)}
             />
-            {isPt ? 'Link Simbólico (Recomendado - desmarque para Hardlink)' : 'Symbolic Link (Recommended - uncheck for Hardlink)'}
+            <span className="min-w-0">
+              <span className="block text-[13px] text-ink">{tr('Criar um hard link', 'Create a hard link instead')}</span>
+              <span className="block text-[11.5px] text-ink-faint leading-snug">
+                {tr(
+                  'Outro nome para o mesmo arquivo. Só funciona com arquivos no mesmo disco, não com pastas.',
+                  'Another name for the same file. Works only for files on the same disk, not for folders.'
+                )}
+              </span>
+            </span>
           </label>
+        </Disclosure>
 
-          {error && (
-            <div className="p-3 bg-rose-500/10 border border-rose-500/20 text-rose-600 dark:text-rose-300 text-xs rounded-lg">
-              {error}
-            </div>
-          )}
-        </div>
-
-        <div className="px-6 py-3 border-t border-slate-200 dark:border-dark-700 bg-slate-100 dark:bg-dark-750 flex items-center justify-end gap-2">
-          <button
-            onClick={onClose}
-            className="px-4 py-1.5 rounded-lg bg-slate-200 hover:bg-slate-300 text-slate-700 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-300 text-xs font-medium border border-slate-300 dark:border-slate-700 transition-colors"
-          >
-            {isPt ? 'Cancelar' : 'Cancel'}
-          </button>
-          <button
-            onClick={handleCreate}
-            disabled={isSubmitting || !linkName.trim() || !targetPath.trim()}
-            className="px-4 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white text-xs font-medium transition-colors shadow-sm"
-          >
-            {isSubmitting ? (isPt ? 'Criando...' : 'Creating...') : (isPt ? 'Criar Link' : 'Create Link')}
-          </button>
-        </div>
-      </div>
-    </div>
+        {error && (
+          <div role="alert" className="flex items-start gap-2 rounded-lg bg-red-500/10 px-3 py-2 text-[12.5px] text-red-700 dark:text-red-300">
+            <AlertTriangle className="w-4 h-4 mt-px shrink-0" aria-hidden="true" />
+            <span className="break-words min-w-0">{error}</span>
+          </div>
+        )}
+      </form>
+    </Modal>,
+    document.body
   );
 };

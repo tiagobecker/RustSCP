@@ -1,20 +1,19 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { 
-  X, 
-  Terminal, 
-  Copy, 
-  Play, 
-  AlertTriangle, 
-  ShieldCheck, 
-  Check, 
-  Plus, 
-  Trash2, 
-  Save, 
-  Search, 
-  Code2
-} from 'lucide-react';
+import { Check, Copy, Pencil, Play, Plus, Search, Terminal, Trash2 } from 'lucide-react';
 import { ActionDefinition, RiskLevel, Scope } from '../types.ts';
+import { Modal } from './ui/Modal.tsx';
+import { Button, Disclosure, Field, IconButton, Segmented, Select, TextArea, TextInput, Toggle } from './ui/controls.tsx';
+import { notify } from './ui/toast.tsx';
+import {
+  commandInDir,
+  describeFieldError,
+  initialFieldValues,
+  renderActionTemplate,
+} from './automation/actionTemplate.ts';
+import { CommandOutput, CommandResult } from './automation/CommandOutput.tsx';
+import { AutomationConfirm } from './automation/AutomationConfirm.tsx';
+import { RiskBadge } from './automation/RiskBadge.tsx';
 
 interface CommandStudioModalProps {
   isOpen: boolean;
@@ -26,7 +25,30 @@ interface CommandStudioModalProps {
   onExecute: (command: string) => Promise<{ stdout: string; stderr: string; exit_code: number }>;
   onSaveCustomAction?: (action: ActionDefinition) => Promise<void>;
   onDeleteCustomAction?: (actionId: string) => Promise<void>;
+  /** Action to select when the studio opens (e.g. chosen in the file context menu) */
+  initialActionId?: string;
+  /** Name of the session the command runs on, shown in the target line */
+  sessionName?: string;
 }
+
+const CATEGORY_LABELS: Record<string, { pt: string; en: string }> = {
+  compression: { pt: 'Compressão', en: 'Compression' },
+  system: { pt: 'Sistema', en: 'System' },
+  search: { pt: 'Busca', en: 'Search' },
+  permissions: { pt: 'Permissões', en: 'Permissions' },
+  sysadmin: { pt: 'Serviços', en: 'Services' },
+  containers: { pt: 'Containers', en: 'Containers' },
+  docker: { pt: 'Docker', en: 'Docker' },
+  git: { pt: 'Git', en: 'Git' },
+  maintenance: { pt: 'Manutenção', en: 'Maintenance' },
+  custom: { pt: 'Personalizadas', en: 'Custom' },
+};
+
+const CUSTOM_CATEGORIES = ['custom', 'sysadmin', 'compression', 'docker', 'git', 'maintenance'];
+
+const VARIABLES = ['${selected_files}', '${current_dir}', '${selected_file}', '${selected_name}', '${selected_stem}', '${selected_ext}'];
+
+const isCustomAction = (a: ActionDefinition) => a.id.startsWith('custom-');
 
 export const CommandStudioModal: React.FC<CommandStudioModalProps> = ({
   isOpen,
@@ -38,536 +60,507 @@ export const CommandStudioModal: React.FC<CommandStudioModalProps> = ({
   onExecute,
   onSaveCustomAction,
   onDeleteCustomAction,
+  initialActionId,
+  sessionName,
 }) => {
   const { i18n } = useTranslation();
   const isPt = i18n.language.startsWith('pt');
   const lang = isPt ? 'pt-BR' : 'en-US';
+  const otherLang = isPt ? 'en-US' : 'pt-BR';
+  const text = (a: { 'pt-BR': string; 'en-US': string } | undefined, fallback = '') => a?.[lang] || a?.[otherLang] || fallback;
+  const categoryLabel = (c: string) => (CATEGORY_LABELS[c] ? (isPt ? CATEGORY_LABELS[c].pt : CATEGORY_LABELS[c].en) : c);
 
   const [activeTab, setActiveTab] = useState<'run' | 'create'>('run');
-  const [searchQuery, setSearchQuery] = useState<string>('');
-  const [selectedCategory, setSelectedCategory] = useState<string>('all');
-  const [selectedActionId, setSelectedActionId] = useState<string>('');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedCategory, setSelectedCategory] = useState('all');
+  // Seed with the requested action so the first render already shows it (no flash of actions[0])
+  const [selectedActionId, setSelectedActionId] = useState(() =>
+    initialActionId && actions.some((a) => a.id === initialActionId) ? initialActionId : ''
+  );
   const [fieldValues, setFieldValues] = useState<Record<string, string>>({});
-  const [commandPreview, setCommandPreview] = useState<string>('');
-  const [outputConsole, setOutputConsole] = useState<string>('');
-  const [exitCode, setExitCode] = useState<number | null>(null);
-  const [isRunning, setIsRunning] = useState<boolean>(false);
-  const [copied, setCopied] = useState<boolean>(false);
+  const [result, setResult] = useState<CommandResult | null>(null);
+  const [isRunning, setIsRunning] = useState(false);
+  const [confirmCommand, setConfirmCommand] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [confirmDeleteActionId, setConfirmDeleteActionId] = useState<string | null>(null);
+  const runIdRef = useRef(0);
 
-  // Custom Action Creator Form State
+  // Custom action form
   const [editingActionId, setEditingActionId] = useState<string | null>(null);
-  const [customNamePt, setCustomNamePt] = useState<string>('');
-  const [customNameEn, setCustomNameEn] = useState<string>('');
-  const [customDescPt, setCustomDescPt] = useState<string>('');
-  const [customDescEn, setCustomDescEn] = useState<string>('');
-  const [customCategory, setCustomCategory] = useState<string>('custom');
+  const [customNamePt, setCustomNamePt] = useState('');
+  const [customNameEn, setCustomNameEn] = useState('');
+  const [customDescPt, setCustomDescPt] = useState('');
+  const [customDescEn, setCustomDescEn] = useState('');
+  const [customCategory, setCustomCategory] = useState('custom');
   const [customRisk, setCustomRisk] = useState<RiskLevel>('safe');
   const [customScope, setCustomScope] = useState<Scope>('selected_files');
-  const [customTemplate, setCustomTemplate] = useState<string>('');
-  const [isSavingCustom, setIsSavingCustom] = useState<boolean>(false);
-  const [confirmDeleteActionId, setConfirmDeleteActionId] = useState<string | null>(null);
+  const [customTemplate, setCustomTemplate] = useState('');
+  const [isSavingCustom, setIsSavingCustom] = useState(false);
+  const templateRef = useRef<HTMLTextAreaElement>(null);
+
+  // Select the requested action when the studio opens, otherwise keep a valid selection
+  useEffect(() => {
+    if (!isOpen) return;
+    if (initialActionId && actions.some((a) => a.id === initialActionId)) {
+      setSelectedActionId(initialActionId);
+      setActiveTab('run');
+    }
+  }, [isOpen, initialActionId, actions]);
 
   useEffect(() => {
-    if (actions.length > 0 && !selectedActionId) {
-      setSelectedActionId(actions[0].id);
+    if (actions.length > 0 && !actions.some((a) => a.id === selectedActionId)) {
+      // Read the pending state, not this closure: the effect above may have queued
+      // initialActionId in the same commit, and it must win over the fallback.
+      setSelectedActionId((cur) => (actions.some((a) => a.id === cur) ? cur : actions[0].id));
     }
   }, [actions, selectedActionId]);
 
-  const activeAction = useMemo(() => {
-    return actions.find((a) => a.id === selectedActionId) || actions[0];
-  }, [actions, selectedActionId]);
+  const activeAction = useMemo(() => actions.find((a) => a.id === selectedActionId) || actions[0], [actions, selectedActionId]);
 
-  // Categories list
-  const categories = useMemo(() => {
-    const cats = new Set<string>();
-    actions.forEach((a) => cats.add(a.category));
-    return ['all', ...Array.from(cats)];
-  }, [actions]);
+  const categories = useMemo(() => Array.from(new Set(actions.map((a) => a.category))), [actions]);
 
-  // Filtered actions
   const filteredActions = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
     return actions.filter((a) => {
-      const matchCat = selectedCategory === 'all' || a.category === selectedCategory;
-      const name = a.name[lang] || a.name['pt-BR'] || a.id;
-      const desc = a.description[lang] || a.description['pt-BR'] || '';
-      const matchQuery = !searchQuery || 
-        name.toLowerCase().includes(searchQuery.toLowerCase()) || 
-        desc.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        a.template.toLowerCase().includes(searchQuery.toLowerCase());
-      return matchCat && matchQuery;
+      if (selectedCategory !== 'all' && a.category !== selectedCategory) return false;
+      if (!q) return true;
+      return (
+        text(a.name, a.id).toLowerCase().includes(q) ||
+        text(a.description).toLowerCase().includes(q) ||
+        a.template.toLowerCase().includes(q)
+      );
     });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [actions, selectedCategory, searchQuery, lang]);
 
-  // Reset/populate fields when active action changes
+  const groupedActions = useMemo(() => {
+    const groups = new Map<string, ActionDefinition[]>();
+    for (const a of filteredActions) {
+      const list = groups.get(a.category) || [];
+      list.push(a);
+      groups.set(a.category, list);
+    }
+    return Array.from(groups.entries());
+  }, [filteredActions]);
+
+  // Reset the form when the action or its context changes (keyed by value, not array identity)
+  const selectionKey = selectedPaths.join('\u0000');
+  const ctx = useMemo(() => ({ selectedPaths, currentDir }), [selectionKey, currentDir]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (!activeAction) return;
-    const initial: Record<string, string> = {};
-    for (const field of activeAction.fields || []) {
-      if (field.default_value) {
-        let def = field.default_value;
-        const firstName = selectedPaths[0]?.split('/').pop()?.split('\\').pop() || 'item';
-        def = def.replace('${selected_first_name}', firstName);
-        initial[field.id] = def;
-      } else if (field.kind === 'checkbox') {
-        initial[field.id] = 'false';
-      } else {
-        initial[field.id] = '';
-      }
-    }
-    setFieldValues(initial);
-  }, [activeAction, selectedPaths]);
+    setFieldValues(initialFieldValues(activeAction, ctx));
+    setConfirmDeleteActionId(null);
+  }, [activeAction, ctx]);
 
-  // Compute live command preview with variables substitution
-  useEffect(() => {
-    if (!activeAction) return;
-    let cmd = activeAction.template;
+  const rendered = useMemo(
+    () => (activeAction ? renderActionTemplate(activeAction, ctx, fieldValues, isPt) : null),
+    [activeAction, ctx, fieldValues, isPt]
+  );
+  const runCommand = rendered ? commandInDir(currentDir, rendered.command) : '';
+  const fieldErrorCount = rendered ? Object.keys(rendered.fieldErrors).length : 0;
+  const canRun = !!rendered && !rendered.error && fieldErrorCount === 0 && !!rendered.command && !isRunning;
 
-    const quotedFiles = selectedPaths.length > 0 
-      ? selectedPaths.map((p) => `'${p.replace(/'/g, "'\\''")}'`).join(' ') 
-      : "''";
-    const firstFull = selectedPaths[0] || '';
-    const firstName = firstFull.split('/').pop()?.split('\\').pop() || 'item';
-    const firstStem = firstName.includes('.') ? firstName.substring(0, firstName.lastIndexOf('.')) : firstName;
-    const firstExt = firstName.includes('.') ? firstName.substring(firstName.lastIndexOf('.') + 1) : '';
-
-    cmd = cmd.replace(/\$\{selected_files\}/g, quotedFiles);
-    cmd = cmd.replace(/\$\{selected_dir\}/g, `'${currentDir.replace(/'/g, "'\\''")}'`);
-    cmd = cmd.replace(/\$\{current_dir\}/g, `'${currentDir.replace(/'/g, "'\\''")}'`);
-    cmd = cmd.replace(/\$\{selected_file\}/g, `'${firstFull.replace(/'/g, "'\\''")}'`);
-    cmd = cmd.replace(/\$\{selected_first_name\}/g, firstName);
-    cmd = cmd.replace(/\$\{selected_name\}/g, firstName);
-    cmd = cmd.replace(/\$\{selected_stem\}/g, firstStem);
-    cmd = cmd.replace(/\$\{selected_ext\}/g, firstExt);
-
-    for (const field of activeAction.fields || []) {
-      const val = fieldValues[field.id] !== undefined ? fieldValues[field.id] : (field.default_value || '');
-      const regex = new RegExp(`\\{\\{${field.id}\\}\\}`, 'g');
-      if (field.kind === 'checkbox') {
-        cmd = cmd.replace(regex, val === 'true' ? 'true' : 'false');
-      } else {
-        cmd = cmd.replace(regex, `'${val.replace(/'/g, "'\\''")}'`);
-      }
-    }
-    cmd = cmd.replace(/\{%.*?%\}/g, '');
-    setCommandPreview(cmd.trim());
-  }, [activeAction, fieldValues, selectedPaths, currentDir]);
+  const targetName = isRemote ? sessionName || (isPt ? 'Servidor' : 'Server') : isPt ? 'Este computador' : 'This computer';
+  const targetLine = `${targetName} · ${currentDir || '/'}`;
 
   if (!isOpen) return null;
 
-  const handleFieldChange = (fieldId: string, value: string) => {
-    setFieldValues((prev) => ({ ...prev, [fieldId]: value }));
-  };
+  const handleFieldChange = (fieldId: string, value: string) => setFieldValues((prev) => ({ ...prev, [fieldId]: value }));
 
-  const handleCopy = () => {
-    navigator.clipboard.writeText(commandPreview);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
-  const handleRun = async () => {
-    setIsRunning(true);
-    setOutputConsole(isPt ? 'Iniciando execução do comando...\n' : 'Starting command execution...\n');
-    setExitCode(null);
+  const handleCopy = async () => {
     try {
-      const result = await onExecute(commandPreview);
-      setExitCode(result.exit_code);
-      let out = '';
-      if (result.stdout) out += result.stdout;
-      if (result.stderr) {
-        out += (out ? '\n--- STDERR ---\n' : '') + result.stderr;
-      }
-      if (!out) out = isPt ? 'Comando concluído com código de saída 0.' : 'Command finished with exit code 0.';
-      setOutputConsole(out);
-    } catch (err: any) {
-      setExitCode(-1);
-      setOutputConsole(`Erro: ${err}`);
-    } finally {
-      setIsRunning(false);
+      await navigator.clipboard.writeText(runCommand);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      notify.error(isPt ? 'Não foi possível copiar' : 'Could not copy');
     }
+  };
+
+  const execute = async (cmd: string) => {
+    const id = ++runIdRef.current;
+    setIsRunning(true);
+    setResult(null);
+    try {
+      const res = await onExecute(cmd);
+      if (id !== runIdRef.current) return;
+      setResult({ stdout: res.stdout || '', stderr: res.stderr || '', exitCode: res.exit_code });
+    } catch (err) {
+      if (id !== runIdRef.current) return;
+      setResult({ stdout: '', stderr: String(err), exitCode: -1 });
+    } finally {
+      if (id === runIdRef.current) setIsRunning(false);
+    }
+  };
+
+  const handleRun = () => {
+    if (!activeAction || !canRun) return;
+    const riskyField = (activeAction.fields || []).some((f) => {
+      if (!f.risk_warning) return false;
+      const v = (fieldValues[f.id] ?? '').trim();
+      return f.kind === 'checkbox' ? v === 'true' : v !== '';
+    });
+    if (activeAction.risk_level !== 'safe' || riskyField) {
+      setConfirmCommand(runCommand);
+      return;
+    }
+    void execute(runCommand);
+  };
+
+  const handleStopWaiting = () => {
+    runIdRef.current++;
+    setIsRunning(false);
+    notify.info(
+      isPt ? 'Parou de aguardar' : 'Stopped waiting',
+      isPt ? 'O comando pode continuar rodando no servidor.' : 'The command may still be running on the server.'
+    );
+  };
+
+  // --- Custom action builder ---
+  const resetForm = () => {
+    setEditingActionId(null);
+    setCustomNamePt('');
+    setCustomNameEn('');
+    setCustomDescPt('');
+    setCustomDescEn('');
+    setCustomCategory('custom');
+    setCustomRisk('safe');
+    setCustomScope('selected_files');
+    setCustomTemplate('');
+  };
+
+  const startEdit = (a: ActionDefinition) => {
+    setEditingActionId(a.id);
+    setCustomNamePt(a.name['pt-BR'] || '');
+    setCustomNameEn(a.name['en-US'] || '');
+    setCustomDescPt(a.description['pt-BR'] || '');
+    setCustomDescEn(a.description['en-US'] || '');
+    setCustomCategory(a.category || 'custom');
+    setCustomRisk(a.risk_level);
+    setCustomScope(a.scope);
+    setCustomTemplate(a.template);
+    setActiveTab('create');
   };
 
   const handleInsertVariable = (variable: string) => {
-    setCustomTemplate((prev) => `${prev} ${variable}`.trim());
-  };
-
-  const handleSaveCustom = async () => {
-    if (!customNamePt || !customTemplate) {
-      alert(isPt ? 'Por favor, preencha o nome e o comando.' : 'Please provide a name and command template.');
+    const el = templateRef.current;
+    if (!el) {
+      setCustomTemplate((prev) => (prev ? `${prev} ${variable}` : variable));
       return;
     }
+    const start = el.selectionStart ?? customTemplate.length;
+    const end = el.selectionEnd ?? start;
+    const before = customTemplate.slice(0, start);
+    const after = customTemplate.slice(end);
+    const pad = before && !/\s$/.test(before) ? ' ' : '';
+    const padAfter = after && !/^\s/.test(after) ? ' ' : '';
+    const next = `${before}${pad}${variable}${padAfter}${after}`;
+    setCustomTemplate(next);
+    const caret = before.length + pad.length + variable.length + padAfter.length;
+    requestAnimationFrame(() => {
+      el.focus();
+      el.setSelectionRange(caret, caret);
+    });
+  };
+
+  const primaryName = isPt ? customNamePt : customNameEn;
+  const anyName = (customNamePt || customNameEn).trim();
+
+  const handleSaveCustom = async () => {
+    if (!anyName || !customTemplate.trim()) {
+      notify.warning(isPt ? 'Preencha o nome e o comando.' : 'Enter a name and a command.');
+      return;
+    }
+    if (!onSaveCustomAction) return;
     setIsSavingCustom(true);
     try {
+      const namePt = customNamePt.trim() || customNameEn.trim();
+      const nameEn = customNameEn.trim() || customNamePt.trim();
       const newAction: ActionDefinition = {
         id: editingActionId || `custom-${Date.now()}`,
         category: customCategory,
         icon: 'terminal',
         risk_level: customRisk,
         scope: customScope,
-        name: {
-          'pt-BR': customNamePt,
-          'en-US': customNameEn || customNamePt,
-        },
+        name: { 'pt-BR': namePt, 'en-US': nameEn },
         description: {
-          'pt-BR': customDescPt || customNamePt,
-          'en-US': customDescEn || customDescPt || customNamePt,
+          'pt-BR': customDescPt.trim() || customDescEn.trim() || namePt,
+          'en-US': customDescEn.trim() || customDescPt.trim() || nameEn,
         },
         fields: [],
-        template: customTemplate,
+        template: customTemplate.trim(),
       };
-      if (onSaveCustomAction) {
-        await onSaveCustomAction(newAction);
-      }
+      await onSaveCustomAction(newAction);
+      notify.success(isPt ? 'Ação salva' : 'Action saved', isPt ? newAction.name['pt-BR'] : newAction.name['en-US']);
       setActiveTab('run');
       setSelectedActionId(newAction.id);
-      // Reset form
-      setEditingActionId(null);
-      setCustomNamePt('');
-      setCustomNameEn('');
-      setCustomDescPt('');
-      setCustomDescEn('');
-      setCustomTemplate('');
+      resetForm();
     } catch (e) {
-      alert(`Falha ao salvar ação: ${e}`);
+      notify.error(isPt ? 'Falha ao salvar a ação' : 'Could not save the action', e);
     } finally {
       setIsSavingCustom(false);
     }
   };
 
-  const getRiskBadge = (risk: RiskLevel) => {
-    switch (risk) {
-      case 'safe':
-        return (
-          <span className="flex items-center space-x-1 px-2 py-0.5 rounded text-[11px] font-semibold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
-            <ShieldCheck className="w-3 h-3" />
-            <span>{isPt ? 'Seguro' : 'Safe'}</span>
-          </span>
-        );
-      case 'warning':
-        return (
-          <span className="flex items-center space-x-1 px-2 py-0.5 rounded text-[11px] font-semibold bg-amber-500/15 text-amber-400 border border-amber-500/30">
-            <AlertTriangle className="w-3 h-3" />
-            <span>{isPt ? 'Atenção' : 'Warning'}</span>
-          </span>
-        );
-      case 'dangerous':
-      default:
-        return (
-          <span className="flex items-center space-x-1 px-2 py-0.5 rounded text-[11px] font-semibold bg-red-500/15 text-red-400 border border-red-500/30">
-            <AlertTriangle className="w-3 h-3" />
-            <span>{isPt ? 'Destrutivo' : 'Dangerous'}</span>
-          </span>
-        );
+  const handleDelete = async (id: string) => {
+    if (!onDeleteCustomAction) return;
+    try {
+      await onDeleteCustomAction(id);
+      setConfirmDeleteActionId(null);
+      notify.success(isPt ? 'Ação excluída' : 'Action deleted');
+    } catch (e) {
+      notify.error(isPt ? 'Falha ao excluir a ação' : 'Could not delete the action', e);
     }
   };
 
+  const headerTabs = (
+    <Segmented
+      size="sm"
+      value={activeTab}
+      onChange={(v) => {
+        if (v === 'create' && activeTab !== 'create' && !editingActionId) resetForm();
+        setActiveTab(v);
+      }}
+      ariaLabel={isPt ? 'Modo' : 'Mode'}
+      options={[
+        { value: 'run', label: isPt ? 'Executar' : 'Run' },
+        { value: 'create', label: editingActionId ? (isPt ? 'Editar' : 'Edit') : isPt ? 'Criar' : 'Create', icon: <Plus className="w-3 h-3" /> },
+      ]}
+    />
+  );
+
   return (
-    <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-3 animate-in fade-in duration-150">
-      <div className="bg-white dark:bg-dark-800 border border-slate-300 dark:border-dark-600 rounded-xl shadow-2xl max-w-5xl w-full h-[88vh] flex flex-col overflow-hidden text-slate-900 dark:text-slate-100">
-        {/* Header */}
-        <div className="px-5 py-3.5 border-b border-slate-200 dark:border-dark-600 bg-slate-100 dark:bg-dark-750 flex items-center justify-between select-none shrink-0">
-          <div className="flex items-center space-x-3">
-            <div className="p-2 rounded-lg bg-rust-500/15 text-rust-500 dark:text-rust-400 border border-rust-500/30">
-              <Terminal className="w-5 h-5" />
-            </div>
-            <div>
-              <h2 className="text-sm font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
-                <span>{isPt ? 'Estúdio de Comandos & Ações' : 'Command Studio & Custom Actions'}</span>
-                <span className="text-[10px] bg-slate-200 dark:bg-dark-700 text-slate-700 dark:text-slate-300 font-mono px-2 py-0.5 rounded border border-slate-300 dark:border-dark-600">
-                  {isRemote ? 'Remoto (SSH)' : 'Local'}
-                </span>
-              </h2>
-              <p className="text-xs text-slate-500 dark:text-slate-400">
-                {isPt 
-                  ? 'Execute comandos inteligentes pré-configurados ou crie suas próprias automações com variáveis dinâmicas.'
-                  : 'Execute pre-configured smart commands or build custom automations with dynamic variables.'}
-              </p>
-            </div>
-          </div>
-
-          <div className="flex items-center space-x-2">
-            {/* Tabs Toggle */}
-            <div className="flex bg-slate-200/80 dark:bg-dark-900/80 p-0.5 rounded-lg border border-slate-300 dark:border-dark-600 text-xs font-semibold">
-              <button
-                onClick={() => setActiveTab('run')}
-                className={`px-3 py-1 rounded-md transition-colors ${
-                  activeTab === 'run'
-                    ? 'bg-rust-600 text-white shadow-sm'
-                    : 'text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200'
-                }`}
-              >
-                {isPt ? 'Executar Ações' : 'Run Actions'}
-              </button>
-              <button
-                onClick={() => setActiveTab('create')}
-                className={`flex items-center gap-1 px-3 py-1 rounded-md transition-colors ${
-                  activeTab === 'create'
-                    ? 'bg-rust-600 text-white shadow-sm'
-                    : 'text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200'
-                }`}
-              >
-                <Plus className="w-3.5 h-3.5" />
-                <span>{isPt ? 'Criar / Editar' : 'Create / Edit'}</span>
-              </button>
-            </div>
-
-            <button
-              onClick={onClose}
-              className="p-1.5 rounded-lg hover:bg-slate-200 dark:hover:bg-dark-700 text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white transition-colors"
-            >
-              <X className="w-4 h-4" />
-            </button>
-          </div>
-        </div>
-
-        {/* Tab 1: Run Actions */}
+    <>
+      <Modal
+        isOpen={isOpen}
+        onClose={onClose}
+        size="2xl"
+        className="h-[min(760px,calc(100vh-2rem))]"
+        padded={false}
+        icon={<Terminal className="w-5 h-5" />}
+        title={isPt ? 'Estúdio de comandos' : 'Command Studio'}
+        subtitle={
+          <span>
+            {targetName} · <span className="font-mono text-[12px]">{currentDir || '/'}</span>
+          </span>
+        }
+        headerActions={headerTabs}
+      >
         {activeTab === 'run' && (
-          <div className="flex-1 flex overflow-hidden">
-            {/* Left Sidebar: Categories & Action List */}
-            <div className="w-72 border-r border-slate-200 dark:border-dark-600 bg-slate-50 dark:bg-dark-850 flex flex-col shrink-0">
-              {/* Search Bar */}
-              <div className="p-2.5 border-b border-slate-200 dark:border-dark-600">
-                <div className="flex items-center space-x-2 bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-600 rounded-lg px-2.5 py-1.5 shadow-sm">
-                  <Search className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                  <input
-                    type="text"
+          <div className="h-full flex border-t border-line">
+            {/* Action list */}
+            <div className="w-64 shrink-0 border-r border-line flex flex-col min-h-0">
+              <div className="p-3 space-y-2 shrink-0">
+                <div className="relative">
+                  <Search className="w-3.5 h-3.5 text-ink-faint absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <TextInput
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
-                    placeholder={isPt ? 'Filtrar comandos...' : 'Search commands...'}
-                    className="bg-transparent text-xs text-slate-900 dark:text-slate-100 placeholder-slate-400 focus:outline-none w-full"
+                    placeholder={isPt ? 'Buscar comandos' : 'Search commands'}
+                    className="pl-8"
+                    aria-label={isPt ? 'Buscar comandos' : 'Search commands'}
                   />
                 </div>
+                <Select
+                  value={selectedCategory}
+                  onChange={(e) => setSelectedCategory(e.target.value)}
+                  aria-label={isPt ? 'Categoria' : 'Category'}
+                >
+                  <option value="all">{isPt ? 'Todas as categorias' : 'All categories'}</option>
+                  {categories.map((c) => (
+                    <option key={c} value={c}>
+                      {categoryLabel(c)}
+                    </option>
+                  ))}
+                </Select>
               </div>
-
-              {/* Category Pills */}
-              <div className="px-2.5 py-2 border-b border-slate-200 dark:border-dark-600 flex items-center space-x-1 overflow-x-auto scrollbar-none">
-                {categories.map((cat) => (
-                  <button
-                    key={cat}
-                    onClick={() => setSelectedCategory(cat)}
-                    className={`px-2 py-0.5 rounded text-[11px] font-medium whitespace-nowrap capitalize transition-colors ${
-                      selectedCategory === cat
-                        ? 'bg-rust-500/20 text-rust-600 dark:text-rust-400 border border-rust-500/40'
-                        : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200 dark:text-slate-400 dark:hover:text-slate-200 dark:hover:bg-dark-700'
-                    }`}
-                  >
-                    {cat === 'all' ? (isPt ? 'Todos' : 'All') : cat}
-                  </button>
+              <div className="flex-1 min-h-0 overflow-y-auto px-2 pb-3">
+                {groupedActions.length === 0 && (
+                  <p className="px-2 py-6 text-center text-[12px] text-ink-faint">{isPt ? 'Nenhum comando encontrado' : 'No commands found'}</p>
+                )}
+                {groupedActions.map(([cat, list]) => (
+                  <div key={cat} className="mb-2">
+                    <div className="px-2 pt-2 pb-1 text-[12px] font-medium text-ink-faint">{categoryLabel(cat)}</div>
+                    {list.map((action) => {
+                      const selected = action.id === activeAction?.id;
+                      return (
+                        <button
+                          key={action.id}
+                          type="button"
+                          onClick={() => setSelectedActionId(action.id)}
+                          aria-current={selected ? 'true' : undefined}
+                          className={`w-full text-left px-2 py-1.5 rounded-lg transition-colors ${
+                            selected ? 'bg-rust-500/10' : 'hover:bg-dark-650/60'
+                          }`}
+                        >
+                          <div className="flex items-center gap-2">
+                            <span className={`flex-1 truncate text-[13px] ${selected ? 'text-ink font-medium' : 'text-ink'}`}>
+                              {text(action.name, action.id)}
+                            </span>
+                            {action.risk_level !== 'safe' && <RiskBadge risk={action.risk_level} isPt={isPt} />}
+                          </div>
+                          <p className="text-[11.5px] text-ink-faint line-clamp-1">{text(action.description)}</p>
+                        </button>
+                      );
+                    })}
+                  </div>
                 ))}
-              </div>
-
-              {/* Actions List */}
-              <div className="flex-1 overflow-y-auto p-1.5 space-y-1">
-                {filteredActions.map((action) => {
-                  const isSelected = action.id === activeAction?.id;
-                  return (
-                    <button
-                      key={action.id}
-                      onClick={() => setSelectedActionId(action.id)}
-                      className={`w-full text-left p-2 rounded-lg border transition-all ${
-                        isSelected
-                          ? 'bg-slate-200 dark:bg-dark-700 border-rust-500/50 shadow-sm'
-                          : 'bg-white/80 dark:bg-dark-800/60 border-slate-200 dark:border-transparent hover:bg-slate-100 dark:hover:bg-dark-700/60 hover:border-slate-300 dark:hover:border-dark-600'
-                      }`}
-                    >
-                      <div className="flex items-center justify-between mb-1">
-                        <span className="text-xs font-semibold text-slate-900 dark:text-slate-200 truncate">
-                          {action.name[lang] || action.name['pt-BR'] || action.id}
-                        </span>
-                        {getRiskBadge(action.risk_level)}
-                      </div>
-                      <p className="text-[11px] text-slate-500 dark:text-slate-400 line-clamp-1">
-                        {action.description[lang] || action.description['pt-BR']}
-                      </p>
-                    </button>
-                  );
-                })}
               </div>
             </div>
 
-            {/* Right Pane: Action Parameters, Live Preview, and Runner */}
-            <div className="flex-1 flex flex-col overflow-hidden bg-slate-100/50 dark:bg-dark-900">
-              {activeAction ? (
-                <div className="flex-1 flex flex-col p-4 overflow-y-auto space-y-4">
-                  {/* Action Header Card */}
-                  <div className="bg-white dark:bg-dark-800 border border-slate-200 dark:border-dark-600 rounded-xl p-3.5 flex items-center justify-between shadow-sm">
-                    <div>
-                      <div className="flex items-center space-x-2">
-                        <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
-                          {activeAction.name[lang] || activeAction.name['pt-BR']}
-                        </h3>
-                        <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-slate-100 dark:bg-dark-700 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-dark-600">
-                          {activeAction.category}
-                        </span>
+            {/* Action detail */}
+            <div className="flex-1 min-w-0 overflow-y-auto">
+              {activeAction && rendered ? (
+                <div className="p-5 space-y-5">
+                  <div className="flex items-start gap-3">
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <h3 className="text-[15px] font-semibold text-ink">{text(activeAction.name, activeAction.id)}</h3>
+                        <RiskBadge risk={activeAction.risk_level} isPt={isPt} />
                       </div>
-                      <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                        {activeAction.description[lang] || activeAction.description['pt-BR']}
-                      </p>
+                      <p className="text-[12.5px] text-ink-muted mt-0.5">{text(activeAction.description)}</p>
                     </div>
-
-                    <div className="flex items-center space-x-2">
-                      {getRiskBadge(activeAction.risk_level)}
-                      {activeAction.id.startsWith('custom-') && onDeleteCustomAction && (
-                        confirmDeleteActionId === activeAction.id ? (
-                          <div className="flex items-center space-x-1 bg-red-500/10 border border-red-500/30 rounded px-2 py-0.5">
-                            <span className="text-[11px] text-red-600 dark:text-red-400 font-medium">
-                              {isPt ? 'Excluir?' : 'Delete?'}
-                            </span>
-                            <button
-                              onClick={async () => {
-                                await onDeleteCustomAction(activeAction.id);
-                                setConfirmDeleteActionId(null);
-                              }}
-                              className="px-1.5 py-0.5 rounded bg-red-600 hover:bg-red-500 text-white text-[10px] font-semibold"
-                            >
-                              {isPt ? 'Sim' : 'Yes'}
-                            </button>
-                            <button
-                              onClick={() => setConfirmDeleteActionId(null)}
-                              className="px-1.5 py-0.5 rounded bg-slate-200 dark:bg-dark-700 text-slate-700 dark:text-slate-300 text-[10px]"
-                            >
-                              {isPt ? 'Não' : 'No'}
-                            </button>
-                          </div>
-                        ) : (
-                          <button
-                            onClick={() => setConfirmDeleteActionId(activeAction.id)}
-                            title={isPt ? 'Excluir Ação' : 'Delete Action'}
-                            className="p-1.5 rounded bg-red-500/10 hover:bg-red-500/20 text-red-600 dark:text-red-400 border border-red-500/20"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        )
-                      )}
-                    </div>
+                    {isCustomAction(activeAction) && (
+                      <div className="flex items-center gap-1 shrink-0">
+                        {onSaveCustomAction && (
+                          <IconButton size="sm" label={isPt ? 'Editar ação' : 'Edit action'} onClick={() => startEdit(activeAction)}>
+                            <Pencil className="w-3.5 h-3.5" />
+                          </IconButton>
+                        )}
+                        {onDeleteCustomAction &&
+                          (confirmDeleteActionId === activeAction.id ? (
+                            <div className="flex items-center gap-1.5 pl-1">
+                              <span className="text-[12px] text-ink-muted">{isPt ? 'Excluir?' : 'Delete?'}</span>
+                              <Button size="sm" variant="secondary" autoFocus onClick={() => setConfirmDeleteActionId(null)}>
+                                {isPt ? 'Não' : 'No'}
+                              </Button>
+                              <Button size="sm" variant="danger" onClick={() => handleDelete(activeAction.id)}>
+                                {isPt ? 'Excluir' : 'Delete'}
+                              </Button>
+                            </div>
+                          ) : (
+                            <IconButton size="sm" label={isPt ? 'Excluir ação' : 'Delete action'} onClick={() => setConfirmDeleteActionId(activeAction.id)}>
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </IconButton>
+                          ))}
+                      </div>
+                    )}
                   </div>
 
-                  {/* Dynamic Fields Parameters (if any) */}
                   {activeAction.fields && activeAction.fields.length > 0 && (
-                    <div className="bg-white dark:bg-dark-800 border border-slate-200 dark:border-dark-600 rounded-xl p-3.5 space-y-3 shadow-sm">
-                      <h4 className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider">
-                        {isPt ? 'Parâmetros da Ação' : 'Action Parameters'}
-                      </h4>
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                        {activeAction.fields.map((field) => (
-                          <div key={field.id} className="space-y-1">
-                            <label className="text-xs font-medium text-slate-700 dark:text-slate-300 flex items-center justify-between">
-                              <span>{field.label[lang] || field.label['pt-BR']}</span>
-                              {field.required && <span className="text-[10px] text-rust-500 dark:text-rust-400">*</span>}
-                            </label>
-
-                            {field.kind === 'select' && field.options ? (
-                              <select
-                                value={fieldValues[field.id] || ''}
-                                onChange={(e) => handleFieldChange(field.id, e.target.value)}
-                                className="w-full bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-600 rounded-lg px-2.5 py-1.5 text-xs text-slate-900 dark:text-slate-200 focus:outline-none focus:border-rust-500 shadow-sm"
-                              >
-                                {field.options.map((opt) => (
-                                  <option key={opt.value} value={opt.value}>
-                                    {opt.label[lang] || opt.label['pt-BR']}
-                                  </option>
-                                ))}
-                              </select>
-                            ) : field.kind === 'checkbox' ? (
-                              <label className="flex items-center space-x-2 cursor-pointer pt-1">
-                                <input
-                                  type="checkbox"
-                                  checked={fieldValues[field.id] === 'true'}
-                                  onChange={(e) => handleFieldChange(field.id, e.target.checked ? 'true' : 'false')}
-                                  className="rounded border-slate-300 dark:border-dark-600 text-rust-500 focus:ring-rust-500"
-                                />
-                                <span className="text-xs text-slate-700 dark:text-slate-300">
-                                  {isPt ? 'Ativar opção' : 'Enable option'}
-                                </span>
-                              </label>
-                            ) : (
-                              <input
-                                type="text"
-                                value={fieldValues[field.id] || ''}
-                                onChange={(e) => handleFieldChange(field.id, e.target.value)}
-                                autoCapitalize="none"
-                                autoCorrect="off"
-                                spellCheck={false}
-                                autoComplete="off"
-                                className="w-full bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-600 rounded-lg px-2.5 py-1.5 text-xs text-slate-900 dark:text-slate-200 focus:outline-none focus:border-rust-500 font-mono shadow-sm"
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-3">
+                      {activeAction.fields.map((field) => {
+                        const err = rendered.fieldErrors[field.id];
+                        const label = (
+                          <>
+                            {text(field.label, field.id)}
+                            {field.required && field.kind !== 'checkbox' && <span className="text-ink-faint"> *</span>}
+                          </>
+                        );
+                        if (field.kind === 'checkbox') {
+                          return (
+                            <div key={field.id} className="sm:col-span-2 flex items-center justify-between gap-3 py-1">
+                              <div className="min-w-0">
+                                <div className="text-[13px] text-ink">{text(field.label, field.id)}</div>
+                                {field.description && <div className="text-[11.5px] text-ink-faint">{text(field.description)}</div>}
+                              </div>
+                              <Toggle
+                                checked={fieldValues[field.id] === 'true'}
+                                onChange={(v) => handleFieldChange(field.id, v ? 'true' : 'false')}
+                                label={text(field.label, field.id)}
                               />
-                            )}
-                          </div>
-                        ))}
-                      </div>
+                            </div>
+                          );
+                        }
+                        return (
+                          <Field
+                            key={field.id}
+                            label={label}
+                            hint={field.description ? text(field.description) : undefined}
+                            error={err ? describeFieldError(err, isPt) : undefined}
+                          >
+                            {(id) =>
+                              field.kind === 'select' && field.options ? (
+                                <Select id={id} value={fieldValues[field.id] ?? ''} onChange={(e) => handleFieldChange(field.id, e.target.value)}>
+                                  {field.options.map((opt) => (
+                                    <option key={opt.value} value={opt.value}>
+                                      {text(opt.label, opt.value)}
+                                    </option>
+                                  ))}
+                                </Select>
+                              ) : (
+                                <TextInput
+                                  id={id}
+                                  mono
+                                  type={field.kind === 'number' ? 'number' : 'text'}
+                                  min={field.min}
+                                  max={field.max}
+                                  step={field.step}
+                                  value={fieldValues[field.id] ?? ''}
+                                  onChange={(e) => handleFieldChange(field.id, e.target.value)}
+                                  aria-invalid={err ? true : undefined}
+                                />
+                              )
+                            }
+                          </Field>
+                        );
+                      })}
                     </div>
                   )}
 
-                  {/* Live Command Preview Box */}
-                  <div className="bg-white dark:bg-dark-800 border border-slate-200 dark:border-dark-600 rounded-xl p-3.5 space-y-2 shadow-sm">
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
-                        <Terminal className="w-3.5 h-3.5 text-rust-500 dark:text-rust-400" />
-                        <span>{isPt ? 'Comando Shell Expandido' : 'Expanded Shell Command'}</span>
-                      </span>
-
-                      <div className="flex items-center space-x-2">
-                        <button
-                          onClick={handleCopy}
-                          className="flex items-center space-x-1 px-2 py-1 rounded bg-slate-200 hover:bg-slate-300 text-slate-700 hover:text-slate-900 dark:bg-dark-700 dark:hover:bg-dark-600 dark:text-slate-300 dark:hover:text-slate-100 text-xs border border-slate-300 dark:border-dark-600 transition-colors shadow-sm"
-                        >
-                          {copied ? <Check className="w-3 h-3 text-emerald-600 dark:text-emerald-400" /> : <Copy className="w-3 h-3" />}
-                          <span>{copied ? (isPt ? 'Copiado!' : 'Copied!') : (isPt ? 'Copiar' : 'Copy')}</span>
-                        </button>
-
-                        <button
-                          onClick={handleRun}
-                          disabled={isRunning}
-                          className="flex items-center space-x-1.5 px-3 py-1 rounded bg-rust-600 hover:bg-rust-500 disabled:opacity-40 text-white text-xs font-bold transition-all shadow-sm border border-rust-500/40"
-                        >
-                          <Play className="w-3 h-3 fill-current" />
-                          <span>{isRunning ? (isPt ? 'Executando...' : 'Running...') : (isPt ? 'Executar' : 'Execute')}</span>
-                        </button>
-                      </div>
+                  {/* Exact command */}
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[12px] font-medium text-ink-faint">{isPt ? 'Comando que será executado' : 'Command that will run'}</span>
+                      <IconButton size="sm" label={isPt ? 'Copiar comando' : 'Copy command'} onClick={handleCopy} disabled={!runCommand}>
+                        {copied ? <Check className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                      </IconButton>
                     </div>
-
-                    <pre className="bg-slate-950 dark:bg-dark-950 p-3 rounded-lg border border-slate-800 dark:border-dark-700 text-xs font-mono text-rust-400 dark:text-rust-300 overflow-x-auto selection:bg-rust-500/40">
-                      <code>{commandPreview || '...'}</code>
+                    <pre className="rounded-lg border border-line bg-surface-sunken px-3 py-2.5 font-mono text-[12px] text-ink whitespace-pre-wrap break-all select-text">
+                      {runCommand || '…'}
                     </pre>
-
-                    <div className="flex items-center justify-between text-[11px] text-slate-500 dark:text-slate-400">
-                      <span>{selectedPaths.length} {isPt ? 'arquivo(s) selecionado(s)' : 'file(s) selected'}</span>
-                      <span className="font-mono truncate max-w-sm">{currentDir}</span>
+                    {rendered.error && <p className="text-[12px] text-red-600 dark:text-red-400">{rendered.error}</p>}
+                    <div className="flex items-center justify-between gap-3 text-[12px] text-ink-faint">
+                      <span>
+                        {selectedPaths.length === 1
+                          ? isPt
+                            ? '1 item selecionado'
+                            : '1 item selected'
+                          : isPt
+                            ? `${selectedPaths.length} itens selecionados`
+                            : `${selectedPaths.length} items selected`}
+                        {' · '}
+                        {isRemote ? (isPt ? 'Servidor (SSH)' : 'Server (SSH)') : isPt ? 'Este computador' : 'This computer'}
+                      </span>
+                      <Button
+                        variant={activeAction.risk_level === 'dangerous' ? 'danger' : 'primary'}
+                        onClick={handleRun}
+                        disabled={!canRun}
+                        loading={isRunning}
+                        icon={<Play className="w-3.5 h-3.5" />}
+                      >
+                        {isRunning ? (isPt ? 'Executando…' : 'Running…') : isPt ? 'Executar' : 'Run'}
+                      </Button>
                     </div>
                   </div>
 
-                  {/* Output Terminal Console */}
-                  <div className="bg-white dark:bg-dark-950 border border-slate-200 dark:border-dark-600 rounded-xl overflow-hidden flex flex-col flex-1 min-h-[160px] shadow-sm">
-                    <div className="bg-slate-100 dark:bg-dark-900 border-b border-slate-200 dark:border-dark-700 px-3 py-1.5 flex items-center justify-between select-none">
-                      <span className="text-xs font-mono text-slate-600 dark:text-slate-400 flex items-center gap-1.5">
-                        <span>Console Output</span>
-                        {exitCode !== null && (
-                          <span className={`text-[10px] px-1.5 py-0.2 rounded font-bold ${
-                            exitCode === 0 
-                              ? 'bg-emerald-500/20 text-emerald-600 dark:text-emerald-400' 
-                              : 'bg-red-500/20 text-red-600 dark:text-red-400'
-                          }`}>
-                            exit code: {exitCode}
-                          </span>
-                        )}
-                      </span>
-
-                      {outputConsole && (
-                        <button
-                          onClick={() => setOutputConsole('')}
-                          className="text-[10px] text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200"
-                        >
-                          {isPt ? 'Limpar' : 'Clear'}
+                  <CommandOutput
+                    result={result}
+                    running={isRunning}
+                    isPt={isPt}
+                    onClear={() => setResult(null)}
+                    placeholder={isPt ? 'A saída do comando aparece aqui.' : 'Command output appears here.'}
+                    actions={
+                      isRunning ? (
+                        <button type="button" className="ui-btn ui-btn-ghost ui-btn-sm" onClick={handleStopWaiting}>
+                          {isPt ? 'Parar de aguardar' : 'Stop waiting'}
                         </button>
-                      )}
-                    </div>
-
-                    <pre className="p-3 text-xs font-mono text-slate-900 dark:text-slate-200 bg-slate-50 dark:bg-transparent overflow-y-auto flex-1 leading-relaxed selection:bg-rust-500/30">
-                      {outputConsole || (isPt ? 'Aguardando execução...' : 'Waiting for command execution...')}
-                    </pre>
-                  </div>
+                      ) : null
+                    }
+                  />
                 </div>
               ) : (
-                <div className="flex-1 flex items-center justify-center text-slate-500 text-xs">
+                <div className="h-full flex items-center justify-center text-[13px] text-ink-faint">
                   {isPt ? 'Nenhuma ação selecionada' : 'No action selected'}
                 </div>
               )}
@@ -575,172 +568,178 @@ export const CommandStudioModal: React.FC<CommandStudioModalProps> = ({
           </div>
         )}
 
-        {/* Tab 2: Create / Edit Custom Actions */}
         {activeTab === 'create' && (
-          <div className="flex-1 flex flex-col p-5 overflow-y-auto space-y-4 bg-slate-50 dark:bg-dark-900">
-            <div className="bg-white dark:bg-dark-800 border border-slate-200 dark:border-dark-600 rounded-xl p-4 space-y-4 shadow-sm">
-              <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
-                <Code2 className="w-4 h-4 text-rust-500 dark:text-rust-400" />
-                <span>{isPt ? 'Construtor de Comando Personalizado' : 'Custom Command Builder'}</span>
-              </h3>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div className="space-y-1">
-                  <label className="text-xs font-semibold text-slate-700 dark:text-slate-300">
-                    {isPt ? 'Nome da Ação (Português) *' : 'Action Name (PT) *'}
-                  </label>
-                  <input
-                    type="text"
-                    value={customNamePt}
-                    onChange={(e) => setCustomNamePt(e.target.value)}
-                    placeholder="Ex: Limpar Cache do Laravel"
-                    className="w-full bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-600 rounded-lg px-3 py-1.5 text-xs text-slate-900 dark:text-slate-200 focus:outline-none focus:border-rust-500 shadow-sm"
-                  />
-                </div>
-
-                <div className="space-y-1">
-                  <label className="text-xs font-semibold text-slate-700 dark:text-slate-300">
-                    {isPt ? 'Nome da Ação (Inglês)' : 'Action Name (EN)'}
-                  </label>
-                  <input
-                    type="text"
-                    value={customNameEn}
-                    onChange={(e) => setCustomNameEn(e.target.value)}
-                    placeholder="Ex: Clear Laravel Cache"
-                    className="w-full bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-600 rounded-lg px-3 py-1.5 text-xs text-slate-900 dark:text-slate-200 focus:outline-none focus:border-rust-500 shadow-sm"
-                  />
-                </div>
+          <div className="h-full overflow-y-auto border-t border-line">
+            <div className="max-w-2xl mx-auto p-5 space-y-4">
+              <div>
+                <h3 className="text-[14px] font-semibold text-ink">
+                  {editingActionId ? (isPt ? 'Editar ação personalizada' : 'Edit custom action') : isPt ? 'Nova ação personalizada' : 'New custom action'}
+                </h3>
+                <p className="text-[12px] text-ink-muted mt-0.5">
+                  {isPt
+                    ? 'Salve um comando para reutilizar com os itens selecionados ou com a pasta atual.'
+                    : 'Save a command to reuse with the selected items or the current folder.'}
+                </p>
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                <div className="space-y-1">
-                  <label className="text-xs font-semibold text-slate-700 dark:text-slate-300">
-                    {isPt ? 'Categoria' : 'Category'}
-                  </label>
-                  <select
-                    value={customCategory}
-                    onChange={(e) => setCustomCategory(e.target.value)}
-                    className="w-full bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-600 rounded-lg px-3 py-1.5 text-xs text-slate-900 dark:text-slate-200 focus:outline-none focus:border-rust-500 shadow-sm"
-                  >
-                    <option value="custom">Custom / Personalizado</option>
-                    <option value="sysadmin">SysAdmin / Sistema</option>
-                    <option value="compression">Compressão / Arquivos</option>
-                    <option value="docker">Docker & Containers</option>
-                    <option value="git">Git & Versionamento</option>
-                    <option value="maintenance">Manutenção & Limpeza</option>
-                  </select>
-                </div>
+              <Field label={isPt ? 'Nome *' : 'Name *'}>
+                {(id) => (
+                  <TextInput
+                    id={id}
+                    value={primaryName}
+                    onChange={(e) => (isPt ? setCustomNamePt(e.target.value) : setCustomNameEn(e.target.value))}
+                    placeholder={isPt ? 'Ex.: Limpar cache do Laravel' : 'e.g. Clear Laravel cache'}
+                  />
+                )}
+              </Field>
 
-                <div className="space-y-1">
-                  <label className="text-xs font-semibold text-slate-700 dark:text-slate-300">
-                    {isPt ? 'Nível de Risco' : 'Risk Level'}
-                  </label>
-                  <select
-                    value={customRisk}
-                    onChange={(e) => setCustomRisk(e.target.value as RiskLevel)}
-                    className="w-full bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-600 rounded-lg px-3 py-1.5 text-xs text-slate-900 dark:text-slate-200 focus:outline-none focus:border-rust-500 shadow-sm"
-                  >
-                    <option value="safe">{isPt ? 'Seguro (Safe)' : 'Safe'}</option>
-                    <option value="warning">{isPt ? 'Atenção (Warning)' : 'Warning'}</option>
-                    <option value="dangerous">{isPt ? 'Destrutivo (Dangerous)' : 'Dangerous'}</option>
-                  </select>
-                </div>
-
-                <div className="space-y-1">
-                  <label className="text-xs font-semibold text-slate-700 dark:text-slate-300">
-                    {isPt ? 'Escopo' : 'Scope'}
-                  </label>
-                  <select
-                    value={customScope}
-                    onChange={(e) => setCustomScope(e.target.value as Scope)}
-                    className="w-full bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-600 rounded-lg px-3 py-1.5 text-xs text-slate-900 dark:text-slate-200 focus:outline-none focus:border-rust-500 shadow-sm"
-                  >
-                    <option value="selected_files">{isPt ? 'Itens Selecionados' : 'Selected Files'}</option>
-                    <option value="selected_dir">{isPt ? 'Diretório Atual' : 'Current Directory'}</option>
-                    <option value="global">{isPt ? 'Global (Qualquer Local)' : 'Global'}</option>
-                  </select>
-                </div>
-              </div>
-
-              {/* Variable Pills */}
-              <div className="space-y-1.5">
-                <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 flex items-center justify-between">
-                  <span>{isPt ? 'Comando / Template Shell *' : 'Command Template *'}</span>
-                  <span className="text-[11px] text-slate-500 dark:text-slate-400 font-normal">
-                    {isPt ? 'Clique nas variáveis para inserir no cursor' : 'Click variable pills to insert'}
-                  </span>
+              <div>
+                <label className="ui-label" htmlFor="studio-template">
+                  {isPt ? 'Comando *' : 'Command *'}
                 </label>
-
                 <div className="flex flex-wrap gap-1.5 mb-2">
-                  <button
-                    type="button"
-                    onClick={() => handleInsertVariable('${selected_files}')}
-                    className="px-2 py-1 rounded bg-slate-200 hover:bg-slate-300 border border-slate-300 text-rust-600 dark:bg-dark-700 dark:hover:bg-dark-600 dark:border-dark-600 dark:text-rust-400 text-xs font-mono"
-                  >
-                    + ${'{selected_files}'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleInsertVariable('${current_dir}')}
-                    className="px-2 py-1 rounded bg-slate-200 hover:bg-slate-300 border border-slate-300 text-sky-600 dark:bg-dark-700 dark:hover:bg-dark-600 dark:border-dark-600 dark:text-sky-400 text-xs font-mono"
-                  >
-                    + ${'{current_dir}'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleInsertVariable('${selected_file}')}
-                    className="px-2 py-1 rounded bg-slate-200 hover:bg-slate-300 border border-slate-300 text-emerald-600 dark:bg-dark-700 dark:hover:bg-dark-600 dark:border-dark-600 dark:text-emerald-400 text-xs font-mono"
-                  >
-                    + ${'{selected_file}'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleInsertVariable('${selected_name}')}
-                    className="px-2 py-1 rounded bg-slate-200 hover:bg-slate-300 border border-slate-300 text-amber-600 dark:bg-dark-700 dark:hover:bg-dark-600 dark:border-dark-600 dark:text-amber-400 text-xs font-mono"
-                  >
-                    + ${'{selected_name}'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleInsertVariable('${selected_stem}')}
-                    className="px-2 py-1 rounded bg-slate-200 hover:bg-slate-300 border border-slate-300 text-purple-600 dark:bg-dark-700 dark:hover:bg-dark-600 dark:border-dark-600 dark:text-purple-400 text-xs font-mono"
-                  >
-                    + ${'{selected_stem}'}
-                  </button>
+                  {VARIABLES.map((v) => (
+                    <button
+                      key={v}
+                      type="button"
+                      onClick={() => handleInsertVariable(v)}
+                      className="h-6 px-2 rounded-md border border-line bg-surface-raised hover:bg-dark-650/60 font-mono text-[11.5px] text-ink-muted transition-colors"
+                    >
+                      {v}
+                    </button>
+                  ))}
                 </div>
-
-                <textarea
+                <TextArea
+                  id="studio-template"
+                  ref={templateRef}
+                  mono
+                  rows={4}
                   value={customTemplate}
                   onChange={(e) => setCustomTemplate(e.target.value)}
-                  placeholder="Ex: cd ${current_dir} && php artisan cache:clear && chmod -R 755 storage"
-                  rows={4}
-                  className="w-full bg-white dark:bg-dark-950 border border-slate-300 dark:border-dark-600 rounded-lg p-3 text-xs text-slate-900 dark:text-rust-300 font-mono focus:outline-none focus:border-rust-500 shadow-sm"
+                  placeholder="php artisan cache:clear && chmod -R 755 storage"
                 />
+                <span className="ui-hint">
+                  {isPt
+                    ? 'Clique numa variável para inserir no cursor. Variáveis viram palavras já entre aspas: não as coloque dentro de aspas. O comando roda na pasta atual.'
+                    : 'Click a variable to insert it at the cursor. Variables expand to already-quoted words: do not put them inside quotes. The command runs in the current folder.'}
+                </span>
               </div>
 
-              {/* Save Button */}
-              <div className="flex justify-end space-x-2 pt-2 border-t border-slate-200 dark:border-dark-700">
-                <button
-                  type="button"
-                  onClick={() => setActiveTab('run')}
-                  className="px-4 py-2 rounded-lg bg-slate-200 hover:bg-slate-300 text-slate-700 dark:bg-dark-700 dark:hover:bg-dark-600 dark:text-slate-300 text-xs font-semibold border border-slate-300 dark:border-dark-600 transition-colors"
+              <div>
+                <span className="ui-label">{isPt ? 'Nível de risco' : 'Risk level'}</span>
+                <Segmented
+                  value={customRisk}
+                  onChange={setCustomRisk}
+                  ariaLabel={isPt ? 'Nível de risco' : 'Risk level'}
+                  options={[
+                    { value: 'safe', label: isPt ? 'Seguro' : 'Safe' },
+                    { value: 'warning', label: isPt ? 'Atenção' : 'Warning' },
+                    { value: 'dangerous', label: isPt ? 'Destrutivo' : 'Dangerous' },
+                  ]}
+                />
+                <span className="ui-hint">
+                  {isPt ? 'Ações com Atenção ou Destrutivo pedem confirmação antes de executar.' : 'Warning and Dangerous actions ask for confirmation before they run.'}
+                </span>
+              </div>
+
+              <Disclosure label={isPt ? 'Avançado' : 'Advanced'}>
+                <div className="space-y-3">
+                  <Field label={isPt ? 'Nome em inglês' : 'Name in Portuguese'}>
+                    {(id) => (
+                      <TextInput
+                        id={id}
+                        value={isPt ? customNameEn : customNamePt}
+                        onChange={(e) => (isPt ? setCustomNameEn(e.target.value) : setCustomNamePt(e.target.value))}
+                      />
+                    )}
+                  </Field>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <Field label={isPt ? 'Descrição (português)' : 'Description (Portuguese)'}>
+                      {(id) => <TextInput id={id} value={customDescPt} onChange={(e) => setCustomDescPt(e.target.value)} />}
+                    </Field>
+                    <Field label={isPt ? 'Descrição (inglês)' : 'Description (English)'}>
+                      {(id) => <TextInput id={id} value={customDescEn} onChange={(e) => setCustomDescEn(e.target.value)} />}
+                    </Field>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <Field label={isPt ? 'Categoria' : 'Category'}>
+                      {(id) => (
+                        <Select id={id} value={customCategory} onChange={(e) => setCustomCategory(e.target.value)}>
+                          {Array.from(new Set([...CUSTOM_CATEGORIES, customCategory])).map((c) => (
+                            <option key={c} value={c}>
+                              {categoryLabel(c)}
+                            </option>
+                          ))}
+                        </Select>
+                      )}
+                    </Field>
+                    <Field label={isPt ? 'Escopo' : 'Scope'}>
+                      {(id) => (
+                        <Select id={id} value={customScope} onChange={(e) => setCustomScope(e.target.value as Scope)}>
+                          <option value="selected_files">{isPt ? 'Itens selecionados' : 'Selected items'}</option>
+                          <option value="selected_dir">{isPt ? 'Pasta atual' : 'Current folder'}</option>
+                          <option value="global">{isPt ? 'Global (qualquer lugar)' : 'Global (anywhere)'}</option>
+                          {customScope === 'any' && <option value="any">{isPt ? 'Qualquer' : 'Any'}</option>}
+                        </Select>
+                      )}
+                    </Field>
+                  </div>
+                </div>
+              </Disclosure>
+
+              <div className="flex justify-end gap-2 pt-3 border-t border-line">
+                <Button
+                  variant="secondary"
+                  onClick={() => {
+                    resetForm();
+                    setActiveTab('run');
+                  }}
                 >
                   {isPt ? 'Cancelar' : 'Cancel'}
-                </button>
-                <button
-                  type="button"
+                </Button>
+                <Button
+                  variant="primary"
                   onClick={handleSaveCustom}
-                  disabled={isSavingCustom || !customNamePt || !customTemplate}
-                  className="flex items-center space-x-1.5 px-4 py-2 rounded-lg bg-rust-600 hover:bg-rust-500 disabled:opacity-40 text-white text-xs font-bold transition-all shadow-md"
+                  loading={isSavingCustom}
+                  disabled={!onSaveCustomAction || !anyName || !customTemplate.trim()}
                 >
-                  <Save className="w-3.5 h-3.5" />
-                  <span>{isSavingCustom ? (isPt ? 'Salvando...' : 'Saving...') : (isPt ? 'Salvar Ação Personalizada' : 'Save Custom Action')}</span>
-                </button>
+                  {editingActionId ? (isPt ? 'Salvar alterações' : 'Save changes') : isPt ? 'Salvar ação' : 'Save action'}
+                </Button>
               </div>
             </div>
           </div>
         )}
-      </div>
-    </div>
+      </Modal>
+
+      <AutomationConfirm
+        isOpen={confirmCommand !== null}
+        tone={activeAction?.risk_level === 'dangerous' ? 'danger' : 'primary'}
+        title={
+          activeAction?.risk_level === 'dangerous'
+            ? isPt
+              ? 'Executar comando destrutivo?'
+              : 'Run destructive command?'
+            : isPt
+              ? 'Executar este comando?'
+              : 'Run this command?'
+        }
+        message={
+          isPt
+            ? 'Confira o comando exato e onde ele será executado. Esta ação pode alterar arquivos ou serviços.'
+            : 'Check the exact command and where it runs. This action can change files or services.'
+        }
+        target={targetLine}
+        command={confirmCommand ?? ''}
+        confirmLabel={isPt ? 'Executar' : 'Run'}
+        cancelLabel={isPt ? 'Cancelar' : 'Cancel'}
+        onCancel={() => setConfirmCommand(null)}
+        onConfirm={() => {
+          const cmd = confirmCommand;
+          setConfirmCommand(null);
+          if (cmd) void execute(cmd);
+        }}
+      />
+    </>
   );
 };
+

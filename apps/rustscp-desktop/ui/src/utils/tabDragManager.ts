@@ -3,7 +3,7 @@
  * Pointer-based Tab Drag & Reorder Architecture:
  * 1. Supports reordering tabs within the same pane with exact insertion index.
  * 2. Supports cross-pane tab dragging (Left <-> Right) with insertion index or pane drop.
- * 3. Notifies subscribers on every pointer movement for smooth 60fps ghost & insertion line rendering.
+ * 3. Notifies subscribers on every pointer movement for smooth ghost & insertion line rendering.
  * 4. Resilient fallback that calculates pane from split ratio if released outside tab bar.
  */
 
@@ -35,7 +35,28 @@ export type TabReorderCallback = (
 let currentState: DraggingTabState | null = null;
 let moveHandler: TabMoveCallback | null = null;
 let reorderHandler: TabReorderCallback | null = null;
+// Split ratio captured once per drag (avoids a localStorage read on every pointer move)
+let dragSplitRatio = 0.5;
 const listeners = new Set<DragListener>();
+
+/** Reads the persisted commander split ratio (0.2 .. 0.8). */
+export function readSplitRatio(): number {
+  try {
+    const raw = localStorage.getItem('rustscp_commander_split_ratio') || '50';
+    return Math.min(Math.max(parseFloat(raw) || 50, 20), 80) / 100;
+  } catch {
+    return 0.5;
+  }
+}
+
+function paneFromRatio(cursorX: number): 'left' | 'right' {
+  return cursorX < window.innerWidth * dragSplitRatio ? 'left' : 'right';
+}
+
+function emit() {
+  (window as any).__rustscpDraggingTab = currentState;
+  listeners.forEach((fn) => fn(currentState));
+}
 
 export const tabDragManager = {
   startDrag(info: {
@@ -47,26 +68,19 @@ export const tabDragManager = {
     cursorX: number;
     cursorY: number;
   }) {
+    dragSplitRatio = readSplitRatio();
     currentState = {
       ...info,
       targetPane: info.sourcePane,
       targetIndex: info.fromIndex,
     };
-    (window as any).__rustscpDraggingTab = currentState;
-    listeners.forEach((fn) => fn(currentState));
+    emit();
   },
 
   updatePointer(cursorX: number, cursorY: number, targetPane?: 'left' | 'right' | null, targetIndex?: number | null) {
     if (!currentState) return;
 
-    let derivedPane = targetPane;
-    if (derivedPane === undefined) {
-      // Calculate from split ratio if not explicitly specified
-      const ratioStr = localStorage.getItem('rustscp_commander_split_ratio') || '50';
-      const ratio = Math.min(Math.max(parseFloat(ratioStr) || 50, 20), 80) / 100;
-      const splitX = window.innerWidth * ratio;
-      derivedPane = cursorX < splitX ? 'left' : 'right';
-    }
+    const derivedPane = targetPane === undefined ? paneFromRatio(cursorX) : targetPane;
 
     currentState = {
       ...currentState,
@@ -75,8 +89,7 @@ export const tabDragManager = {
       targetPane: derivedPane ?? currentState.targetPane,
       targetIndex: targetIndex !== undefined ? targetIndex : currentState.targetIndex,
     };
-    (window as any).__rustscpDraggingTab = currentState;
-    listeners.forEach((fn) => fn(currentState));
+    emit();
   },
 
   setHoverTarget(targetPane: 'left' | 'right' | null, targetIndex: number | null = null) {
@@ -86,23 +99,14 @@ export const tabDragManager = {
       targetPane,
       targetIndex,
     };
-    (window as any).__rustscpDraggingTab = currentState;
-    listeners.forEach((fn) => fn(currentState));
+    emit();
   },
 
   finishDrag(): boolean {
     if (!currentState) return false;
 
     const { sessionId, sourcePane, fromIndex, targetPane, targetIndex, cursorX } = currentState;
-    console.log('[tabDragManager finishDrag]', { sessionId, sourcePane, fromIndex, targetPane, targetIndex, cursorX });
-
-    let finalTargetPane = targetPane;
-    if (!finalTargetPane) {
-      const ratioStr = localStorage.getItem('rustscp_commander_split_ratio') || '50';
-      const ratio = Math.min(Math.max(parseFloat(ratioStr) || 50, 20), 80) / 100;
-      const splitX = window.innerWidth * ratio;
-      finalTargetPane = cursorX < splitX ? 'left' : 'right';
-    }
+    const finalTargetPane = targetPane || paneFromRatio(cursorX);
 
     let executed = false;
 
@@ -110,18 +114,14 @@ export const tabDragManager = {
       // Reorder within the same pane
       if (targetIndex !== null && targetIndex !== undefined && targetIndex !== fromIndex) {
         if (reorderHandler) {
-          console.log('[tabDragManager] Reordering within pane:', { pane: sourcePane, fromIndex, targetIndex });
           reorderHandler(sourcePane, fromIndex, targetIndex);
           executed = true;
         }
       }
-    } else {
+    } else if (moveHandler) {
       // Cross-pane transfer
-      if (moveHandler) {
-        console.log('[tabDragManager] Moving across panes:', { sessionId, sourcePane, targetPane: finalTargetPane, targetIndex });
-        moveHandler(sessionId, sourcePane, finalTargetPane, targetIndex ?? undefined);
-        executed = true;
-      }
+      moveHandler(sessionId, sourcePane, finalTargetPane, targetIndex ?? undefined);
+      executed = true;
     }
 
     this.cancelDrag();
@@ -129,24 +129,31 @@ export const tabDragManager = {
   },
 
   cancelDrag() {
+    if (!currentState) return;
     currentState = null;
-    (window as any).__rustscpDraggingTab = null;
-    listeners.forEach((fn) => fn(null));
+    emit();
   },
 
-  registerMoveHandler(fn: TabMoveCallback) {
+  /** Registers the cross-pane move handler; returns a function that unregisters it. */
+  registerMoveHandler(fn: TabMoveCallback): () => void {
     moveHandler = fn;
+    return () => {
+      if (moveHandler === fn) moveHandler = null;
+    };
   },
 
-  registerReorderHandler(fn: TabReorderCallback) {
+  /** Registers the reorder handler; returns a function that unregisters it. */
+  registerReorderHandler(fn: TabReorderCallback): () => void {
     reorderHandler = fn;
+    return () => {
+      if (reorderHandler === fn) reorderHandler = null;
+    };
   },
 
   clearHoverTarget(pane: 'left' | 'right') {
     if (currentState && currentState.targetPane === pane) {
-      currentState.targetPane = null;
-      (window as any).__rustscpDraggingTab = currentState;
-      listeners.forEach((fn) => fn(currentState));
+      currentState = { ...currentState, targetPane: null };
+      emit();
     }
   },
 

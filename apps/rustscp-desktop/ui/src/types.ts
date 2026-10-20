@@ -110,6 +110,12 @@ export interface McpStatusInfo {
   enabled: boolean;
   active_sessions_count: number;
   total_audit_events: number;
+  /** True when this build ships an MCP transport agents can connect to. */
+  transport_available?: boolean;
+  /** True while that transport is accepting connections. */
+  transport_running?: boolean;
+  /** Command an agent uses to register the gateway (e.g. `claude mcp add …`), when there is one. */
+  setup_command?: string | null;
 }
 
 export interface TransferItem {
@@ -206,3 +212,23 @@ export interface EditorTab {
   cursorCol: number;
 }
 
+
+/** One of the two Commander panes (Explorer mode shows the focused one). */
+export type PaneId = 'left' | 'right';
+
+/** Response of `get_vault_security_info`. `load_error`/`backup_path` are set when the vault could not be read at startup. */
+export interface VaultSecurityInfo {
+  is_encrypted: boolean;
+  cipher: string;
+  kdf: string;
+  kdf_iterations: number;
+  vault_path: string;
+  site_count: number;
+  has_custom_master_password: boolean;
+  key_storage?: string;
+  key_path?: string;
+  export_kdf_iterations?: number;
+  protection_note?: string;
+  load_error?: string | null;
+  backup_path?: string | null;
+}

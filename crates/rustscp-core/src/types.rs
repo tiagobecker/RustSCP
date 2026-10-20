@@ -34,6 +34,11 @@ pub enum CoreError {
 
     #[error("General error: {0}")]
     General(String),
+
+    /// The SSH server presented a host key that differs from the one recorded
+    /// in a known_hosts file (or a revoked key). No credentials were sent.
+    #[error("Host key verification failed: {0}")]
+    HostKeyMismatch(String),
 }
 
 pub type CoreResult<T> = Result<T, CoreError>;
@@ -99,7 +104,9 @@ pub struct FileEntry {
     pub modified_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub created_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub permissions: Permissions,
+    #[serde(default)]
     pub is_hidden: bool,
 }
 
@@ -117,10 +124,16 @@ impl FileEntry {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// `Default` (SFTP, the app's primary protocol) is only used when an old saved
+/// site has no `protocol` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
     Local,
+    /// SFTP over SSH. The UI's "scp" option runs over the same SSH connection,
+    /// so `"scp"` deserializes to this variant.
+    #[default]
+    #[serde(alias = "scp", alias = "ssh")]
     Sftp,
     S3,
     Ftp,
@@ -139,9 +152,10 @@ impl fmt::Display for Protocol {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(tag = "type", content = "value")]
 pub enum AuthMethod {
+    #[default]
     None,
     Password(String),
     PrivateKey {
@@ -151,15 +165,55 @@ pub enum AuthMethod {
     KeyringRef(String),
 }
 
+/// Secrets are never printed: `{:?}` of a config may end up in logs or panics.
+impl fmt::Debug for AuthMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn redact(s: &str) -> &'static str {
+            if s.is_empty() {
+                "\"\""
+            } else {
+                "\"***\""
+            }
+        }
+        match self {
+            Self::None => write!(f, "None"),
+            Self::Password(p) => write!(f, "Password({})", redact(p)),
+            Self::PrivateKey { path, passphrase } => f
+                .debug_struct("PrivateKey")
+                .field("path", path)
+                .field(
+                    "passphrase",
+                    &format_args!("{}", passphrase.as_deref().map(redact).unwrap_or("None")),
+                )
+                .finish(),
+            Self::KeyringRef(r) => f.debug_tuple("KeyringRef").field(r).finish(),
+        }
+    }
+}
+
+fn default_ssh_port() -> u16 {
+    22
+}
+
+/// Every field has a serde default so sites saved by older versions (which
+/// may lack newer fields) still load.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionConfig {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub protocol: Protocol,
+    #[serde(default)]
     pub host: String,
+    #[serde(default = "default_ssh_port")]
     pub port: u16,
+    #[serde(default)]
     pub username: String,
+    #[serde(default)]
     pub auth: AuthMethod,
+    #[serde(default)]
     pub remote_root: String,
 }
 
@@ -302,4 +356,55 @@ pub struct RemoteTrashStatus {
     pub trash_dir: String,
     pub item_count: usize,
     pub total_size_bytes: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scp_and_ssh_deserialize_to_sftp() {
+        let p: Protocol = serde_json::from_str("\"scp\"").unwrap();
+        assert_eq!(p, Protocol::Sftp);
+        let p: Protocol = serde_json::from_str("\"ssh\"").unwrap();
+        assert_eq!(p, Protocol::Sftp);
+        assert_eq!(serde_json::to_string(&Protocol::Sftp).unwrap(), "\"sftp\"");
+    }
+
+    #[test]
+    fn old_saved_sites_without_new_fields_still_load() {
+        let cfg: ConnectionConfig =
+            serde_json::from_str(r#"{"id":"a","name":"A","host":"h","username":"u"}"#).unwrap();
+        assert_eq!(cfg.protocol, Protocol::Sftp);
+        assert_eq!(cfg.port, 22);
+        assert!(matches!(cfg.auth, AuthMethod::None));
+        assert_eq!(cfg.remote_root, "");
+
+        let entry: FileEntry = serde_json::from_str(
+            r#"{"name":"f","path":"/f","file_type":"file","size":1,"modified_at":null}"#,
+        )
+        .unwrap();
+        assert!(!entry.is_hidden);
+        assert_eq!(entry.permissions, Permissions::default());
+    }
+
+    #[test]
+    fn debug_never_prints_secrets() {
+        let pw = format!("{:?}", AuthMethod::Password("hunter2".into()));
+        assert!(!pw.contains("hunter2"), "{pw}");
+        let key = format!(
+            "{:?}",
+            AuthMethod::PrivateKey {
+                path: "~/.ssh/id".into(),
+                passphrase: Some("s3cret".into())
+            }
+        );
+        assert!(
+            !key.contains("s3cret") && key.contains("~/.ssh/id"),
+            "{key}"
+        );
+        // Serialization for the UI and the vault is unchanged.
+        let json = serde_json::to_string(&AuthMethod::Password("hunter2".into())).unwrap();
+        assert_eq!(json, r#"{"type":"Password","value":"hunter2"}"#);
+    }
 }

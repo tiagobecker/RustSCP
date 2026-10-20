@@ -1,13 +1,14 @@
-import React, { useState, useEffect } from 'react';
-import { 
-  X, 
-  Save, 
-  FileCode, 
-  Check, 
-  Search, 
-  
-} from 'lucide-react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Save, Check, Search, ChevronDown, X } from 'lucide-react';
+import { Modal } from './ui/Modal.tsx';
+import { Button, IconButton } from './ui/controls.tsx';
+import { notify } from './ui/toast.tsx';
+import { plainTextInputProps } from '../utils/inputHardening.ts';
 
+/**
+ * Legacy single-file editor. The app uses RustScpEditor; this stays for compatibility.
+ */
 interface FileEditorModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -17,162 +18,218 @@ interface FileEditorModalProps {
   onSave: (path: string, content: string) => Promise<void>;
 }
 
-export const FileEditorModal: React.FC<FileEditorModalProps> = ({
-  isOpen,
-  onClose,
-  fileName,
-  filePath,
-  initialContent,
-  onSave,
-}) => {
+const LINE_HEIGHT = 20;
+
+export const FileEditorModal: React.FC<FileEditorModalProps> = ({ isOpen, onClose, fileName, filePath, initialContent, onSave }) => {
+  const { i18n } = useTranslation();
+  const isPt = (i18n.language || 'en').toLowerCase().startsWith('pt');
+  const tr = (pt: string, en: string) => (isPt ? pt : en);
+
   const [content, setContent] = useState<string>('');
-  const [isDirty, setIsDirty] = useState<boolean>(false);
+  const [savedContent, setSavedContent] = useState<string>('');
   const [isSaving, setIsSaving] = useState<boolean>(false);
   const [saveSuccess, setSaveSuccess] = useState<boolean>(false);
   const [searchTerm, setSearchTerm] = useState<string>('');
   const [showSearch, setShowSearch] = useState<boolean>(false);
+  const [confirmDiscard, setConfirmDiscard] = useState<boolean>(false);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const gutterRef = useRef<HTMLPreElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     setContent(initialContent);
-    setIsDirty(false);
+    setSavedContent(initialContent);
+    setConfirmDiscard(false);
   }, [initialContent, filePath]);
 
-  if (!isOpen) return null;
+  const isDirty = content !== savedContent;
+  const lineCount = useMemo(() => content.split('\n').length, [content]);
+  const gutterText = useMemo(() => Array.from({ length: lineCount }, (_, i) => String(i + 1)).join('\n'), [lineCount]);
 
-  const handleTextChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setContent(e.target.value);
-    setIsDirty(true);
-  };
-
-  const handleSave = async () => {
+  const handleSave = async (): Promise<boolean> => {
+    if (isSaving) return false;
+    if (!isDirty) return true;
+    const toSave = content;
     setIsSaving(true);
     try {
-      await onSave(filePath, content);
-      setIsDirty(false);
+      await onSave(filePath, toSave);
+      setSavedContent(toSave);
       setSaveSuccess(true);
-      setTimeout(() => setSaveSuccess(false), 2000);
+      setTimeout(() => setSaveSuccess(false), 1800);
+      return true;
     } catch (err) {
-      alert(`Falha ao salvar: ${err}`);
+      notify.error(tr('Não foi possível salvar', 'Could not save'), err);
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  // Keyboard shortcut Ctrl+S / Cmd+S
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === 's') {
-      e.preventDefault();
-      handleSave();
+  const findNext = () => {
+    const ta = textareaRef.current;
+    if (!ta || !searchTerm) return;
+    const hay = content.toLowerCase();
+    const needle = searchTerm.toLowerCase();
+    let pos = hay.indexOf(needle, ta.selectionEnd);
+    if (pos === -1) pos = hay.indexOf(needle);
+    if (pos === -1) {
+      notify.info(tr('Nada encontrado', 'Not found'), searchTerm);
+      return;
     }
-    if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+    ta.focus();
+    ta.setSelectionRange(pos, pos + searchTerm.length);
+  };
+
+  const requestClose = () => {
+    if (isDirty) setConfirmDiscard(true);
+    else onClose();
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
       e.preventDefault();
-      setShowSearch(!showSearch);
+      void handleSave();
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
+      e.preventDefault();
+      setShowSearch(true);
+      requestAnimationFrame(() => searchRef.current?.focus());
     }
   };
 
-  const lineCount = content.split('\n').length;
-
   return (
-    <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-      <div 
-        onKeyDown={handleKeyDown}
-        className="bg-white dark:bg-dark-800 border border-slate-300 dark:border-dark-600 rounded-xl max-w-5xl w-full shadow-2xl flex flex-col h-[680px] overflow-hidden text-slate-900 dark:text-slate-100"
-      >
-        {/* Editor Header */}
-        <div className="px-5 py-3 border-b border-slate-200 dark:border-dark-700 flex items-center justify-between bg-slate-100 dark:bg-dark-750 select-none">
-          <div className="flex items-center space-x-2.5">
-            <div className="p-1.5 rounded bg-sky-500/10 text-sky-600 dark:text-sky-400 border border-sky-500/20">
-              <FileCode className="w-4 h-4" />
-            </div>
-            <div>
-              <div className="flex items-center space-x-2">
-                <span className="font-bold text-slate-900 dark:text-slate-100 text-xs">{fileName}</span>
-                {isDirty && (
-                  <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-700 dark:text-amber-300 border border-amber-500/30 text-[10px] font-mono font-medium">
-                    Não Salvo
-                  </span>
-                )}
-              </div>
-              <span className="text-[11px] text-slate-500 dark:text-slate-400 font-mono truncate max-w-lg block">
-                {filePath}
-              </span>
-            </div>
-          </div>
-
-          <div className="flex items-center space-x-2">
-            <button
-              onClick={() => setShowSearch(!showSearch)}
-              title="Buscar (Ctrl+F)"
-              className="p-1.5 rounded hover:bg-slate-200 dark:hover:bg-dark-600 text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white transition-colors"
-            >
+    <>
+      <Modal
+        isOpen={isOpen}
+        onClose={requestClose}
+        size="2xl"
+        padded={false}
+        dismissOnBackdrop={false}
+        title={
+          <span className="inline-flex items-center gap-2">
+            {fileName}
+            {isDirty && <span className="w-1.5 h-1.5 rounded-full bg-rust-500" aria-label={tr('Não salvo', 'Unsaved')} />}
+          </span>
+        }
+        subtitle={<span className="font-mono text-[11.5px]">{filePath}</span>}
+        initialFocusRef={textareaRef}
+        headerActions={
+          <>
+            <IconButton size="sm" label={tr('Localizar', 'Find')} active={showSearch} onClick={() => setShowSearch((v) => !v)}>
               <Search className="w-4 h-4" />
-            </button>
-
-            <button
-              onClick={handleSave}
-              disabled={isSaving || !isDirty}
-              className="flex items-center space-x-1.5 px-3 py-1.5 rounded bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white text-xs font-bold transition-all shadow-md"
+            </IconButton>
+            <Button
+              size="sm"
+              variant="primary"
+              onClick={() => void handleSave()}
+              disabled={!isDirty && !isSaving}
+              loading={isSaving}
+              icon={saveSuccess ? <Check className="w-3.5 h-3.5" /> : <Save className="w-3.5 h-3.5" />}
             >
-              {saveSuccess ? <Check className="w-3.5 h-3.5" /> : <Save className="w-3.5 h-3.5" />}
-              <span>{saveSuccess ? 'Salvo!' : isSaving ? 'Salvando...' : 'Salvar no Servidor'}</span>
-            </button>
-
-            <button onClick={onClose} className="text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white p-1.5 rounded-md hover:bg-slate-200 dark:hover:bg-dark-700 transition-colors">
-              <X className="w-4 h-4" />
-            </button>
-          </div>
-        </div>
-
-        {/* Quick Search Bar */}
-        {showSearch && (
-          <div className="bg-slate-100 dark:bg-dark-900 border-b border-slate-200 dark:border-dark-700 px-4 py-2 flex items-center space-x-2">
-            <Search className="w-3.5 h-3.5 text-slate-400" />
-            <input
-              type="text"
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              placeholder="Localizar texto no arquivo..."
-              className="bg-white dark:bg-dark-800 border border-slate-300 dark:border-dark-700 rounded px-2.5 py-1 text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:border-sky-500 w-72"
+              {saveSuccess ? tr('Salvo', 'Saved') : tr('Salvar', 'Save')}
+            </Button>
+          </>
+        }
+      >
+        <div className="h-[65vh] flex flex-col" onKeyDown={handleKeyDown}>
+          {showSearch && (
+            <div className="flex items-center gap-1.5 px-4 py-2 border-y border-line">
+              <input
+                ref={searchRef}
+                type="text"
+                {...plainTextInputProps}
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    findNext();
+                  }
+                }}
+                placeholder={tr('Localizar no arquivo', 'Find in file')}
+                aria-label={tr('Localizar no arquivo', 'Find in file')}
+                className="ui-input h-7 w-72 text-[12.5px]"
+              />
+              <IconButton size="sm" label={tr('Próximo', 'Next')} onClick={findNext} disabled={!searchTerm}>
+                <ChevronDown className="w-4 h-4" />
+              </IconButton>
+              <IconButton size="sm" label={tr('Fechar busca', 'Close find')} onClick={() => setShowSearch(false)}>
+                <X className="w-3.5 h-3.5" />
+              </IconButton>
+            </div>
+          )}
+          <div className="flex-1 min-h-0 flex border-t border-line bg-surface-raised font-mono text-[12.5px]">
+            <pre
+              ref={gutterRef}
+              aria-hidden="true"
+              className="m-0 w-12 shrink-0 overflow-hidden select-none border-r border-line bg-surface text-ink-faint text-right pr-2 pt-3 pb-12"
+              style={{ lineHeight: `${LINE_HEIGHT}px`, font: 'inherit' }}
+            >
+              {gutterText}
+            </pre>
+            <textarea
+              ref={textareaRef}
+              {...plainTextInputProps}
+              value={content}
+              onChange={(e) => setContent(e.target.value)}
+              onScroll={(e) => {
+                if (gutterRef.current) gutterRef.current.scrollTop = e.currentTarget.scrollTop;
+              }}
+              wrap="off"
+              aria-label={tr(`Conteúdo de ${fileName}`, `Contents of ${fileName}`)}
+              className="flex-1 min-w-0 bg-transparent text-ink p-3 resize-none focus:outline-none overflow-auto whitespace-pre font-mono selection:bg-rust-500/25"
+              style={{ lineHeight: `${LINE_HEIGHT}px` }}
             />
-            <button 
-              onClick={() => setShowSearch(false)}
-              className="text-xs text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200 font-medium"
+          </div>
+          <div className="flex items-center gap-4 h-7 px-4 border-t border-line text-[11.5px] text-ink-faint select-none">
+            <span className="tabular-nums">
+              {lineCount.toLocaleString()} {tr('linhas', 'lines')}
+            </span>
+            <span className="tabular-nums">{content.length.toLocaleString()} {tr('caracteres', 'characters')}</span>
+            <span className="ml-auto">UTF-8</span>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal
+        isOpen={isOpen && confirmDiscard}
+        onClose={() => setConfirmDiscard(false)}
+        size="sm"
+        title={tr(`Salvar as alterações em “${fileName}”?`, `Save changes to “${fileName}”?`)}
+        initialFocusRef={cancelRef}
+        footer={
+          <>
+            <Button
+              variant="ghost"
+              className="mr-auto text-red-600 dark:text-red-400"
+              onClick={() => {
+                setConfirmDiscard(false);
+                setContent(savedContent);
+                onClose();
+              }}
             >
-              Fechar
-            </button>
-          </div>
-        )}
-
-        {/* Text Area Code Body */}
-        <div className="flex-1 flex overflow-hidden bg-slate-900 dark:bg-dark-950 font-mono text-xs">
-          {/* Line Numbers Simulation */}
-          <div className="w-12 bg-slate-950/80 dark:bg-dark-900/90 text-slate-400 dark:text-slate-500 text-right pr-2 pt-3 select-none border-r border-slate-800 dark:border-dark-700/60 font-mono text-[11px] overflow-hidden">
-            {Array.from({ length: Math.min(lineCount, 500) }).map((_, i) => (
-              <div key={i} className="leading-5">{i + 1}</div>
-            ))}
-          </div>
-
-          <textarea
-            value={content}
-            onChange={handleTextChange}
-            spellCheck={false}
-            className="flex-1 bg-transparent text-slate-100 dark:text-slate-200 p-3 leading-5 resize-none focus:outline-none overflow-auto font-mono text-xs selection:bg-sky-500/30"
-          />
-        </div>
-
-        {/* Editor Status Bar */}
-        <div className="h-6 bg-slate-100 dark:bg-dark-900 border-t border-slate-200 dark:border-dark-700 px-4 flex items-center justify-between text-[11px] text-slate-600 dark:text-slate-400 font-mono select-none">
-          <div className="flex items-center space-x-4">
-            <span>Linhas: {lineCount}</span>
-            <span>Tamanho: {content.length} bytes</span>
-            <span>Codificação: UTF-8</span>
-          </div>
-
-          <div className="flex items-center space-x-2">
-            <span>Modo: Edição Direta Remota</span>
-          </div>
-        </div>
-      </div>
-    </div>
+              {tr('Não salvar', 'Don’t save')}
+            </Button>
+            <Button ref={cancelRef} variant="secondary" onClick={() => setConfirmDiscard(false)}>
+              {tr('Cancelar', 'Cancel')}
+            </Button>
+            <Button
+              variant="primary"
+              loading={isSaving}
+              onClick={async () => {
+                const ok = await handleSave();
+                setConfirmDiscard(false);
+                if (ok) onClose();
+              }}
+            >
+              {tr('Salvar', 'Save')}
+            </Button>
+          </>
+        }
+      >
+        <p className="text-[13px] text-ink-muted">{tr('Se você não salvar, as alterações serão perdidas.', 'Your changes will be lost if you don’t save them.')}</p>
+      </Modal>
+    </>
   );
 };

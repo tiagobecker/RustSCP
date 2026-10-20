@@ -62,7 +62,10 @@ impl ActionCatalog {
                         risk_warning: false,
                     },
                 ],
-                template: "tar -czf {{archive_name}} ${selected_files}".to_string(),
+                // Runs in the selected folder, stores names relative to it ("./name", so a
+                // file called "--option" is never read as a tar option) and applies the
+                // chosen gzip level. Only variables the UI preview also knows are used.
+                template: "cd ${selected_dir} && for f in ${selected_files}; do printf '%s\\n' \"./${f##*/}\"; done | tar -cf - -T - | gzip {{compression_level}} > {{archive_name}}".to_string(),
             },
             // 2. Extract Archive
             ActionDefinition {
@@ -73,7 +76,7 @@ impl ActionCatalog {
                 scope: Scope::SelectedFiles,
                 name: LocalizedText::new("Extract Archive", "Descompactar Arquivo"),
                 description: LocalizedText::new(
-                    "Extract tar.gz, tar.bz2, zip or tar archive",
+                    "Extract tar.gz, tar.bz2, tar.xz, tar or zip archives",
                     "Extrai arquivos compactados no diretório atual ou selecionado",
                 ),
                 fields: vec![ActionField {
@@ -89,7 +92,9 @@ impl ActionCatalog {
                     validation_regex: None,
                     risk_warning: false,
                 }],
-                template: "tar -xzf ${selected_files} -C {{dest_dir}}".to_string(),
+                // tar -xf detects gzip/bzip2/xz itself; zip archives go through unzip.
+                // dest_dir is relative to the selected folder.
+                template: "cd ${selected_dir} && for f in ${selected_files}; do case \"$f\" in *.zip|*.ZIP) unzip -o \"$f\" -d {{dest_dir}} ;; *) tar -xf \"$f\" -C {{dest_dir}} ;; esac; done".to_string(),
             },
             // 3. Disk Usage
             ActionDefinition {
@@ -117,7 +122,7 @@ impl ActionCatalog {
                     validation_regex: None,
                     risk_warning: false,
                 }],
-                template: "du -sh * 2>/dev/null | sort -hr | head -n {{limit}}".to_string(),
+                template: "cd ${selected_dir} && du -sh -- * 2>/dev/null | sort -hr | head -n {{limit}}".to_string(),
             },
             // 4. Find Files
             ActionDefinition {
@@ -144,7 +149,7 @@ impl ActionCatalog {
                     validation_regex: None,
                     risk_warning: false,
                 }],
-                template: "find . -name {{pattern}} -maxdepth 4".to_string(),
+                template: "cd ${selected_dir} && find . -maxdepth 4 -name {{pattern}}".to_string(),
             },
             // 5. Visual Chmod
             ActionDefinition {
@@ -221,9 +226,11 @@ impl ActionCatalog {
                         risk_warning: true,
                     },
                 ],
-                template:
-                    "chmod {% if recursive == 'true' %}-R {% endif %}{{mode}} ${selected_files}"
-                        .to_string(),
+                // The -R flag is decided by the shell from the checkbox value ("true" /
+                // "false"), so the command is correct whichever renderer fills it in
+                // (the backend or the UI preview, which strips {% %} tags).
+                template: "chmod $([ {{recursive}} = true ] && printf %s -R) {{mode}} ${selected_files}"
+                    .to_string(),
             },
             // 6. Systemd Service Management
             ActionDefinition {

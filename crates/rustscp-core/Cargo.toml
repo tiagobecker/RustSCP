@@ -20,6 +20,7 @@ reqwest = { version = "0.13.4", features = ["json", "stream"] }
 hmac = "0.12.1"
 sha2.workspace = true
 hex = "0.4.3"
+base64 = "0.22.1"
 notify = "8.2.0"
 regex.workspace = true
 libc = "0.2"

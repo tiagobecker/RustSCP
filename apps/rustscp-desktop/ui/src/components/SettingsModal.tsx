@@ -1,19 +1,9 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { 
-  X, 
-  Settings, 
-  Sun, 
-  Moon, 
-  Monitor, 
-  Trash2, 
-  FileCode, 
-  Terminal,
-  Save, 
-  Check,
-  Info
-} from 'lucide-react';
+import { Settings2, Sun, Moon, Monitor, Trash2, SlidersHorizontal, Info, Check, ChevronRight } from 'lucide-react';
 import { ThemeMode } from '../theme.ts';
+import { Modal } from './ui/Modal.tsx';
+import { Segmented, SettingsGroup, SettingsRow, TextInput, Toggle, Button } from './ui/controls.tsx';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -30,6 +20,19 @@ interface SettingsModalProps {
   onOpenAbout?: () => void;
 }
 
+type Section = 'general' | 'files' | 'advanced';
+
+const EDITOR_PRESETS = [
+  { cmd: 'code', label: 'VS Code' },
+  { cmd: 'cursor', label: 'Cursor' },
+  { cmd: 'subl', label: 'Sublime Text' },
+  { cmd: 'zed', label: 'Zed' },
+];
+
+/**
+ * System-Settings-style preferences. Every change applies immediately (no Save step);
+ * power-user options live under "Advanced".
+ */
 export const SettingsModal: React.FC<SettingsModalProps> = ({
   isOpen,
   onClose,
@@ -44,416 +47,203 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onOpenRemoteTrashModal,
   onOpenAbout,
 }) => {
-  const { i18n } = useTranslation();
-  const isPt = i18n.language.startsWith('pt');
-
-  const [activeTab, setActiveTab] = useState<'general' | 'trash' | 'editor' | 'terminal'>('general');
-  const [editorCmdInput, setEditorCmdInput] = useState<string>(externalEditorCmd || 'code');
-  const [trashEnabled, setTrashEnabled] = useState<boolean>(isRemoteTrashEnabled);
-  const [rememberLastDir, setRememberLastDir] = useState<boolean>(rememberLastRemoteDir);
-  const [savedSuccess, setSavedSuccess] = useState<boolean>(false);
+  const { t, i18n } = useTranslation();
+  const [section, setSection] = useState<Section>('general');
+  const [editorCmd, setEditorCmd] = useState(externalEditorCmd || '');
+  const [editorSaved, setEditorSaved] = useState(false);
 
   useEffect(() => {
-    if (isOpen) {
-      setTrashEnabled(isRemoteTrashEnabled);
-      setRememberLastDir(rememberLastRemoteDir);
-      setEditorCmdInput(externalEditorCmd || 'code');
-    }
-  }, [isOpen, isRemoteTrashEnabled, rememberLastRemoteDir, externalEditorCmd]);
+    if (isOpen) setEditorCmd(externalEditorCmd || '');
+  }, [isOpen, externalEditorCmd]);
 
-  if (!isOpen) return null;
-
-  const handleLanguageChange = (lang: string) => {
-    i18n.changeLanguage(lang);
+  const commitEditorCmd = (value: string) => {
+    const v = value.trim();
+    if (v === (externalEditorCmd || '').trim()) return;
+    onSaveExternalEditorCmd(v);
+    setEditorSaved(true);
+    setTimeout(() => setEditorSaved(false), 1500);
   };
 
-  const handleSaveAll = () => {
-    onToggleRemoteTrash(trashEnabled);
-    onToggleRememberLastRemoteDir(rememberLastDir);
-    onSaveExternalEditorCmd(editorCmdInput);
-    setSavedSuccess(true);
-    setTimeout(() => {
-      setSavedSuccess(false);
-      onClose();
-    }, 800);
-  };
+  const lang = i18n.language.startsWith('pt') ? 'pt-BR' : 'en-US';
+
+  const nav: Array<{ id: Section; label: string; icon: React.ReactNode }> = [
+    { id: 'general', label: t('settings.general', 'General'), icon: <Settings2 className="w-4 h-4" /> },
+    { id: 'files', label: t('settings.filesTransfers', 'Files & deletion'), icon: <Trash2 className="w-4 h-4" /> },
+    { id: 'advanced', label: t('settings.advanced', 'Advanced'), icon: <SlidersHorizontal className="w-4 h-4" /> },
+  ];
 
   return (
-    <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-3 animate-in fade-in duration-150">
-      <div className="bg-white dark:bg-dark-800 border border-slate-300 dark:border-dark-600 rounded-xl shadow-2xl max-w-2xl w-full flex flex-col overflow-hidden text-slate-900 dark:text-slate-100">
-        {/* Header */}
-        <div className="px-5 py-3.5 border-b border-slate-200 dark:border-dark-600 bg-slate-100 dark:bg-dark-750 flex items-center justify-between select-none shrink-0">
-          <div className="flex items-center space-x-2.5">
-            <div className="p-2 rounded-lg bg-rust-500/15 text-rust-600 dark:text-rust-400 border border-rust-500/30">
-              <Settings className="w-5 h-5" />
-            </div>
-            <div>
-              <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
-                {isPt ? 'Configurações do RustSCP' : 'RustSCP Settings'}
-              </h3>
-              <p className="text-xs text-slate-600 dark:text-slate-400">
-                {isPt ? 'Personalize temas, lixeira remota, terminais e editores' : 'Configure themes, remote trash, terminals, and editors'}
-              </p>
-            </div>
-          </div>
-
-          <button
-            onClick={onClose}
-            className="p-1 rounded-lg hover:bg-slate-200 dark:hover:bg-dark-700 text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200 transition-colors"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-
-        {/* Sidebar & Content Layout */}
-        <div className="flex flex-1 min-h-[380px] overflow-hidden">
-          {/* Tabs Sidebar */}
-          <div className="w-48 bg-slate-50 dark:bg-dark-850 border-r border-slate-200 dark:border-dark-600 p-2 space-y-1 select-none shrink-0">
-            <button
-              onClick={() => setActiveTab('general')}
-              className={`w-full flex items-center space-x-2 px-3 py-2 rounded-lg text-xs font-semibold transition-colors ${
-                activeTab === 'general'
-                  ? 'bg-rust-600 text-white shadow-sm'
-                  : 'text-slate-700 dark:text-slate-400 hover:text-slate-950 dark:hover:text-slate-200 hover:bg-slate-200/80 dark:hover:bg-dark-700'
-              }`}
-            >
-              <Sun className="w-3.5 h-3.5" />
-              <span>{isPt ? 'Geral & Tema' : 'General & Theme'}</span>
-            </button>
-
-            <button
-              onClick={() => setActiveTab('trash')}
-              className={`w-full flex items-center space-x-2 px-3 py-2 rounded-lg text-xs font-semibold transition-colors ${
-                activeTab === 'trash'
-                  ? 'bg-rust-600 text-white shadow-sm'
-                  : 'text-slate-700 dark:text-slate-400 hover:text-slate-950 dark:hover:text-slate-200 hover:bg-slate-200/80 dark:hover:bg-dark-700'
-              }`}
-            >
-              <Trash2 className="w-3.5 h-3.5" />
-              <span>{isPt ? 'Lixeira Remota' : 'Remote Trash'}</span>
-            </button>
-
-            <button
-              onClick={() => setActiveTab('editor')}
-              className={`w-full flex items-center space-x-2 px-3 py-2 rounded-lg text-xs font-semibold transition-colors ${
-                activeTab === 'editor'
-                  ? 'bg-rust-600 text-white shadow-sm'
-                  : 'text-slate-700 dark:text-slate-400 hover:text-slate-950 dark:hover:text-slate-200 hover:bg-slate-200/80 dark:hover:bg-dark-700'
-              }`}
-            >
-              <FileCode className="w-3.5 h-3.5" />
-              <span>{isPt ? 'Editor de Código' : 'Code Editor'}</span>
-            </button>
-
-            <button
-              onClick={() => setActiveTab('terminal')}
-              className={`w-full flex items-center space-x-2 px-3 py-2 rounded-lg text-xs font-semibold transition-colors ${
-                activeTab === 'terminal'
-                  ? 'bg-rust-600 text-white shadow-sm'
-                  : 'text-slate-700 dark:text-slate-400 hover:text-slate-950 dark:hover:text-slate-200 hover:bg-slate-200/80 dark:hover:bg-dark-700'
-              }`}
-            >
-              <Terminal className="w-3.5 h-3.5" />
-              <span>{isPt ? 'Terminal Nativo' : 'Native Terminal'}</span>
-            </button>
-
-            {onOpenAbout && (
+    <Modal isOpen={isOpen} onClose={onClose} size="2xl" padded={false} className="h-[min(560px,calc(100vh-2rem))]">
+      <div className="flex h-full min-h-0">
+        {/* Sidebar */}
+        <aside className="w-52 shrink-0 bg-dark-850 border-r border-line p-3 flex flex-col select-none">
+          <div className="px-2 pt-1 pb-3 text-[15px] font-semibold text-ink">{t('settings.title', 'Settings')}</div>
+          <nav className="space-y-0.5 flex-1">
+            {nav.map((n) => (
               <button
-                onClick={onOpenAbout}
-                className="w-full flex items-center space-x-2 px-3 py-2 rounded-lg text-xs font-semibold transition-colors text-slate-700 dark:text-slate-400 hover:text-slate-950 dark:hover:text-slate-200 hover:bg-slate-200/80 dark:hover:bg-dark-700 pt-2.5 border-t border-slate-200 dark:border-dark-700"
+                key={n.id}
+                type="button"
+                onClick={() => setSection(n.id)}
+                aria-current={section === n.id ? 'page' : undefined}
+                className={`w-full flex items-center gap-2.5 px-2.5 h-8 rounded-lg text-[13px] transition-colors ${
+                  section === n.id ? 'bg-dark-650 text-ink font-medium' : 'text-ink-muted hover:text-ink hover:bg-dark-650/50'
+                }`}
               >
-                <Info className="w-3.5 h-3.5 text-rust-500" />
-                <span>{isPt ? 'Sobre o RustSCP' : 'About RustSCP'}</span>
+                <span className={section === n.id ? 'text-rust-500' : ''}>{n.icon}</span>
+                {n.label}
               </button>
-            )}
-          </div>
+            ))}
+          </nav>
+          {onOpenAbout && (
+            <button
+              type="button"
+              onClick={onOpenAbout}
+              className="w-full flex items-center gap-2.5 px-2.5 h-8 rounded-lg text-[13px] text-ink-muted hover:text-ink hover:bg-dark-650/50 transition-colors"
+            >
+              <Info className="w-4 h-4" />
+              {t('settings.about', 'About RustSCP')}
+            </button>
+          )}
+        </aside>
 
-          {/* Tab Content */}
-          <div className="flex-1 p-5 overflow-y-auto bg-white dark:bg-dark-900 text-xs">
-            {/* Tab: General & Theme */}
-            {activeTab === 'general' && (
-              <div className="space-y-5">
-                <div>
-                  <h4 className="font-bold text-slate-900 dark:text-slate-100 text-sm mb-1">
-                    {isPt ? 'Tema da Interface & Contraste' : 'Theme & Visual Contrast'}
-                  </h4>
-                  <p className="text-slate-600 dark:text-slate-400 mb-3">
-                    {isPt 
-                      ? 'Alterne entre o tema Claro de alto contraste e o tema Escuro calibrado com as cores da marca.'
-                      : 'Switch between calibrated high-contrast Light mode and dark titanium brand palette.'}
-                  </p>
-
-                  <div className="grid grid-cols-3 gap-2">
-                    {[
-                      { id: 'system', label: isPt ? 'Automático' : 'System', icon: Monitor },
-                      { id: 'light', label: isPt ? 'Claro (Light)' : 'Light Mode', icon: Sun },
-                      { id: 'dark', label: isPt ? 'Escuro (Dark)' : 'Dark Mode', icon: Moon },
-                    ].map((item) => {
-                      const Icon = item.icon;
-                      const isSelected = themeMode === item.id;
-                      return (
-                        <button
-                          key={item.id}
-                          type="button"
-                          onClick={() => onThemeChange(item.id as ThemeMode)}
-                          className={`p-3 rounded-xl border flex flex-col items-center justify-center space-y-1.5 transition-all ${
-                            isSelected
-                              ? 'bg-rust-500/15 border-rust-500 text-rust-600 dark:text-rust-400 shadow-sm font-bold'
-                              : 'bg-slate-50 dark:bg-dark-800 border-slate-200 dark:border-dark-600 text-slate-700 dark:text-slate-400 hover:text-slate-950 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-dark-700'
-                          }`}
-                        >
-                          <Icon className="w-5 h-5" />
-                          <span>{item.label}</span>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                <div className="pt-4 border-t border-slate-200 dark:border-dark-700">
-                  <h4 className="font-bold text-slate-900 dark:text-slate-100 text-sm mb-1">
-                    {isPt ? 'Idioma da Interface' : 'Interface Language'}
-                  </h4>
-                  <p className="text-slate-600 dark:text-slate-400 mb-3">
-                    {isPt 
-                      ? 'Selecione o idioma padrão para a interface, diálogos e menus do aplicativo.'
-                      : 'Select the default language for interface, dialogs, and menus.'}
-                  </p>
-                  <div className="grid grid-cols-2 gap-3 max-w-md">
-                    <button
-                      type="button"
-                      onClick={() => handleLanguageChange('pt-BR')}
-                      className={`p-3 rounded-xl border flex items-center space-x-2.5 transition-all ${
-                        isPt 
-                          ? 'bg-rust-500/15 border-rust-500 text-rust-600 dark:text-rust-400 shadow-sm font-bold' 
-                          : 'bg-slate-50 dark:bg-dark-800 border-slate-200 dark:border-dark-600 text-slate-700 dark:text-slate-400 hover:text-slate-950 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-dark-700'
-                      }`}
-                    >
-                      <span className="text-lg">🇧🇷</span>
-                      <div className="text-left">
-                        <div className="text-xs font-semibold text-slate-900 dark:text-slate-100">Português</div>
-                        <div className="text-[10px] text-slate-500 dark:text-slate-400">Brasil (pt-BR)</div>
-                      </div>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleLanguageChange('en-US')}
-                      className={`p-3 rounded-xl border flex items-center space-x-2.5 transition-all ${
-                        !isPt 
-                          ? 'bg-rust-500/15 border-rust-500 text-rust-600 dark:text-rust-400 shadow-sm font-bold' 
-                          : 'bg-slate-50 dark:bg-dark-800 border-slate-200 dark:border-dark-600 text-slate-700 dark:text-slate-400 hover:text-slate-950 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-dark-700'
-                      }`}
-                    >
-                      <span className="text-lg">🇺🇸</span>
-                      <div className="text-left">
-                        <div className="text-xs font-semibold text-slate-900 dark:text-slate-100">English</div>
-                        <div className="text-[10px] text-slate-500 dark:text-slate-400">United States (en-US)</div>
-                      </div>
-                    </button>
-                  </div>
-                </div>
-
-                {/* Remote Connections Navigation Setting */}
-                <div className="pt-4 border-t border-slate-200 dark:border-dark-700">
-                  <div className="bg-slate-50 dark:bg-dark-800 border border-slate-200 dark:border-dark-600 rounded-xl p-4">
-                    <div className="flex items-center justify-between cursor-pointer" onClick={() => setRememberLastDir(!rememberLastDir)}>
-                      <div>
-                        <span className="font-semibold text-slate-900 dark:text-slate-100 block text-xs">
-                          {isPt ? 'Lembrar Último Local Ativo da Conexão' : 'Remember Last Active Remote Directory'}
-                        </span>
-                        <span className="text-[11px] text-slate-500 dark:text-slate-400 block mt-0.5 max-w-sm">
-                          {isPt
-                            ? 'Ao desconectar ou fechar o app, memoriza a última pasta remota acessada nesta conexão e reabre nela por padrão. Se desativado, inicia sempre na raiz root/home do usuário.'
-                            : 'Memorizes the last visited remote folder upon disconnect or app restart, resuming there by default. If disabled, always starts at the user root/home.'}
-                        </span>
-                      </div>
-
-                      <div
-                        className={`w-10 h-5 rounded-full transition-colors relative cursor-pointer shrink-0 ml-4 ${
-                          rememberLastDir ? 'bg-rust-600' : 'bg-slate-300 dark:bg-dark-600'
-                        }`}
-                      >
-                        <div
-                          className={`w-4 h-4 rounded-full bg-white transition-transform absolute top-0.5 ${
-                            rememberLastDir ? 'right-0.5' : 'left-0.5'
-                          }`}
-                        />
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                {onOpenAbout && (
-                  <div className="pt-4 border-t border-slate-200 dark:border-dark-700 flex items-center justify-between bg-slate-50 dark:bg-dark-800/60 p-3 rounded-xl border border-slate-200 dark:border-dark-700">
-                    <div className="flex items-center space-x-2.5">
-                      <div className="p-1.5 rounded-lg bg-rust-500/15 text-rust-600 dark:text-rust-400">
-                        <Info className="w-4 h-4" />
-                      </div>
-                      <div>
-                        <div className="font-semibold text-slate-900 dark:text-slate-100">
-                          {isPt ? 'Versionador & Diagnóstico' : 'Versioner & Diagnostics'}
-                        </div>
-                        <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                          {isPt ? 'Verifique data/hora de compilação e ID de build' : 'Check build timestamp and compilation ID'}
-                        </div>
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={onOpenAbout}
-                      className="px-3 py-1.5 rounded-lg bg-rust-600 hover:bg-rust-500 text-white text-xs font-semibold shadow-xs transition-colors cursor-pointer"
-                    >
-                      {isPt ? 'Ver Sobre' : 'View About'}
-                    </button>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Tab: Remote Trash */}
-            {activeTab === 'trash' && (
-              <div className="space-y-4">
-                <div>
-                  <h4 className="font-bold text-slate-900 dark:text-slate-100 text-sm mb-1">
-                    {isPt ? 'Lixeira Remota Segura (Move-to-Trash)' : 'Secure Remote Trash Bin'}
-                  </h4>
-                  <p className="text-slate-600 dark:text-slate-400 leading-relaxed">
-                    {isPt 
-                      ? 'Por padrão, a exclusão remota é permanente. Ao ativar esta opção, o RustSCP moverá atomicamente os arquivos para ~/.local/share/Trash no servidor, permitindo restauração posterior sem requerer permissões de root.'
-                      : 'By default, remote deletion is permanent. When enabled, RustSCP moves items atomically into ~/.local/share/Trash in user space.'}
-                  </p>
-                </div>
-
-                <div className="bg-slate-50 dark:bg-dark-800 border border-slate-200 dark:border-dark-600 rounded-xl p-4 space-y-3">
-                  <label className="flex items-center justify-between cursor-pointer">
-                    <div>
-                      <span className="font-semibold text-slate-900 dark:text-slate-200 block">
-                        {isPt ? 'Mover para a Lixeira Remota ao excluir com F8 / Del' : 'Move to Remote Trash on delete (F8 / Del)'}
-                      </span>
-                      <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                        {isPt ? 'Substitui exclusão definitiva (rm) por movimento atômico' : 'Replaces permanent rm with atomic move'}
-                      </span>
-                    </div>
-
-                    <div
-                      onClick={() => setTrashEnabled(!trashEnabled)}
-                      className={`w-10 h-5 rounded-full transition-colors relative cursor-pointer ${
-                        trashEnabled ? 'bg-rust-600' : 'bg-slate-300 dark:bg-dark-600'
-                      }`}
-                    >
-                      <div
-                        className={`w-4 h-4 rounded-full bg-white transition-transform absolute top-0.5 ${
-                          trashEnabled ? 'right-0.5' : 'left-0.5'
-                        }`}
-                      />
-                    </div>
-                  </label>
-
-                  {onOpenRemoteTrashModal && (
-                    <div className="pt-2 border-t border-slate-200 dark:border-dark-700/60 flex justify-end">
-                      <button
-                        type="button"
-                        onClick={onOpenRemoteTrashModal}
-                        className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg bg-slate-200 hover:bg-slate-300 dark:bg-dark-700 dark:hover:bg-dark-600 text-slate-800 dark:text-slate-300 text-xs font-semibold border border-slate-300 dark:border-dark-600 transition-colors"
-                      >
-                        <Trash2 className="w-3.5 h-3.5 text-rust-600 dark:text-rust-400" />
-                        <span>{isPt ? 'Gerenciar Lixeira do Servidor Atual' : 'Open Remote Trash Manager'}</span>
-                      </button>
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {/* Tab: Editor Settings */}
-            {activeTab === 'editor' && (
-              <div className="space-y-4">
-                <div>
-                  <h4 className="font-bold text-slate-900 dark:text-slate-100 text-sm mb-1">
-                    {isPt ? 'Editor de Código RustSCP & Externo' : 'RustSCP Code Editor & External'}
-                  </h4>
-                  <p className="text-slate-600 dark:text-slate-400">
-                    {isPt 
-                      ? 'O RustSCP possui o editor interno modular "RustSCP Editor" com suporte a multi-abas e sintaxe para mais de 15 linguagens. Você também pode configurar um editor externo como preferência.'
-                      : 'RustSCP includes the embedded multi-tab "RustSCP Editor". You can also configure an external editor.'}
-                  </p>
-                </div>
-
-                <div className="bg-slate-50 dark:bg-dark-800 border border-slate-200 dark:border-dark-600 rounded-xl p-4 space-y-3">
-                  <label className="block font-semibold text-slate-800 dark:text-slate-200">
-                    {isPt ? 'Comando / Executável do Editor Externo:' : 'External Editor Command / Executable:'}
-                  </label>
-                  <div className="flex items-center space-x-2">
-                    <input
-                      type="text"
-                      value={editorCmdInput}
-                      onChange={(e) => setEditorCmdInput(e.target.value)}
-                      placeholder="code, cursor, subl, notepad++"
-                      className="flex-1 bg-white dark:bg-dark-900 border border-slate-300 dark:border-dark-600 rounded-lg px-3 py-1.5 text-slate-900 dark:text-slate-100 font-mono text-xs focus:outline-none focus:border-rust-500 shadow-sm"
+        {/* Content */}
+        <div className="flex-1 min-w-0 flex flex-col">
+          <div className="flex-1 overflow-y-auto px-7 pt-6 pb-6 space-y-6">
+            {section === 'general' && (
+              <>
+                <SettingsGroup title={t('settings.appearance', 'Appearance')}>
+                  <SettingsRow label={t('settings.theme', 'Theme')}>
+                    <Segmented<ThemeMode>
+                      ariaLabel={t('settings.theme', 'Theme')}
+                      value={themeMode}
+                      onChange={onThemeChange}
+                      options={[
+                        { value: 'system', label: t('settings.themeSystem', 'Auto'), icon: <Monitor className="w-3.5 h-3.5" /> },
+                        { value: 'light', label: t('settings.themeLight', 'Light'), icon: <Sun className="w-3.5 h-3.5" /> },
+                        { value: 'dark', label: t('settings.themeDark', 'Dark'), icon: <Moon className="w-3.5 h-3.5" /> },
+                      ]}
                     />
-                  </div>
-                  <div className="flex flex-wrap gap-1.5 text-[11px] text-slate-500 dark:text-slate-400">
-                    <span>{isPt ? 'Exemplos comuns:' : 'Common examples:'}</span>
-                    <button type="button" onClick={() => setEditorCmdInput('code')} className="underline hover:text-slate-900 dark:hover:text-slate-200">code (VS Code)</button>
-                    <button type="button" onClick={() => setEditorCmdInput('cursor')} className="underline hover:text-slate-900 dark:hover:text-slate-200">cursor</button>
-                    <button type="button" onClick={() => setEditorCmdInput('subl')} className="underline hover:text-slate-900 dark:hover:text-slate-200">subl (Sublime)</button>
-                  </div>
-                </div>
-              </div>
+                  </SettingsRow>
+                  <SettingsRow label={t('settings.language', 'Language')}>
+                    <Segmented
+                      ariaLabel={t('settings.language', 'Language')}
+                      value={lang}
+                      onChange={(v) => i18n.changeLanguage(v)}
+                      options={[
+                        { value: 'pt-BR', label: 'Português' },
+                        { value: 'en-US', label: 'English' },
+                      ]}
+                    />
+                  </SettingsRow>
+                </SettingsGroup>
+
+                <SettingsGroup
+                  title={t('settings.connections', 'Connections')}
+                  footer={t(
+                    'settings.rememberDirHelp',
+                    'When off, every connection opens in the configured initial folder or the user home.'
+                  )}
+                >
+                  <SettingsRow
+                    label={t('settings.rememberDir', 'Reopen the last remote folder')}
+                    description={t('settings.rememberDirDesc', 'Resume where you left off on each server.')}
+                  >
+                    <Toggle
+                      checked={rememberLastRemoteDir}
+                      onChange={onToggleRememberLastRemoteDir}
+                      label={t('settings.rememberDir', 'Reopen the last remote folder')}
+                    />
+                  </SettingsRow>
+                </SettingsGroup>
+              </>
             )}
 
-            {/* Tab: Terminal Settings */}
-            {activeTab === 'terminal' && (
-              <div className="space-y-4">
-                <div>
-                  <h4 className="font-bold text-slate-900 dark:text-slate-100 text-sm mb-1">
-                    {isPt ? 'Terminal Nativo da Plataforma' : 'Native Platform Terminal'}
-                  </h4>
-                  <p className="text-slate-600 dark:text-slate-400 leading-relaxed">
-                    {isPt 
-                      ? 'O RustSCP abre o terminal nativo do seu sistema operacional (macOS Terminal/iTerm, Windows Terminal/PowerShell, GNOME Terminal) com a conexão SSH e a pasta atual já inicializadas.'
-                      : 'RustSCP opens your OS native terminal with current SSH connection and directory pre-loaded.'}
-                  </p>
-                </div>
+            {section === 'files' && (
+              <SettingsGroup
+                title={t('settings.deletion', 'Deleting remote files')}
+                footer={t(
+                  'settings.remoteTrashHelp',
+                  'Items are moved to ~/.local/share/Trash on the server, so they can be restored. When off, deletion is permanent (rm -rf).'
+                )}
+              >
+                <SettingsRow
+                  label={t('settings.useRemoteTrash', 'Move to remote trash instead of deleting')}
+                  description={t('settings.useRemoteTrashDesc', 'Applies to Delete / F8 on remote servers.')}
+                >
+                  <Toggle
+                    checked={isRemoteTrashEnabled}
+                    onChange={onToggleRemoteTrash}
+                    label={t('settings.useRemoteTrash', 'Move to remote trash instead of deleting')}
+                  />
+                </SettingsRow>
+                {onOpenRemoteTrashModal && (
+                  <SettingsRow label={t('settings.manageTrash', 'Manage remote trash…')} onClick={onOpenRemoteTrashModal}>
+                    <ChevronRight className="w-4 h-4 text-ink-faint" />
+                  </SettingsRow>
+                )}
+              </SettingsGroup>
+            )}
 
-                <div className="bg-slate-50 dark:bg-dark-800 border border-slate-200 dark:border-dark-600 rounded-xl p-4 space-y-2 text-slate-700 dark:text-slate-300">
-                  <div className="flex items-center space-x-2">
-                    <Check className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-                    <span>macOS: Terminal.app / iTerm2</span>
-                  </div>
-                  <div className="flex items-center space-x-2">
-                    <Check className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-                    <span>Windows: Windows Terminal (wt.exe), PowerShell, cmd.exe</span>
-                  </div>
-                  <div className="flex items-center space-x-2">
-                    <Check className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-                    <span>Linux: x-terminal-emulator, gnome-terminal, konsole, alacritty, kitty</span>
-                  </div>
-                </div>
-              </div>
+            {section === 'advanced' && (
+              <>
+                <SettingsGroup
+                  title={t('settings.externalEditor', 'External editor')}
+                  footer={t('settings.externalEditorHelp', 'Command used by “Open in external editor”. Leave empty to use the system default.')}
+                >
+                  <SettingsRow label={t('settings.editorCommand', 'Editor command')} stacked>
+                    <div className="flex items-center gap-2">
+                      <TextInput
+                        mono
+                        value={editorCmd}
+                        onChange={(e) => setEditorCmd(e.target.value)}
+                        onBlur={(e) => commitEditorCmd(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') commitEditorCmd((e.target as HTMLInputElement).value);
+                        }}
+                        placeholder="code"
+                        aria-label={t('settings.editorCommand', 'Editor command')}
+                      />
+                      {editorSaved && <Check className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0" />}
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {EDITOR_PRESETS.map((p) => (
+                        <Button
+                          key={p.cmd}
+                          size="sm"
+                          variant={editorCmd.trim() === p.cmd ? 'primary' : 'secondary'}
+                          onClick={() => {
+                            setEditorCmd(p.cmd);
+                            commitEditorCmd(p.cmd);
+                          }}
+                        >
+                          {p.label}
+                        </Button>
+                      ))}
+                    </div>
+                  </SettingsRow>
+                </SettingsGroup>
+
+                <SettingsGroup
+                  title={t('settings.nativeTerminal', 'System terminal')}
+                  footer={t(
+                    'settings.nativeTerminalHelp',
+                    '“Open in system Terminal” starts your OS terminal with the current SSH session and folder.'
+                  )}
+                >
+                  <SettingsRow label="macOS" description="Terminal.app, iTerm2" />
+                  <SettingsRow label="Windows" description="Windows Terminal, PowerShell, cmd.exe" />
+                  <SettingsRow label="Linux" description="x-terminal-emulator, GNOME Terminal, Konsole, Alacritty, kitty" />
+                </SettingsGroup>
+              </>
             )}
           </div>
-        </div>
-
-        {/* Footer */}
-        <div className="px-5 py-3 border-t border-slate-200 dark:border-dark-600 bg-slate-100 dark:bg-dark-750 flex items-center justify-end space-x-2 select-none shrink-0">
-          <button
-            type="button"
-            onClick={onClose}
-            className="px-4 py-2 rounded-lg bg-slate-200 hover:bg-slate-300 dark:bg-dark-700 dark:hover:bg-dark-600 text-slate-700 dark:text-slate-300 text-xs font-semibold border border-slate-300 dark:border-dark-600 transition-colors"
-          >
-            {isPt ? 'Cancelar' : 'Cancel'}
-          </button>
-          <button
-            type="button"
-            onClick={handleSaveAll}
-            className="flex items-center space-x-1.5 px-4 py-2 rounded-lg bg-rust-600 hover:bg-rust-500 text-white text-xs font-bold transition-all shadow-md"
-          >
-            {savedSuccess ? <Check className="w-3.5 h-3.5" /> : <Save className="w-3.5 h-3.5" />}
-            <span>{savedSuccess ? (isPt ? 'Salvo!' : 'Saved!') : (isPt ? 'Salvar Configurações' : 'Save Settings')}</span>
-          </button>
+          <div className="flex items-center justify-end px-5 py-3 border-t border-line shrink-0">
+            <Button variant="primary" onClick={onClose}>
+              {t('settings.done', 'Done')}
+            </Button>
+          </div>
         </div>
       </div>
-    </div>
+    </Modal>
   );
 };

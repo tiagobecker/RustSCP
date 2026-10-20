@@ -4,104 +4,284 @@
 
 :root {
   /* ==========================================================================
-     LIGHT MODE
-     Ultra-clean, high-contrast titanium & pearl surfaces with corten rust accents
-     WCAG AA calibrated text contrast
+     LIGHT MODE — warm ivory surfaces, one terracotta accent (Claude-style calm)
      ========================================================================== */
-  --color-dark-950: 241 245 249; /* #f1f5f9 - lowest background base */
-  --color-dark-900: 248 250 252; /* #f8fafc - main window canvas */
-  --color-dark-850: 241 245 249; /* #f1f5f9 - subtle panel fill */
-  --color-dark-800: 255 255 255; /* #ffffff - headers, panels, modal dialogs */
-  --color-dark-750: 248 250 252; /* #f8fafc - modal titlebars / toolbars */
-  --color-dark-700: 241 245 249; /* #f1f5f9 - card backgrounds, dropdown items */
-  --color-dark-650: 226 232 240; /* #e2e8f0 - hovered dropdown items / button hover */
-  --color-dark-600: 203 213 225; /* #cbd5e1 - crisp structural borders */
+  --color-dark-950: 240 238 230; /* #F0EEE6 - lowest background base */
+  --color-dark-900: 250 249 245; /* #FAF9F5 - main window canvas */
+  --color-dark-850: 245 244 237; /* #F5F4ED - subtle panel fill / sidebars */
+  --color-dark-800: 255 255 255; /* #FFFFFF - panels, menus, dialogs */
+  --color-dark-750: 250 249 245; /* #FAF9F5 - dialog headers / toolbars */
+  --color-dark-700: 243 241 234; /* #F3F1EA - cards, dropdown items */
+  --color-dark-650: 234 232 223; /* #EAE8DF - hover */
+  --color-dark-600: 224 222 212; /* #E0DED4 - borders */
 
+  /* Semantic tokens */
+  --surface: 250 249 245;
+  --surface-raised: 255 255 255;
+  --surface-sunken: 244 243 238;
+  --surface-overlay: 255 255 255;
+  --line: 229 227 218;
+  --line-strong: 212 210 200;
+  --ink: 20 20 19;
+  --ink-muted: 94 93 88;
+  --ink-faint: 128 127 120;
+  --accent-soft: 201 100 66;
 
-  /* Rust Corten Accent (Calibrated deep corten orange for light mode) */
-  --color-rust-400: 217 83 30;   /* #d9531e */
-  --color-rust-500: 194 65 12;   /* #c2410c - official corten */
-  --color-rust-600: 154 52 18;   /* #9a3412 - pressed/active */
+  /* Terracotta accent */
+  --color-rust-400: 217 119 87;  /* #D97757 */
+  --color-rust-500: 201 100 66;  /* #C96442 */
+  --color-rust-600: 176 84 54;   /* #B05436 */
 
-  /* AI Gateway MCP Luminescent Core */
-  --color-mcp-cyan: 2 132 199;   /* #0284c7 */
-  --color-mcp-amber: 217 119 6;  /* #d97706 */
+  /* AI Gateway */
+  --color-mcp-cyan: 37 99 160;
+  --color-mcp-amber: 180 110 20;
 
   /* Syntax Highlighting Tokens (Light) */
-  --token-keyword: #c2410c;
-  --token-function: #0369a1;
-  --token-string: #15803d;
-  --token-comment: #64748b;
-  --token-number: #b45309;
-  --token-variable: #6b21a8;
-  --token-operator: #0f172a;
-  --token-punctuation: #475569;
+  --token-keyword: #b5533a;
+  --token-function: #2f6a9e;
+  --token-string: #4d7c3a;
+  --token-comment: #8a887f;
+  --token-number: #a1641c;
+  --token-variable: #7a4c9c;
+  --token-operator: #262624;
+  --token-punctuation: #5e5d58;
 
-  --scrollbar-track: #f1f5f9;
-  --scrollbar-thumb: #cbd5e1;
-  --scrollbar-hover: #c2410c;
+  --scrollbar-thumb: rgb(0 0 0 / 0.16);
+  --scrollbar-hover: rgb(0 0 0 / 0.30);
+
+  color-scheme: light;
 }
 
 .dark {
   /* ==========================================================================
-     DARK MODE
-     Forged iron, dark titanium surfaces, vibrant glowing brand corten orange
+     DARK MODE — warm charcoal, low-contrast chrome, soft terracotta accent
      ========================================================================== */
-  --color-dark-950: 8 11 16;     /* #080b10 - deepest base */
-  --color-dark-900: 12 16 23;    /* #0c1017 - app window canvas */
-  --color-dark-850: 15 20 28;    /* #0f141c - sub-panel background */
-  --color-dark-800: 19 25 35;    /* #131923 - headers, toolbars, dialogs */
-  --color-dark-750: 23 30 42;    /* #171e2a - titlebars */
-  --color-dark-700: 29 38 52;    /* #1d2634 - cards, elevated items */
-  --color-dark-650: 35 46 63;    /* #232e3f - hover states */
-  --color-dark-600: 42 55 75;    /* #2a374b - crisp borders and dividers */
+  --color-dark-950: 26 25 24;    /* #1A1918 */
+  --color-dark-900: 31 30 29;    /* #1F1E1D - canvas */
+  --color-dark-850: 35 34 32;    /* #232220 - sidebars */
+  --color-dark-800: 38 38 36;    /* #262624 - panels, menus, dialogs */
+  --color-dark-750: 43 42 40;    /* #2B2A28 - dialog headers */
+  --color-dark-700: 48 48 46;    /* #30302E - cards */
+  --color-dark-650: 58 57 54;    /* #3A3936 - hover */
+  --color-dark-600: 66 65 61;    /* #42413D - borders */
 
+  --surface: 31 30 29;
+  --surface-raised: 38 38 36;
+  --surface-sunken: 26 25 24;
+  --surface-overlay: 48 48 46;
+  --line: 58 57 54;
+  --line-strong: 74 73 68;
+  --ink: 250 249 245;
+  --ink-muted: 194 192 182;
+  --ink-faint: 156 154 146;
+  --accent-soft: 217 119 87;
 
-  /* Rust Corten Accent (Vibrant electric forged rust-orange) */
-  --color-rust-400: 249 115 22;  /* #f97316 */
-  --color-rust-500: 217 83 30;   /* #d9531e - official logo corten orange */
-  --color-rust-600: 184 62 16;   /* #b83e10 */
+  --color-rust-400: 228 140 112; /* #E48C70 */
+  --color-rust-500: 217 119 87;  /* #D97757 */
+  --color-rust-600: 201 100 66;  /* #C96442 */
 
-  /* AI Gateway MCP Luminescent Core */
-  --color-mcp-cyan: 0 229 255;   /* #00e5ff - laser glowing cyan */
-  --color-mcp-amber: 245 158 11; /* #f59e0b - neon amber */
+  --color-mcp-cyan: 125 180 230;
+  --color-mcp-amber: 230 170 80;
 
   /* Syntax Highlighting Tokens (Dark) */
-  --token-keyword: #f97316;
-  --token-function: #38bdf8;
-  --token-string: #4ade80;
-  --token-comment: #94a3b8;
-  --token-number: #fbbf24;
-  --token-variable: #c084fc;
-  --token-operator: #f8fafc;
-  --token-punctuation: #cbd5e1;
+  --token-keyword: #e48c70;
+  --token-function: #8ab8e6;
+  --token-string: #a6c98a;
+  --token-comment: #8f8d85;
+  --token-number: #e5b567;
+  --token-variable: #c3a6e0;
+  --token-operator: #f4f3ee;
+  --token-punctuation: #c2c0b6;
 
-  --scrollbar-track: #0c1017;
-  --scrollbar-thumb: #232e3f;
-  --scrollbar-hover: #d9531e;
+  --scrollbar-thumb: rgb(255 255 255 / 0.14);
+  --scrollbar-hover: rgb(255 255 255 / 0.26);
+
+  color-scheme: dark;
 }
 
-/* Custom modern scrollbars with subtle brand hover */
+@layer base {
+  html,
+  body {
+    font-family: theme('fontFamily.sans');
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    font-feature-settings: 'cv11', 'ss01';
+  }
+
+  body {
+    background-color: rgb(var(--surface));
+    color: rgb(var(--ink));
+  }
+
+  /* Text fields keep typed text exactly as entered (no autocapitalize/autocorrect),
+     and stay selectable even though the app chrome uses select-none. */
+  input,
+  textarea,
+  [contenteditable='true'] {
+    -webkit-user-select: text;
+    user-select: text;
+    text-transform: none;
+  }
+
+  :focus {
+    outline: none;
+  }
+
+  :focus-visible {
+    outline: 2px solid rgb(var(--color-rust-500) / 0.55);
+    outline-offset: 1px;
+  }
+
+  [data-ui-modal]:focus,
+  [data-ui-modal]:focus-visible,
+  [role='dialog']:focus-visible {
+    outline: none;
+  }
+
+  input:focus-visible,
+  textarea:focus-visible,
+  select:focus-visible {
+    outline: none;
+  }
+
+  ::selection {
+    background: rgb(var(--color-rust-500) / 0.28);
+  }
+}
+
+@layer components {
+  /* ---------- Form controls ---------- */
+  .ui-input {
+    @apply w-full h-8 rounded-lg border border-line bg-surface-raised px-2.5 text-[13px] text-ink placeholder:text-ink-faint transition-colors;
+    @apply focus:border-rust-500/70 focus:ring-[3px] focus:ring-rust-500/15;
+    @apply disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  textarea.ui-input {
+    @apply h-auto py-2 leading-relaxed;
+  }
+  select.ui-input {
+    @apply pr-7 appearance-none bg-no-repeat;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2378776F' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-position: right 0.55rem center;
+  }
+  .ui-label {
+    @apply block text-[12px] font-medium text-ink-muted mb-1;
+  }
+  .ui-hint {
+    @apply block text-[11.5px] text-ink-faint mt-1 leading-snug;
+  }
+
+  /* ---------- Buttons ---------- */
+  .ui-btn {
+    @apply inline-flex items-center justify-center gap-1.5 h-8 px-3 rounded-lg text-[13px] font-medium whitespace-nowrap transition-colors select-none;
+    @apply disabled:opacity-50 disabled:pointer-events-none;
+  }
+  .ui-btn-sm {
+    @apply h-7 px-2.5 text-[12px] rounded-md;
+  }
+  .ui-btn-primary {
+    @apply bg-rust-500 text-white hover:bg-rust-600 shadow-xs;
+  }
+  .ui-btn-secondary {
+    @apply bg-surface-raised text-ink border border-line-strong hover:bg-dark-650/60 shadow-xs;
+    @apply dark:bg-white/[0.06] dark:border-white/[0.12] dark:hover:bg-white/[0.10];
+  }
+  .ui-btn-ghost {
+    @apply text-ink-muted hover:text-ink hover:bg-dark-650/70;
+  }
+  .ui-btn-danger {
+    @apply bg-red-600 text-white hover:bg-red-700 shadow-xs;
+  }
+  .ui-icon-btn {
+    @apply inline-flex items-center justify-center w-8 h-8 rounded-lg text-ink-muted hover:text-ink hover:bg-dark-650/70 transition-colors disabled:opacity-40 disabled:pointer-events-none;
+  }
+  .ui-icon-btn-sm {
+    @apply w-7 h-7 rounded-md;
+  }
+
+  /* ---------- Surfaces ---------- */
+  .ui-card {
+    @apply rounded-xl border border-line bg-surface-raised;
+  }
+  .ui-menu {
+    @apply rounded-xl border border-line bg-surface-raised shadow-pop p-1 text-[13px] text-ink;
+  }
+  .ui-menu-item {
+    @apply w-full flex items-center gap-2.5 px-2.5 h-8 rounded-lg text-left text-ink hover:bg-dark-650/70 transition-colors;
+  }
+  .ui-menu-label {
+    @apply px-2.5 pt-2 pb-1 text-[11px] font-medium text-ink-faint;
+  }
+  .ui-menu-sep {
+    @apply my-1 h-px bg-line mx-1;
+  }
+  .ui-kbd {
+    @apply ml-auto text-[11px] text-ink-faint tabular-nums;
+  }
+}
+
+/* Thin, unobtrusive scrollbars */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 10px;
+  height: 10px;
 }
 
 ::-webkit-scrollbar-track {
-  background: var(--scrollbar-track);
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
   background: var(--scrollbar-thumb);
-  border-radius: 3px;
-  transition: background 0.15s ease;
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
 }
 
 ::-webkit-scrollbar-thumb:hover {
   background: var(--scrollbar-hover);
+  border: 3px solid transparent;
+  background-clip: content-box;
 }
 
-/* Shimmer animation for shadow/skeleton loading */
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Lightweight entrance animations (stand-ins for tailwindcss-animate class names used across the app) */
+@keyframes ui-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes ui-pop-in {
+  from { opacity: 0; transform: translateY(4px) scale(0.985); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.animate-in {
+  animation: ui-fade-in 120ms ease-out both;
+}
+
+.animate-in.zoom-in-95,
+.animate-pop {
+  animation: ui-pop-in 140ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-in,
+  .animate-pop,
+  .animate-pulse,
+  .animate-spin,
+  .animate-shimmer,
+  .animate-natural-wave-1,
+  .animate-natural-wave-2,
+  .animate-wave-glow {
+    animation: none !important;
+  }
+}
+
+/* Shimmer animation for skeleton loading */
 @keyframes shimmer {
   0% {
     background-position: -200% 0;
@@ -114,9 +294,9 @@
 .animate-shimmer {
   background: linear-gradient(
     90deg,
-    rgba(var(--color-dark-700), 0.4) 25%,
-    rgba(var(--color-dark-650), 0.8) 50%,
-    rgba(var(--color-dark-700), 0.4) 75%
+    rgb(var(--color-dark-700) / 0.5) 25%,
+    rgb(var(--color-dark-650) / 0.9) 50%,
+    rgb(var(--color-dark-700) / 0.5) 75%
   );
   background-size: 200% 100%;
   animation: shimmer 1.5s infinite linear;
@@ -150,7 +330,7 @@
   color: var(--token-variable);
 }
 
-/* Natural Transfer Wave Animations (GPU Accelerated 60fps) */
+/* Transfer wave animations (GPU accelerated) */
 @keyframes naturalWave1 {
   0% {
     transform: translate3d(0, 0, 0);
@@ -191,13 +371,3 @@
 .animate-wave-glow {
   animation: wavePulseGlow 2.5s ease-in-out infinite;
 }
-
-/* Global High-Contrast System Base */
-body {
-  color: #0f172a; /* text-slate-900 in Light Mode */
-}
-
-.dark body {
-  color: #f1f5f9; /* text-slate-100 in Dark Mode */
-}
-
