@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Tiago Becker <tiagobecker@users.noreply.github.com>"]
 license = "MIT OR Apache-2.0"
@@ -31,6 +31,18 @@ bytes = "1.10"
 sha2 = "0.10"
 regex = "1.11"
 tempfile = "3.17"
+
+# Key derivation of passphrase-protected PuTTY keys (Argon2) and of the OpenSSH copies
+# made for the system `ssh` client (bcrypt) runs in about 0.1 s optimized and many
+# times that unoptimized, so debug builds optimize these crates too.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+[profile.dev.package.bcrypt-pbkdf]
+opt-level = 3
+[profile.dev.package.blowfish]
+opt-level = 3
 
 [profile.release]
 opt-level = 3
