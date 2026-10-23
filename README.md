@@ -49,6 +49,7 @@ For more than two decades, **WinSCP** set the gold standard for dual-pane file m
 | **Remote Quick-Delete (`rm -rf`)** | **Yes (Safe fallback)** | Scripting only | ❌ Slow file-by-file | ❌ Slow file-by-file |
 | **Visual Unix Chmod Studio** | **Real-time Octal Matrix** | Basic | Basic | Basic |
 | **Built-in Remote Code Editor** | **Yes (`F4` with live save)** | External / Basic | External only | External only |
+| **Built-in SSH Terminal** | **Yes (background, history, assistant)** | PuTTY (separate app) | ❌ No | ❌ No |
 | **Smart Context Menu** | **Edge-aware 60 FPS** | Standard | Standard | Standard |
 
 ---
@@ -100,6 +101,16 @@ Unlike traditional tools that disconnect or force a second login prompt when run
 - **Dynamic Viewport Edge Mapping:** The right-click menu detects screen boundaries; flips upwards when near the bottom of the window, and opens submenus to the left when near the right edge.
 - **Visual Overflow Indicators:** Animated "More above" and "More below" indicators with smooth auto-scroll on click.
 - **Zero-Freeze Guarantee:** Isolated rendering lifecycle with global dismiss listeners (`Escape`, outside click backdrop, window blur).
+
+### 💻 8. Built-in Terminal (PuTTY-style, beginner-friendly)
+- **Real interactive shell** (`xterm-256color` PTY) on an SSH connection of its own, so long commands never compete with transfers. Output streams as it arrives; `top`, `nano`, `vim` and colors work.
+- **Keeps running in the background:** hide the panel (`` Ctrl+` ``) and the terminals keep going. A slim bar shows each one's state, and a notification (with **Show**) tells you when a command finishes, fails, or waits for an answer (`[Y/n]`, a `sudo` password).
+- **Local command history** that survives logging out of the server: every command (with its exit status, duration and folder) is saved on this computer in a private file, searchable per server. Commands typed with a leading space are not saved, as in bash.
+- **Copy & paste that is easy to see:** select to copy (with a "Copied" confirmation), a right-click menu (copy, paste, copy the last command's output, save the output to a file, find), PuTTY's right-click-paste as an option, and a warning before pasting several lines at once.
+- **Command assistant for people new to Linux:** describe the task ("disk space", "restart nginx") to get the right command, see what every option of a command does before running it, a second look before destructive commands (`rm -rf /`, `mkfs`, `chmod -R 777`...), ready-made commands by task (adapted to `apt`/`dnf`/`apk`...), and plain-language hints when a command fails ("not installed: install it", "needs sudo: retry with sudo").
+- Command reporting needs bash on the server (the usual login shell on Linux); other shells get the terminal, the assistant and the history of what is run from the assistant.
+
+**Open in system terminal** starts Terminal.app (macOS), Windows Terminal/`ssh.exe` or a Linux terminal already logged in like the site: keys that `ssh` would refuse (a key downloaded from a cloud console such as Oracle OCI, readable by other users) are used through a private copy, the server's known host key is shared with `ssh`, and a saved password or key passphrase is handed to `ssh` once through a one-shot local socket (macOS/Linux, OpenSSH 8.4+), never written to disk.
 
 ---
 
@@ -155,6 +166,9 @@ graph TD
 | **Permanent Delete** | `⌥ + ⌘ + ⌫` | `Shift + Delete` or `Shift + F8` |
 | **Properties & Chmod** | `Alt + Enter` / `⌘ + I` | `Alt + Enter` |
 | **Quick Terminal Command** | `Ctrl + R` | `Ctrl + R` |
+| **Show / Hide Terminals** | `` Ctrl + ` `` | `` Ctrl + ` `` |
+| **New Terminal** | `` Ctrl + Shift + ` `` | `` Ctrl + Shift + ` `` |
+| **Copy / Paste in Terminal** | `⌘ + C` / `⌘ + V` (or select to copy) | `Ctrl + Shift + C` / `Ctrl + V` |
 | **Navigate Up Directory** | `⌘ + ↑` | `Alt + ↑` |
 | **Save in Editor** | `⌘ + S` | `Ctrl + S` |
 | **Close Dialog / Menu** | `Escape` | `Escape` |

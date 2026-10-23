@@ -210,7 +210,7 @@
     "editorCommand": "Comando do editor",
     "externalEditorHelp": "Comando usado em “Abrir no editor externo”. Deixe vazio para usar o padrão do sistema.",
     "nativeTerminal": "Terminal do sistema",
-    "nativeTerminalHelp": "“Abrir no Terminal do sistema” abre o terminal do seu SO com a sessão SSH e a pasta atuais.",
+    "nativeTerminalHelp": "“Abrir no Terminal do sistema” abre o terminal do seu SO já conectado na sessão SSH e na pasta atuais, com a chave ou a senha salva do site. O terminal integrado (Ctrl+`) tem as opções no ⚙ do próprio painel.",
     "done": "OK",
     "preferExternalEditor": "Abrir arquivos no editor externo",
     "preferExternalEditorDesc": "Editar, F4 e clique duplo usam o editor externo em vez do integrado."
@@ -368,6 +368,8 @@
     "syncAssistant": "Sincronizar…",
     "keepUpToDate": "Manter remoto atualizado",
     "terminal": "Terminal",
+    "newTerminal": "Novo terminal",
+    "showTerminals": "Mostrar terminais",
     "nativeTerminal": "Abrir no Terminal do sistema",
     "remoteShell": "Executar comando remoto…",
     "scriptConsole": "Console de scripts",

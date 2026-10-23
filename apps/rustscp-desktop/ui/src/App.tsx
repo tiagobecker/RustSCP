@@ -51,6 +51,8 @@ import { inDir } from './utils/shell.ts';
 import { useRefState } from './utils/useRefState.ts';
 import { useStableHandlers } from './utils/useStableHandlers.ts';
 import { invoke, isTauri } from '@tauri-apps/api/core';
+import { TerminalDock } from './components/terminal/TerminalDock.tsx';
+import { initTerminalStore, openTerminal, setDockOpen, toggleDock, useTerminalBadge } from './components/terminal/terminalStore.ts';
 import { listen } from '@tauri-apps/api/event';
 import type { ShareSource } from './components/ShareConnectionModal.tsx';
 import type { ShareFile } from './components/OpenShareModal.tsx';
@@ -1555,10 +1557,46 @@ export const App: React.FC = () => {
     }
   };
 
+  /** Built-in terminal on the SSH server of `pane` (the focused SSH pane by default), in `path`. */
+  const openBuiltinTerminal = (pane?: PaneId, path?: string, sessionId?: string) => {
+    const p = pickPane('shell', pane);
+    const sid = sessionId ?? panes[p].activeRef.current;
+    if (!hasShell(sid)) {
+      notify.info(
+        isRemoteSession(sid) ? tr('Esta conexão não oferece um shell', 'This connection has no shell') : tr('Conecte-se a um servidor SSH primeiro', 'Connect to an SSH server first'),
+        tr('O terminal integrado abre um shell em um servidor SSH (SFTP).', 'The built-in terminal opens a shell on an SSH (SFTP) server.')
+      );
+      return;
+    }
+    const cfg = sessionById(sid)?.config;
+    void openTerminal({
+      sessionId: sid,
+      path: path ?? (panes[p].activeRef.current === sid ? panes[p].pathRef.current : rememberedPath(p, sid)),
+      title: cfg?.name || (cfg ? `${cfg.username}@${cfg.host}` : tr('Servidor', 'Server')),
+      host: cfg?.host,
+      username: cfg?.username,
+    });
+  };
+
+  /** Shows a server folder (a terminal's current folder) in the file pane that has that session. */
+  const showRemoteFolder = (sid: string, path: string) => {
+    if (!sessionById(sid)) {
+      notify.info(tr('Esta conexão foi fechada nos arquivos', 'This connection was closed in the file panes'), tr('Conecte-se de novo para ver a pasta.', 'Connect again to see the folder.'));
+      return;
+    }
+    const f = focusedPaneRef.current;
+    const pane = panes[f].idsRef.current.includes(sid) ? f : isDualPane && panes[otherPane(f)].idsRef.current.includes(sid) ? otherPane(f) : f;
+    const api = panes[pane];
+    if (!api.idsRef.current.includes(sid)) api.setIds([...api.idsRef.current, sid]);
+    switchPaneSession(pane, sid);
+    setFocusedPane(pane);
+    void loadPane(pane, path, sid);
+  };
+
   const handleOpenTerminalHere = (path: string, isRemote: boolean, sessionId?: string, pane?: PaneId) => {
     const sid = sessionForPane(sessionId, pane);
     if (isRemote && isRemoteSession(sid)) {
-      openRemoteCommand(pane, path);
+      openBuiltinTerminal(pane, path, sid);
     } else {
       handleOpenNativeTerminal(path, false, sid, pane);
     }
@@ -2350,6 +2388,11 @@ export const App: React.FC = () => {
 
   // .rustscp files the OS hands over (double-click, Open With, a second launch), also the one
   // that started the app: queued by the backend until this window takes them.
+  // Built-in terminals run in the backend; their events are followed from the start.
+  useEffect(() => {
+    void initTerminalStore();
+  }, []);
+
   useEffect(() => {
     if (!isTauri()) return;
     let disposed = false;
@@ -2433,6 +2476,15 @@ export const App: React.FC = () => {
   globalKeyRef.current = (e: KeyboardEvent) => {
     const mod = e.metaKey || e.ctrlKey;
     const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    // Ctrl+` shows/hides the terminals (they keep running), Ctrl+Shift+` opens a new one.
+    if (e.ctrlKey && !e.metaKey && !e.altKey && e.code === 'Backquote') {
+      if (anyModalOpen || isPaletteOpen) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.shiftKey) openBuiltinTerminal();
+      else toggleDock();
+      return;
+    }
     if (mod && !e.shiftKey && !e.altKey && key === 'k') {
       if (isPaletteOpen || !anyModalOpen) {
         e.preventDefault();
@@ -2632,6 +2684,11 @@ export const App: React.FC = () => {
         toggleSyncBrowsing: () => setSyncBrowsing((v) => !v),
         toggleContinuousSync: handleToggleContinuousSync,
         openNativeTerminal: () => handleOpenNativeTerminal(focusedCtx.path, focusedCtx.isRemote, focusedCtx.sessionId, focusedPane),
+        openTerminal: () => openBuiltinTerminal(),
+        toggleTerminals: () => {
+          if (terminalBadge.count === 0) openBuiltinTerminal();
+          else toggleDock();
+        },
         openRemoteCommand: () => openRemoteCommand(),
         openScriptConsole: () => openScriptConsole(),
         openFindFiles: () => openFindFiles(),
@@ -2663,6 +2720,7 @@ export const App: React.FC = () => {
     [isPaletteOpen, isPt, syncBrowsing, continuousSync, isDualPane]
   );
   const activeTransferCount = queueTasks.filter((t) => t.status === 'in_progress').length;
+  const terminalBadge = useTerminalBadge();
   const totalSpeedBps = queueTasks.filter((t) => t.status === 'in_progress').reduce((acc, t) => acc + (t.speed_bps || 0), 0);
 
   return (
@@ -2682,6 +2740,9 @@ export const App: React.FC = () => {
           onOpenMarketplace={() => openMarketplace()}
           onOpenTrash={() => openTrash()}
           onOpenNativeTerminal={() => handleOpenNativeTerminal(focusedCtx.path, focusedCtx.isRemote, focusedCtx.sessionId, focusedPane)}
+          onNewTerminal={() => openBuiltinTerminal()}
+          onShowTerminals={() => setDockOpen(true)}
+          terminalBadge={terminalBadge}
           onOpenSettings={() => setIsSettingsOpen(true)}
           onOpenCommandPalette={() => setIsPaletteOpen(true)}
           onOpenAbout={() => setIsAboutOpen(true)}
@@ -2795,6 +2856,22 @@ export const App: React.FC = () => {
         localHomePath={localHome}
         onOpenLocalFolder={dp.openLocalFolder}
       />
+
+      {/* Built-in terminals: keep running when hidden; a slim bar shows their state */}
+      <ErrorBoundary scope="section" fallbackTitle={tr('Terminais', 'Terminals')}>
+        <TerminalDock
+          isPt={isPt}
+          onNewTerminal={hasShell(panes[pickPane('shell')].activeRef.current) ? () => openBuiltinTerminal() : null}
+          onOpenFolder={showRemoteFolder}
+          onOpenNative={(sid, path) => {
+            if (!sessionById(sid)) {
+              notify.info(tr('Esta conexão foi fechada nos arquivos', 'This connection was closed in the file panes'), tr('Conecte-se de novo para abrir no terminal do sistema.', 'Connect again to open it in the system terminal.'));
+              return;
+            }
+            void handleOpenNativeTerminal(path, true, sid);
+          }}
+        />
+      </ErrorBoundary>
 
       {/* Transfer queue drawer */}
       <ErrorBoundary scope="section" fallbackTitle={tr('Transferências', 'Transfers')}>

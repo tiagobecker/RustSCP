@@ -1,10 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod askpass;
 mod commands;
 mod sharing;
+mod terminal;
 
 use commands::*;
 use sharing::*;
+use terminal::*;
 
 #[cfg(target_os = "macos")]
 fn setup_macos_dock_icon() {
@@ -54,6 +57,13 @@ fn disable_macos_text_substitutions() {
 }
 
 fn main() {
+    // ssh runs RustSCP as its SSH_ASKPASS program for "Open in system terminal": answer
+    // its question and exit before anything else starts (see `askpass`).
+    if let Some(spec) = std::env::var_os(askpass::ASKPASS_ENV) {
+        let prompt = std::env::args().nth(1).unwrap_or_default();
+        std::process::exit(askpass::run_helper(&spec.to_string_lossy(), &prompt));
+    }
+
     // `rustscp-desktop --mcp-stdio`: the MCP server AI agents launch. It never opens a
     // window; it forwards tool calls to the RustSCP app that is already running.
     if std::env::args_os().skip(1).any(|arg| arg == MCP_STDIO_FLAG) {
@@ -97,6 +107,7 @@ fn main() {
         })
         .manage(AppState::new())
         .manage(SharingState::default())
+        .manage(TerminalState::default())
         .invoke_handler(tauri::generate_handler![
             connect_session,
             disconnect_session,
@@ -175,6 +186,19 @@ fn main() {
             accept_connection_share,
             discard_connection_share,
             take_pending_share_files,
+            terminal_open,
+            terminal_write,
+            terminal_run,
+            terminal_resize,
+            terminal_close,
+            terminal_reconnect,
+            terminal_list,
+            terminal_snapshot,
+            terminal_history,
+            terminal_history_delete,
+            terminal_history_clear,
+            clipboard_read_text,
+            open_external_url,
         ])
         .build(tauri::generate_context!())
         .expect("error while building RustSCP desktop application")

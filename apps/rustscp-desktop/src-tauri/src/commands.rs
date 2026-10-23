@@ -502,7 +502,7 @@ fn register_sftp_driver(driver: &Arc<SftpDriver>) {
     drivers.push(Arc::downgrade(driver));
 }
 
-fn sftp_driver_of(vfs: &Arc<dyn VirtualFileSystem>) -> Option<Arc<SftpDriver>> {
+pub(crate) fn sftp_driver_of(vfs: &Arc<dyn VirtualFileSystem>) -> Option<Arc<SftpDriver>> {
     let target = Arc::as_ptr(vfs) as *const ();
     let drivers = SFTP_DRIVERS
         .lock()
@@ -725,7 +725,10 @@ impl AppState {
 /// Clones the session's driver out of the registry. The global `active_sessions` guard is
 /// released before the caller does any I/O, so a slow listing, transfer or command never
 /// makes `connect_session` / `disconnect_session` (writers) and every later reader wait.
-async fn get_vfs(state: &AppState, session_id: &str) -> Result<Arc<dyn VirtualFileSystem>, String> {
+pub(crate) async fn get_vfs(
+    state: &AppState,
+    session_id: &str,
+) -> Result<Arc<dyn VirtualFileSystem>, String> {
     state
         .active_sessions
         .read()
@@ -5215,12 +5218,39 @@ fn validate_ssh_destination(host: &str, username: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Value of ssh's `UserKnownHostsFile` option for `files`: RustSCP's known_hosts first
+/// (it holds the host keys RustSCP trusted, and ssh records a key the user accepts there),
+/// then the user's own, so the terminal does not ask again about a server RustSCP already
+/// knows. ssh splits the value on spaces and reads `\` as an escape: paths with spaces are
+/// quoted, Windows paths use `/`, and a path ssh could not read back is left out.
+pub(crate) fn ssh_known_hosts_option(files: &[std::path::PathBuf]) -> Option<String> {
+    let parts: Vec<String> = files
+        .iter()
+        .filter_map(|f| {
+            let p = f.to_string_lossy().replace('\\', "/");
+            if p.is_empty() || p.contains('"') || has_control_chars(&p) {
+                return None;
+            }
+            Some(if p.contains([' ', '\'']) {
+                format!("\"{p}\"")
+            } else {
+                p
+            })
+        })
+        .collect();
+    (!parts.is_empty()).then(|| format!("UserKnownHostsFile={}", parts.join(" ")))
+}
+
 /// `ssh` arguments that open an interactive shell in `remote_path` on the session's
-/// server. They are always passed as an argument vector (or quoted one by one with
-/// [`sh_quote`]); `--` ends ssh's own options so the destination can never be one.
+/// server, logging in the way the site does: its key file only (an agent full of other
+/// keys would otherwise use up the server's attempts first), or straight to the password
+/// prompt for password sites. They are always passed as an argument vector (or quoted one
+/// by one with [`sh_quote`]); `--` ends ssh's own options so the destination can never be
+/// one.
 pub(crate) fn ssh_terminal_args(
     cfg: &ConnectionConfig,
     remote_path: &str,
+    known_hosts: &[std::path::PathBuf],
 ) -> Result<Vec<String>, String> {
     let raw_host = cfg.host.trim();
     let host = raw_host
@@ -5232,15 +5262,33 @@ pub(crate) fn ssh_terminal_args(
 
     let port = if cfg.port == 0 { 22 } else { cfg.port };
     let mut args = vec!["-p".to_string(), port.to_string()];
-    if let rustscp_core::AuthMethod::PrivateKey { path, .. } = &cfg.auth {
-        let key = path.trim();
-        if !key.is_empty() {
-            if has_control_chars(key) {
-                return Err("Invalid private key path".to_string());
+    // Notice a dead connection (sleeping laptop, NAT timeout) instead of hanging.
+    for opt in ["ServerAliveInterval=30", "ServerAliveCountMax=4"] {
+        args.push("-o".to_string());
+        args.push(opt.to_string());
+    }
+    if let Some(opt) = ssh_known_hosts_option(known_hosts) {
+        args.push("-o".to_string());
+        args.push(opt);
+    }
+    match &cfg.auth {
+        rustscp_core::AuthMethod::PrivateKey { path, .. } => {
+            let key = path.trim();
+            if !key.is_empty() {
+                if has_control_chars(key) {
+                    return Err("Invalid private key path".to_string());
+                }
+                args.push("-i".to_string());
+                args.push(key.to_string());
+                args.push("-o".to_string());
+                args.push("IdentitiesOnly=yes".to_string());
             }
-            args.push("-i".to_string());
-            args.push(key.to_string());
         }
+        rustscp_core::AuthMethod::Password(_) => {
+            args.push("-o".to_string());
+            args.push("PreferredAuthentications=keyboard-interactive,password".to_string());
+        }
+        _ => {}
     }
     args.push("-t".to_string());
     args.push("--".to_string());
@@ -5256,7 +5304,9 @@ pub(crate) fn ssh_terminal_args(
 /// `cfg` with its PuTTY (`.ppk`) key, if it has one, swapped for an OpenSSH copy saved in
 /// `keys_dir`: the system `ssh` client only reads OpenSSH keys. The copy is encrypted with
 /// the key's passphrase when the original is, so ssh asks for that passphrase as usual.
-/// A key embedded in the site (received in a share) is saved there the same way.
+/// A key embedded in the site (received in a share) is saved there the same way, and so
+/// is a key file ssh would refuse as it is (readable by other users, as keys downloaded
+/// from a cloud console such as Oracle OCI usually are, or with Windows line ends).
 fn terminal_ssh_config(
     mut cfg: ConnectionConfig,
     keys_dir: &std::path::Path,
@@ -5282,16 +5332,71 @@ fn terminal_ssh_config(
                     format!("Could not use the PuTTY key {}: {}", key_path.display(), e)
                 })?;
             *path = copy.to_string_lossy().into_owned();
+        } else if let Some(copy) = embedded_key::private_copy_for_ssh(&key_path, keys_dir)
+            .map_err(|e| format!("Could not use the key {}: {}", key_path.display(), e))?
+        {
+            *path = copy.to_string_lossy().into_owned();
+        } else if !path.trim().is_empty() {
+            *path = key_path.to_string_lossy().into_owned();
         }
     }
     Ok(cfg)
 }
 
-/// Writes a private (0600), self-deleting `/bin/sh` script that runs `ssh <args>`.
-/// Terminal.app then only types `/bin/sh '<script>'` into the user's shell, so remote
-/// data is never parsed by that shell (which may be zsh, bash or fish).
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn write_ssh_launcher_script(ssh_args: &[String]) -> Result<std::path::PathBuf, String> {
+/// The saved secret ssh will ask for when it logs in like the site: its password, or
+/// the passphrase of its key.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn askpass_secret(cfg: &ConnectionConfig) -> Option<(String, crate::askpass::SecretKind)> {
+    use crate::askpass::SecretKind;
+    match &cfg.auth {
+        rustscp_core::AuthMethod::Password(p) if !p.is_empty() => {
+            Some((p.clone(), SecretKind::Password))
+        }
+        rustscp_core::AuthMethod::PrivateKey {
+            passphrase: Some(p),
+            ..
+        } if !p.is_empty() => Some((p.clone(), SecretKind::Passphrase)),
+        _ => None,
+    }
+}
+
+/// Environment for the ssh process that lets it fetch `secret` from RustSCP once (see
+/// [`crate::askpass`]); empty when there is nothing to hand over.
+#[cfg(unix)]
+fn askpass_env(
+    secret: Option<(String, crate::askpass::SecretKind)>,
+) -> Vec<(&'static str, String)> {
+    let Some((secret, kind)) = secret else {
+        return Vec::new();
+    };
+    let Ok(exe) = std::env::current_exe() else {
+        return Vec::new();
+    };
+    match crate::askpass::serve_secret(secret, kind) {
+        Ok(spec) => vec![
+            (crate::askpass::ASKPASS_ENV, spec),
+            ("SSH_ASKPASS", exe.to_string_lossy().into_owned()),
+            ("SSH_ASKPASS_REQUIRE", "force".to_string()),
+        ],
+        Err(e) => {
+            tracing::warn!("the terminal will ask for the password itself: {}", e);
+            Vec::new()
+        }
+    }
+}
+
+/// Writes a private (0700), self-deleting `/bin/sh` script that runs `ssh <args>` with
+/// `env` set for ssh alone, puts `title` in the window title and explains a failed
+/// connection. The terminal only runs this file, so remote data is never parsed by the
+/// user's own shell (which may be zsh, bash or fish). `extension` is `command` for
+/// Terminal.app, which runs such files when it opens them.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+fn write_ssh_launcher_script(
+    ssh_args: &[String],
+    env: &[(&str, String)],
+    title: &str,
+    extension: &str,
+) -> Result<std::path::PathBuf, String> {
     use std::io::Write;
 
     let mut dir = std::env::temp_dir();
@@ -5302,15 +5407,34 @@ fn write_ssh_launcher_script(ssh_args: &[String]) -> Result<std::path::PathBuf, 
     if !dir_is_plain {
         dir = std::path::PathBuf::from("/tmp");
     }
-    let path = dir.join(format!("rustscp-ssh-{}.sh", uuid::Uuid::new_v4().simple()));
-    let script = format!("#!/bin/sh\nrm -f -- \"$0\"\nssh {}\n", sh_join(ssh_args));
+    let path = dir.join(format!(
+        "rustscp-ssh-{}.{extension}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let assignments: String = env
+        .iter()
+        .map(|(name, value)| format!("{name}={} ", sh_quote(value)))
+        .collect();
+    let script = format!(
+        "#!/bin/sh\n\
+         rm -f -- \"$0\"\n\
+         printf '\\033]0;%s\\007' {title}\n\
+         {assignments}ssh {args}\n\
+         status=$?\n\
+         if [ \"$status\" -eq 255 ]; then\n\
+         printf '\\n%s\\n' 'RustSCP: the SSH connection failed; see the message above.'\n\
+         fi\n\
+         exit \"$status\"\n",
+        title = sh_quote(title),
+        args = sh_join(ssh_args),
+    );
 
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(0o700);
     }
     let mut file = options
         .open(&path)
@@ -5430,13 +5554,26 @@ pub async fn open_native_terminal(
         .get(&session_id)
         .cloned()
         .ok_or_else(|| format!("Session config for '{}' not found", session_id))?;
+    let secret = askpass_secret(&cfg);
     // Converting a PuTTY key runs its key derivation (Argon2, bcrypt): off the async runtime.
     let cfg = tokio::task::spawn_blocking(move || {
         terminal_ssh_config(cfg, &get_rustscp_config_dir().join("openssh-keys"))
     })
     .await
     .map_err(|e| e.to_string())??;
-    let mut ssh_args = ssh_terminal_args(&cfg, &path)?;
+    let store = rustscp_core::known_hosts::HostKeyStore::for_current_user();
+    let known_hosts: Vec<std::path::PathBuf> = std::iter::once(store.app_file)
+        .chain(store.read_only_files)
+        .collect();
+    let mut ssh_args = ssh_terminal_args(&cfg, &path, &known_hosts)?;
+    let title = format!(
+        "RustSCP: {}",
+        if cfg.name.trim().is_empty() {
+            format!("{}@{}", cfg.username.trim(), cfg.host.trim())
+        } else {
+            cfg.name.trim().to_string()
+        }
+    );
     // The `cd '<path>'` command is parsed by the server's login shell. When that shell
     // does not quote like `sh` (fish, cmd.exe, PowerShell), open a plain login shell in
     // the home folder instead of letting it parse the folder name.
@@ -5446,7 +5583,22 @@ pub async fn open_native_terminal(
 
     #[cfg(target_os = "macos")]
     {
-        let launcher = write_ssh_launcher_script(&ssh_args)?;
+        let launcher =
+            write_ssh_launcher_script(&ssh_args, &askpass_env(secret), &title, "command")?;
+        // `open` hands the script to Terminal.app like a double-clicked .command file, so
+        // no AppleScript permission ("RustSCP wants to control Terminal") is involved.
+        // AppleScript stays as the fallback.
+        if let Ok(out) = tokio::process::Command::new("open")
+            .arg("-a")
+            .arg("Terminal")
+            .arg(&launcher)
+            .output()
+            .await
+        {
+            if out.status.success() {
+                return Ok("Opened SSH in macOS Terminal.app".to_string());
+            }
+        }
         let typed_command = format!("/bin/sh {}", sh_quote(&launcher.to_string_lossy()));
         let output = tokio::process::Command::new("osascript")
             .arg("-e")
@@ -5473,6 +5625,8 @@ pub async fn open_native_terminal(
     #[cfg(target_os = "windows")]
     {
         const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        // ssh.exe asks for the password in its console window itself.
+        let _ = (secret, title);
         // ssh.exe gets a real argument vector in its own console window; neither cmd.exe
         // nor wt.exe re-parses the remote path, user or key path.
         tokio::process::Command::new("ssh.exe")
@@ -5490,6 +5644,8 @@ pub async fn open_native_terminal(
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
+        let launcher = write_ssh_launcher_script(&ssh_args, &askpass_env(secret), &title, "sh")?;
+        let launcher_args = vec![launcher.to_string_lossy().into_owned()];
         for term in &[
             "x-terminal-emulator",
             "gnome-terminal",
@@ -5500,13 +5656,14 @@ pub async fn open_native_terminal(
             "xterm",
         ] {
             if tokio::process::Command::new(term)
-                .args(linux_terminal_exec_args(term, "ssh", &ssh_args))
+                .args(linux_terminal_exec_args(term, "/bin/sh", &launcher_args))
                 .spawn()
                 .is_ok()
             {
                 return Ok(format!("Opened SSH in {}", term));
             }
         }
+        let _ = std::fs::remove_file(&launcher);
         return Err("No supported terminal emulator found".to_string());
     }
 }
@@ -6864,13 +7021,18 @@ mod security_tests {
         assert!(std::fs::read_to_string(&copy)
             .unwrap()
             .starts_with("-----BEGIN OPENSSH PRIVATE KEY-----\n"));
-        assert!(ssh_terminal_args(&converted, "/")
+        assert!(ssh_terminal_args(&converted, "/", &[])
             .unwrap()
             .contains(&copy.to_string_lossy().into_owned()));
 
-        // OpenSSH keys and password sites are left alone.
+        // Private OpenSSH keys and password sites are left alone.
         let openssh = dir.path().join("id_ed25519");
         std::fs::write(&openssh, "-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&openssh, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let cfg = site(
             "s2",
             AuthMethod::PrivateKey {
@@ -6915,22 +7077,28 @@ mod security_tests {
             },
         );
         cfg.port = 2222;
-        let args = ssh_terminal_args(&cfg, "/srv/$(touch PWNED)\"x'").unwrap();
+        let args = ssh_terminal_args(&cfg, "/srv/$(touch PWNED)\"x'", &[]).unwrap();
         assert_eq!(
-            &args[..7],
+            &args[..13],
             &[
                 "-p",
                 "2222",
+                "-o",
+                "ServerAliveInterval=30",
+                "-o",
+                "ServerAliveCountMax=4",
                 "-i",
                 "/Users/me/keys/my key",
+                "-o",
+                "IdentitiesOnly=yes",
                 "-t",
                 "--",
                 "deploy@example.com"
             ]
         );
-        assert_eq!(args.len(), 8);
+        assert_eq!(args.len(), 14);
         assert_eq!(
-            args[7],
+            args[13],
             format!(
                 "cd {} 2>/dev/null || cd; exec \"$SHELL\" -l",
                 sh_quote("/srv/$(touch PWNED)\"x'")
@@ -6938,18 +7106,121 @@ mod security_tests {
         );
 
         cfg.username = "-oProxyCommand=calc".to_string();
-        assert!(ssh_terminal_args(&cfg, "/").is_err());
+        assert!(ssh_terminal_args(&cfg, "/", &[]).is_err());
         cfg.username = "deploy".to_string();
         cfg.host = "srv; rm -rf ~".to_string();
-        assert!(ssh_terminal_args(&cfg, "/").is_err());
+        assert!(ssh_terminal_args(&cfg, "/", &[]).is_err());
         cfg.host = "-oProxyCommand=calc".to_string();
-        assert!(ssh_terminal_args(&cfg, "/").is_err());
+        assert!(ssh_terminal_args(&cfg, "/", &[]).is_err());
         cfg.host = "[fe80::1%en0]".to_string();
-        let args = ssh_terminal_args(&cfg, "").unwrap();
+        let args = ssh_terminal_args(&cfg, "", &[]).unwrap();
         assert!(args.contains(&"deploy@fe80::1%en0".to_string()));
         assert_eq!(
             args.last().unwrap(),
             "cd 2>/dev/null || cd; exec \"$SHELL\" -l"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_ssh_config_copies_keys_other_users_can_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = ScratchDir::new("open-key");
+        let keys_dir = dir.path().join("openssh-keys");
+        // As downloaded from the Oracle Cloud console: PKCS#8, readable by everyone.
+        let key = dir.path().join("ssh-key-2026-10-23.key");
+        let pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----\n";
+        std::fs::write(&key, pem).unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let cfg = site(
+            "oci",
+            AuthMethod::PrivateKey {
+                path: key.to_string_lossy().into_owned(),
+                passphrase: None,
+                key_data: None,
+            },
+        );
+        let converted = terminal_ssh_config(cfg, &keys_dir).unwrap();
+        let copy = match &converted.auth {
+            AuthMethod::PrivateKey { path, .. } => std::path::PathBuf::from(path),
+            other => panic!("{other:?}"),
+        };
+        assert!(copy.starts_with(&keys_dir));
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), pem);
+        let mode = std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // The original is not touched.
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+    }
+
+    #[test]
+    fn ssh_terminal_args_log_in_like_the_site() {
+        let mut cfg = site("s1", AuthMethod::Password("pw".into()));
+        let known = vec![
+            std::path::PathBuf::from("/Users/me/Library/Application Support/rustscp/known_hosts"),
+            std::path::PathBuf::from("/Users/me/.ssh/known_hosts"),
+            std::path::PathBuf::from("/odd/\"quote"),
+        ];
+        let args = ssh_terminal_args(&cfg, "/", &known).unwrap();
+        let options: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "-o")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert!(options.contains(
+            &"UserKnownHostsFile=\"/Users/me/Library/Application Support/rustscp/known_hosts\" /Users/me/.ssh/known_hosts"
+        ));
+        assert!(options.contains(&"PreferredAuthentications=keyboard-interactive,password"));
+        assert!(!args.contains(&"-i".to_string()));
+
+        // Agent sites keep ssh's defaults.
+        cfg.auth = AuthMethod::None;
+        let args = ssh_terminal_args(&cfg, "/", &[]).unwrap();
+        assert!(!args
+            .iter()
+            .any(|a| a.starts_with("Preferred") || a.starts_with("Identities")));
+        assert_eq!(
+            ssh_known_hosts_option(&[std::path::PathBuf::from(
+                r"C:\Users\me\AppData\Roaming\RustSCP\known_hosts"
+            )]),
+            Some("UserKnownHostsFile=C:/Users/me/AppData/Roaming/RustSCP/known_hosts".to_string())
+        );
+        assert_eq!(ssh_known_hosts_option(&[]), None);
+    }
+
+    #[test]
+    fn askpass_hands_over_the_secret_ssh_will_ask_for() {
+        use crate::askpass::SecretKind;
+        let cfg = site("s1", AuthMethod::Password("pw".into()));
+        assert_eq!(
+            askpass_secret(&cfg),
+            Some(("pw".to_string(), SecretKind::Password))
+        );
+        let cfg = site(
+            "s2",
+            AuthMethod::PrivateKey {
+                path: "/k".into(),
+                passphrase: Some("pp".into()),
+                key_data: None,
+            },
+        );
+        assert_eq!(
+            askpass_secret(&cfg),
+            Some(("pp".to_string(), SecretKind::Passphrase))
+        );
+        let cfg = site(
+            "s3",
+            AuthMethod::PrivateKey {
+                path: "/k".into(),
+                passphrase: None,
+                key_data: None,
+            },
+        );
+        assert_eq!(askpass_secret(&cfg), None);
+        assert_eq!(
+            askpass_secret(&site("s4", AuthMethod::Password(String::new()))),
+            None
         );
     }
 
@@ -7013,13 +7284,60 @@ mod security_tests {
             "u@h".into(),
             remote_terminal_command("/srv/a'b $(id)"),
         ];
-        let path = write_ssh_launcher_script(&args).unwrap();
+        let env = [("SSH_ASKPASS", "/Applications/Rust SCP.app/x".to_string())];
+        let path = write_ssh_launcher_script(&args, &env, "RustSCP: it's me", "command").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         let contents = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        assert_eq!(mode, 0o600);
-        let ssh_line = contents.lines().nth(2).unwrap();
-        assert_eq!(ssh_line, format!("ssh {}", sh_join(&args)));
+        assert_eq!(mode, 0o700);
+        assert!(path.extension().is_some_and(|e| e == "command"));
+        let ssh_line = contents.lines().nth(3).unwrap();
+        assert_eq!(
+            ssh_line,
+            format!(
+                "SSH_ASKPASS='/Applications/Rust SCP.app/x' ssh {}",
+                sh_join(&args)
+            )
+        );
+        assert!(contents.contains("printf '\\033]0;%s\\007' 'RustSCP: it'\\''s me'\n"));
+    }
+
+    /// The launcher runs ssh with the environment and argv it was given, deletes itself
+    /// and passes ssh's exit status on.
+    #[cfg(unix)]
+    #[test]
+    fn ssh_launcher_script_runs_ssh_and_cleans_up() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = ScratchDir::new("launcher");
+        let fake_ssh = dir.path().join("ssh");
+        std::fs::write(
+            &fake_ssh,
+            "#!/bin/sh\nprintf '%s|' \"$RUSTSCP_ASKPASS\" \"$@\" > \"$OUT\"\nexit 255\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out_file = dir.path().join("out");
+        let args = vec![
+            "-p".to_string(),
+            "22".to_string(),
+            "u@h".to_string(),
+            "a b'$(id)".to_string(),
+        ];
+        let env = [(crate::askpass::ASKPASS_ENV, "password:/tmp/s".to_string())];
+        let launcher = write_ssh_launcher_script(&args, &env, "t", "sh").unwrap();
+        let status = std::process::Command::new("/bin/sh")
+            .arg(&launcher)
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+            .env("OUT", &out_file)
+            .output()
+            .unwrap();
+        assert_eq!(status.status.code(), Some(255));
+        assert!(String::from_utf8_lossy(&status.stdout).contains("the SSH connection failed"));
+        assert!(!launcher.exists());
+        assert_eq!(
+            std::fs::read_to_string(&out_file).unwrap(),
+            "password:/tmp/s|-p|22|u@h|a b'$(id)|"
+        );
     }
 
     #[test]

@@ -24,6 +24,9 @@ hex = "0.4.3"
 uuid.workspace = true
 sha2.workspace = true
 chrono.workspace = true
+zeroize = "1"
+# "Paste" in the terminal's menu (the WebView cannot read the clipboard on its own).
+arboard = { version = "3", default-features = false }
 
 [dev-dependencies]
 tempfile = { workspace = true }

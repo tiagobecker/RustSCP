@@ -25,6 +25,8 @@ import {
   ListChecks,
   Share2,
   FileKey2,
+  SquareTerminal,
+  PanelBottom,
 } from 'lucide-react';
 import type { PaletteCommand } from './components/CommandPalette.tsx';
 import type { ThemeMode } from './theme.ts';
@@ -38,6 +40,8 @@ export interface PaletteActions {
   toggleSyncBrowsing: () => void;
   toggleContinuousSync: () => void;
   openNativeTerminal: () => void;
+  openTerminal: () => void;
+  toggleTerminals: () => void;
   openRemoteCommand: () => void;
   openScriptConsole: () => void;
   openFindFiles: () => void;
@@ -88,6 +92,8 @@ export function buildPaletteCommands(a: PaletteActions, isPt: boolean): PaletteC
     { id: 'sync-browse', group: g.sync, label: L('Navegação sincronizada', 'Synchronized browsing') + on(a.syncBrowsing), icon: <Link className={ic} />, keywords: 'toggle', run: a.toggleSyncBrowsing },
     { id: 'live-sync', group: g.sync, label: L('Manter remoto atualizado', 'Keep remote up to date') + on(a.continuousSync), icon: <Zap className={ic} />, keywords: 'continuous live watch contínua', run: a.toggleContinuousSync },
 
+    { id: 'new-term', group: g.term, label: L('Novo terminal', 'New terminal'), icon: <SquareTerminal className={ic} />, shortcut: 'Ctrl+⇧`', keywords: 'ssh shell putty console bash prompt linha de comando command line', run: a.openTerminal },
+    { id: 'toggle-term', group: g.term, label: L('Mostrar/ocultar terminais', 'Show/hide terminals'), icon: <PanelBottom className={ic} />, shortcut: 'Ctrl+`', keywords: 'painel panel dock segundo plano background histórico history', run: a.toggleTerminals },
     { id: 'native-term', group: g.term, label: L('Abrir no Terminal do sistema', 'Open in system Terminal'), icon: <Terminal className={ic} />, keywords: 'iterm shell native nativo', run: a.openNativeTerminal },
     { id: 'remote-cmd', group: g.term, label: L('Executar comando remoto…', 'Run remote command…'), icon: <TerminalSquare className={ic} />, keywords: 'ssh shell exec', run: a.openRemoteCommand },
     { id: 'script', group: g.term, label: L('Console de scripts', 'Scripting console'), icon: <FileCode2 className={ic} />, keywords: 'automação automation batch', run: a.openScriptConsole },

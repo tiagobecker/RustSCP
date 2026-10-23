@@ -10,6 +10,13 @@ export interface ToastItem {
   message?: string;
   /** Stays until the user dismisses it */
   sticky?: boolean;
+  action?: ToastAction;
+}
+
+/** A button on the toast (e.g. "Show"); clicking it also dismisses the toast. */
+export interface ToastAction {
+  label: string;
+  onClick: () => void;
 }
 
 export interface NotifyOptions {
@@ -17,6 +24,7 @@ export interface NotifyOptions {
   durationMs?: number;
   /** Never auto-dismiss: for notices the user must not miss (e.g. where a file was moved) */
   sticky?: boolean;
+  action?: ToastAction;
 }
 
 /** Why a toast's countdown is on hold: pointer over it, keyboard focus in it, or the app window not focused */
@@ -103,7 +111,7 @@ function push(kind: ToastKind, title: string, message?: string, opts?: NotifyOpt
   // Collapse identical consecutive toasts instead of stacking duplicates
   const dup = items.find((i) => i.kind === kind && i.title === title && i.message === message);
   if (dup) clearTimer(dup.id);
-  let next = [...items.filter((i) => i !== dup), { id, kind, title, message, sticky }];
+  let next = [...items.filter((i) => i !== dup), { id, kind, title, message, sticky, action: opts?.action }];
   // Over the limit: drop the oldest auto-dismissing toast first, so sticky notices survive a burst
   while (next.length > MAX_TOASTS) {
     const victim = next.find((i) => !i.sticky && i.id !== id) ?? next[0];
@@ -199,6 +207,18 @@ export const Toaster: React.FC = () => {
                 <div className="text-[12px] text-ink-muted mt-0.5 leading-snug break-words whitespace-pre-line max-h-40 overflow-y-auto">
                   {t.message}
                 </div>
+              )}
+              {t.action && (
+                <button
+                  type="button"
+                  className="ui-btn ui-btn-secondary ui-btn-sm mt-2"
+                  onClick={() => {
+                    dismiss(t.id);
+                    t.action?.onClick();
+                  }}
+                >
+                  {t.action.label}
+                </button>
               )}
             </div>
             <button

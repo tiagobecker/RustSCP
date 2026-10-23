@@ -69,7 +69,7 @@ const SHELL_UNAVAILABLE: u8 = 2;
 /// Connection details captured once after login (no blocking libssh2 calls
 /// on the async runtime later).
 #[derive(Debug, Clone, Default)]
-struct SessionInfo {
+pub(crate) struct SessionInfo {
     fingerprint_sha256: Option<String>,
     fingerprint_md5: Option<String>,
     cipher: Option<String>,
@@ -905,12 +905,32 @@ impl SftpDriver {
         &self.config
     }
 
+    /// Opens built-in terminals on this server, each on an SSH connection of its own. It
+    /// keeps the site and the host key accepted at login (not this driver's connections),
+    /// so a terminal can reconnect after the file session is closed.
+    pub fn terminal_connector(&self) -> crate::terminal::TerminalConnector {
+        crate::terminal::TerminalConnector::new(
+            self.config.clone(),
+            lock(&self.state.host_key_pin).clone(),
+        )
+    }
+
     /// TCP connect, SSH handshake, host key verification (before any
     /// credentials are sent) and authentication.
     fn create_authenticated_ssh_session(
         config: &ConnectionConfig,
         host_key_pin: &StdMutex<Option<Vec<u8>>>,
     ) -> CoreResult<(Session, SessionInfo)> {
+        Self::connect_authenticated(config, host_key_pin).map(|(sess, info, _)| (sess, info))
+    }
+
+    /// [`create_authenticated_ssh_session`](Self::create_authenticated_ssh_session) that
+    /// also returns a second handle to the connection's socket, so a terminal can wait for
+    /// it to become readable instead of polling libssh2.
+    pub(crate) fn connect_authenticated(
+        config: &ConnectionConfig,
+        host_key_pin: &StdMutex<Option<Vec<u8>>>,
+    ) -> CoreResult<(Session, SessionInfo, TcpStream)> {
         let addr = socket_address(&config.host, config.port);
         let socket_addrs = addr.to_socket_addrs().map_err(|e| {
             CoreError::ConnectionFailed(format!(
@@ -948,6 +968,9 @@ impl SftpDriver {
             ))
         })?;
 
+        let socket = tcp
+            .try_clone()
+            .map_err(|e| CoreError::ConnectionFailed(e.to_string()))?;
         let mut sess = Session::new().map_err(|e| CoreError::ConnectionFailed(e.to_string()))?;
         sess.set_timeout(SSH_IO_TIMEOUT_MS); // handshake, authentication and SFTP calls
         sess.set_tcp_stream(tcp);
@@ -978,7 +1001,7 @@ impl SftpDriver {
             compression: sess.methods(MethodType::CompCs).map(|s| s.to_string()),
         };
 
-        Ok((sess, info))
+        Ok((sess, info, socket))
     }
 
     /// Ask for a host key type we already know for this host, so a server

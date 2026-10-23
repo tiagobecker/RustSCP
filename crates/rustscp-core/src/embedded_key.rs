@@ -195,6 +195,58 @@ pub fn write_openssh_copy(text: &str, passphrase: Option<&str>, dir: &Path) -> C
         .map_err(|e| CoreError::General(format!("could not save the key for ssh: {}", e)))
 }
 
+/// Saves a private copy of the key file at `path` inside `dir` when the system `ssh`
+/// client would refuse the original, and returns the copy's path. ssh ignores a key that
+/// other users can read ("UNPROTECTED PRIVATE KEY FILE"), which is how a key downloaded
+/// from a cloud console (Oracle OCI, for one) usually arrives, while RustSCP itself logs in
+/// with it fine; Windows line ends and a byte-order mark are fixed on the way. `Ok(None)`
+/// when ssh can use the file as it is, and when it is not a key file RustSCP recognizes
+/// (ssh then reports the problem itself).
+pub fn private_copy_for_ssh(path: &Path, dir: &Path) -> CoreResult<Option<PathBuf>> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Ok(None);
+    };
+    let mut data = Vec::new();
+    if file
+        .take(MAX_EMBEDDED_KEY_BYTES as u64 + 1)
+        .read_to_end(&mut data)
+        .is_err()
+        || data.len() > MAX_EMBEDDED_KEY_BYTES
+    {
+        return Ok(None);
+    }
+    let Ok(text) = String::from_utf8(data) else {
+        return Ok(None);
+    };
+    let clean = normalize(&text);
+    if clean == text && !readable_by_others(path) {
+        return Ok(None);
+    }
+    if inspect(&clean).is_err() {
+        return Ok(None);
+    }
+    let source = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let digest = Sha256::digest(source.to_string_lossy().as_bytes());
+    let name = format!("key-{}", hex::encode(&digest[..12]));
+    ppk::write_private_key_file(dir, &name, &clean)
+        .map(Some)
+        .map_err(|e| CoreError::General(format!("could not save the key for ssh: {}", e)))
+}
+
+/// Whether the group or other users may read the file (ssh then refuses it as a key).
+#[cfg(unix)]
+fn readable_by_others(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o077 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn readable_by_others(_path: &Path) -> bool {
+    false
+}
+
 /// Cipher name and public key blob from the clear header of an `openssh-key-v1` file.
 fn openssh_v1_header(text: &str) -> Option<(String, Vec<u8>)> {
     let body: String = text
@@ -299,6 +351,52 @@ aQE6Wsu7my3+WEchTQPIAAAAEHJ1c3RzY3AtdGVzdC1rZXkBAgMEBQ==
         std::fs::write(&public, "ssh-ed25519 AAAA comment\n").unwrap();
         assert!(read_key_file(&public).is_err());
         assert!(read_key_file(&dir.path().join("missing")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copies_keys_that_ssh_would_refuse() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("openssh-keys");
+        let set_mode = |p: &Path, mode: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+
+        // A private, clean key is used as it is.
+        let ok = dir.path().join("ok");
+        std::fs::write(&ok, OPENSSH_ED25519).unwrap();
+        set_mode(&ok, 0o600);
+        assert_eq!(private_copy_for_ssh(&ok, &keys).unwrap(), None);
+
+        // Downloaded from a cloud console: readable by everyone.
+        let open = dir.path().join("ssh-key-2026-10-23.key");
+        std::fs::write(&open, OPENSSH_ED25519).unwrap();
+        set_mode(&open, 0o644);
+        let copy = private_copy_for_ssh(&open, &keys).unwrap().unwrap();
+        assert!(copy.starts_with(&keys));
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), OPENSSH_ED25519);
+        let mode = std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // The same file always maps to the same copy.
+        assert_eq!(private_copy_for_ssh(&open, &keys).unwrap(), Some(copy));
+
+        // Windows line ends are fixed even when the file is private.
+        let crlf = dir.path().join("crlf");
+        std::fs::write(&crlf, OPENSSH_ED25519.replace('\n', "\r\n")).unwrap();
+        set_mode(&crlf, 0o600);
+        let copy = private_copy_for_ssh(&crlf, &keys).unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), OPENSSH_ED25519);
+
+        // Not a key, or missing: left to ssh.
+        let public = dir.path().join("id.pub");
+        std::fs::write(&public, "ssh-ed25519 AAAA comment\n").unwrap();
+        set_mode(&public, 0o644);
+        assert_eq!(private_copy_for_ssh(&public, &keys).unwrap(), None);
+        assert_eq!(
+            private_copy_for_ssh(&dir.path().join("missing"), &keys).unwrap(),
+            None
+        );
     }
 
     #[test]

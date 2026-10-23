@@ -403,3 +403,19 @@
 .animate-wave-glow {
   animation: wavePulseGlow 2.5s ease-in-out infinite;
 }
+
+/* ---------- Built-in terminal (xterm.js) ---------- */
+/* The padding around the text uses the terminal's own background. */
+.rustscp-terminal {
+  background: #fdfcf9;
+}
+.dark .rustscp-terminal,
+.term-dark .rustscp-terminal {
+  background: #1a1918;
+}
+.rustscp-terminal .xterm {
+  height: 100%;
+}
+.rustscp-terminal .xterm-viewport {
+  background-color: transparent !important;
+}

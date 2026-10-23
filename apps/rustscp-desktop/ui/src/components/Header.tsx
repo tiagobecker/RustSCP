@@ -20,6 +20,8 @@ import {
   LayoutGrid,
   ChevronDown,
   FileCode2,
+  SquareTerminal,
+  PanelBottom,
 } from 'lucide-react';
 import { McpStatusInfo } from '../types.ts';
 import { ThemeMode } from '../theme.ts';
@@ -40,6 +42,11 @@ interface HeaderProps {
   onOpenMarketplace: () => void;
   onOpenTrash: () => void;
   onOpenNativeTerminal: () => void;
+  /** Opens a built-in terminal on the focused SSH session. */
+  onNewTerminal?: () => void;
+  /** Shows the terminal panel. */
+  onShowTerminals?: () => void;
+  terminalBadge?: { count: number; running: number; attention: boolean };
   onOpenSettings?: () => void;
   onOpenCommandPalette?: () => void;
   remoteTrashEnabled?: boolean;
@@ -62,7 +69,7 @@ export const MOD_KEY = isMac ? '⌘' : 'Ctrl+';
 
 const ToolbarButton = React.forwardRef<
   HTMLButtonElement,
-  { icon: React.ReactNode; label: string; open?: boolean; active?: boolean; onClick: () => void; badge?: boolean }
+  { icon: React.ReactNode; label: string; open?: boolean; active?: boolean; onClick: () => void; badge?: boolean | 'attention' }
 >(({ icon, label, open, active, onClick, badge }, ref) => (
   <button
     ref={ref}
@@ -79,7 +86,11 @@ const ToolbarButton = React.forwardRef<
     <span className="w-4 h-4 flex items-center justify-center">{icon}</span>
     <span className="hidden xl:inline">{label}</span>
     <ChevronDown className="w-3 h-3 opacity-60 hidden xl:inline" />
-    {badge && <span className="absolute top-1.5 left-6 w-1.5 h-1.5 rounded-full bg-emerald-500 ring-2 ring-surface-raised" />}
+    {badge && (
+      <span
+        className={`absolute top-1.5 left-6 w-1.5 h-1.5 rounded-full ring-2 ring-surface-raised ${badge === 'attention' ? 'bg-rust-500' : 'bg-emerald-500'}`}
+      />
+    )}
   </button>
 ));
 ToolbarButton.displayName = 'ToolbarButton';
@@ -99,6 +110,9 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenMarketplace,
   onOpenTrash,
   onOpenNativeTerminal,
+  onNewTerminal,
+  onShowTerminals,
+  terminalBadge,
   onOpenSettings,
   onOpenCommandPalette,
   remoteTrashEnabled,
@@ -190,11 +204,36 @@ export const Header: React.FC<HeaderProps> = ({
           align="right"
           width="w-72"
           trigger={({ open, toggle, ref }) => (
-            <ToolbarButton ref={ref} icon={<Terminal className={iconCls} />} label={t('header.terminal', 'Terminal')} open={open} onClick={toggle} />
+            <ToolbarButton
+              ref={ref}
+              icon={<Terminal className={iconCls} />}
+              label={t('header.terminal', 'Terminal')}
+              open={open}
+              onClick={toggle}
+              badge={terminalBadge?.attention ? 'attention' : (terminalBadge?.running ?? 0) > 0}
+            />
           )}
         >
           {(close) => (
             <>
+              {onNewTerminal && (
+                <MenuItem icon={<SquareTerminal className={iconCls} />} label={t('header.newTerminal', 'New terminal')} shortcut="Ctrl+⇧`" onSelect={onNewTerminal} close={close} />
+              )}
+              {onShowTerminals && (terminalBadge?.count ?? 0) > 0 && (
+                <MenuItem
+                  icon={<PanelBottom className={iconCls} />}
+                  label={t('header.showTerminals', 'Show terminals')}
+                  hint={
+                    <span className="text-[11px] text-ink-faint tabular-nums">
+                      {terminalBadge!.running > 0 ? `${terminalBadge!.running}/${terminalBadge!.count}` : terminalBadge!.count}
+                    </span>
+                  }
+                  shortcut="Ctrl+`"
+                  onSelect={onShowTerminals}
+                  close={close}
+                />
+              )}
+              <MenuSeparator />
               <MenuItem
                 icon={<Terminal className={iconCls} />}
                 label={t('header.nativeTerminal', 'Open in system Terminal')}

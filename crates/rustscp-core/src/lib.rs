@@ -13,6 +13,7 @@ pub mod sftp;
 pub mod share;
 pub mod shell;
 pub mod sync;
+pub mod terminal;
 pub mod transfer_queue;
 pub mod types;
 pub mod vault;
@@ -32,6 +33,9 @@ pub use scripting::{ScriptCommandOutput, ScriptInterpreter};
 pub use sftp::SftpDriver;
 pub use share::{ShareError, SharePreview, SharedConnection};
 pub use sync::{SyncActionType, SyncDirection, SyncEngine, SyncItem, SyncOptions};
+pub use terminal::{
+    shell_bootstrap, TerminalConnector, TerminalHandle, TerminalOptions, TerminalSink, TerminalSize,
+};
 pub use transfer_queue::{QueueTransferTask, TransferQueueManager};
 pub use types::*;
 pub use vault::{

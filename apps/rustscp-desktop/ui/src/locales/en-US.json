@@ -210,7 +210,7 @@
     "editorCommand": "Editor command",
     "externalEditorHelp": "Command used by “Open in external editor”. Leave empty to use the system default.",
     "nativeTerminal": "System terminal",
-    "nativeTerminalHelp": "“Open in system Terminal” launches your OS terminal with the current SSH session and folder.",
+    "nativeTerminalHelp": "“Open in system Terminal” opens your OS terminal already logged in to the current SSH session and folder, with the site’s key or saved password. The built-in terminal (Ctrl+`) has its options in the ⚙ of its panel.",
     "done": "Done",
     "preferExternalEditor": "Open files in the external editor",
     "preferExternalEditorDesc": "Edit, F4 and double-click use it instead of the built-in editor."
@@ -368,6 +368,8 @@
     "syncAssistant": "Synchronize…",
     "keepUpToDate": "Keep remote up to date",
     "terminal": "Terminal",
+    "newTerminal": "New terminal",
+    "showTerminals": "Show terminals",
     "nativeTerminal": "Open in system Terminal",
     "remoteShell": "Run remote command…",
     "scriptConsole": "Scripting console",
