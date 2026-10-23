@@ -322,7 +322,12 @@
     "filterHint": "Filter by name, server, user or folder",
     "clearFilter": "Clear filter",
     "importWinscp": "Import from WinSCP…",
-    "winscpHint": "Bring over your WinSCP sites, folders and saved passwords"
+    "winscpHint": "Bring over your WinSCP sites, folders and saved passwords",
+    "shareSite": "Share connection…",
+    "openShared": "Open shared connection…",
+    "openSharedHint": "Open a .rustscp file someone sent you",
+    "embeddedKey": "Received key (in the vault)",
+    "embeddedKeyHint": "This key came in a shared connection and is kept encrypted in your vault. Choose a file only to replace it."
   },
   "virtualDisk": {
     "title": "Native Virtual Disk & Network Drive",

@@ -268,17 +268,25 @@ fn redact_auth(auth: &rustscp_core::AuthMethod) -> rustscp_core::AuthMethod {
         }
         AuthMethod::PrivateKey {
             path,
-            passphrase: Some(p),
-        } if !p.is_empty() => AuthMethod::PrivateKey {
-            path: path.clone(),
-            passphrase: Some(STORED_SECRET_MARKER.to_string()),
-        },
+            passphrase,
+            key_data,
+        } => {
+            let marker = |secret: &Option<String>, blank: fn(&str) -> bool| match secret {
+                Some(s) if !blank(s) => Some(STORED_SECRET_MARKER.to_string()),
+                other => other.clone(),
+            };
+            AuthMethod::PrivateKey {
+                path: path.clone(),
+                passphrase: marker(passphrase, str::is_empty),
+                key_data: marker(key_data, |k| k.trim().is_empty()),
+            }
+        }
         other => other.clone(),
     }
 }
 
 /// Copy of a saved site that is safe to hand to the WebView: a non-empty password /
-/// S3 secret / key passphrase is replaced by [`STORED_SECRET_MARKER`].
+/// S3 secret / key passphrase / embedded key is replaced by [`STORED_SECRET_MARKER`].
 pub(crate) fn redact_site(site: &ConnectionConfig) -> ConnectionConfig {
     let mut copy = site.clone();
     copy.auth = redact_auth(&site.auth);
@@ -304,16 +312,31 @@ pub(crate) fn restore_stored_secret(
                 _ => String::new(),
             };
         }
-        AuthMethod::PrivateKey { passphrase, .. }
-            if passphrase.as_deref() == Some(STORED_SECRET_MARKER) =>
-        {
-            *passphrase = match stored.map(|s| &s.auth) {
-                Some(AuthMethod::PrivateKey {
-                    passphrase: Some(saved),
-                    ..
-                }) if !saved.is_empty() && saved != STORED_SECRET_MARKER => Some(saved.clone()),
-                _ => None,
-            };
+        AuthMethod::PrivateKey {
+            passphrase,
+            key_data,
+            ..
+        } => {
+            if passphrase.as_deref() == Some(STORED_SECRET_MARKER) {
+                *passphrase = match stored.map(|s| &s.auth) {
+                    Some(AuthMethod::PrivateKey {
+                        passphrase: Some(saved),
+                        ..
+                    }) if !saved.is_empty() && saved != STORED_SECRET_MARKER => Some(saved.clone()),
+                    _ => None,
+                };
+            }
+            if key_data.as_deref() == Some(STORED_SECRET_MARKER) {
+                *key_data = match stored.map(|s| &s.auth) {
+                    Some(AuthMethod::PrivateKey {
+                        key_data: Some(saved),
+                        ..
+                    }) if !saved.trim().is_empty() && saved != STORED_SECRET_MARKER => {
+                        Some(saved.clone())
+                    }
+                    _ => None,
+                };
+            }
         }
         _ => {}
     }
@@ -1026,13 +1049,19 @@ pub(crate) fn s3_region_from_endpoint(endpoint: &str) -> String {
 #[tauri::command]
 pub async fn connect_session(
     state: tauri::State<'_, AppState>,
+    sharing: tauri::State<'_, crate::sharing::SharingState>,
     config: ConnectionConfig,
 ) -> Result<String, String> {
     let mut config = config;
     {
-        // The WebView only ever holds the stored-secret marker for saved sites.
+        // The WebView only ever holds the stored-secret marker for saved sites (and for
+        // sites opened from a share without saving them).
         let sites = state.saved_sites.read().await;
-        let stored = sites.iter().find(|s| s.id == config.id);
+        let session_sites = sharing.session_sites.read().await;
+        let stored = sites
+            .iter()
+            .find(|s| s.id == config.id)
+            .or_else(|| session_sites.get(&config.id));
         restore_stored_secret(&mut config, stored);
     }
 
@@ -1158,7 +1187,7 @@ pub async fn disconnect_session(
 
 /// Refuses to write the vault when it was left unread at startup (see
 /// [`AppState::vault_save_blocked`]).
-fn ensure_vault_writable(state: &AppState) -> Result<(), String> {
+pub(crate) fn ensure_vault_writable(state: &AppState) -> Result<(), String> {
     match &state.vault_save_blocked {
         Some(reason) => Err(reason.clone()),
         None => Ok(()),
@@ -1376,10 +1405,13 @@ fn keep_saved_credentials(site: &mut ConnectionConfig, old: &ConnectionConfig) -
             kept = true;
         }
     } else if let (
-        AuthMethod::PrivateKey { path, passphrase },
+        AuthMethod::PrivateKey {
+            path, passphrase, ..
+        },
         AuthMethod::PrivateKey {
             path: old_path,
             passphrase: old_passphrase @ Some(_),
+            ..
         },
     ) = (&mut site.auth, &old.auth)
     {
@@ -5224,13 +5256,25 @@ pub(crate) fn ssh_terminal_args(
 /// `cfg` with its PuTTY (`.ppk`) key, if it has one, swapped for an OpenSSH copy saved in
 /// `keys_dir`: the system `ssh` client only reads OpenSSH keys. The copy is encrypted with
 /// the key's passphrase when the original is, so ssh asks for that passphrase as usual.
+/// A key embedded in the site (received in a share) is saved there the same way.
 fn terminal_ssh_config(
     mut cfg: ConnectionConfig,
     keys_dir: &std::path::Path,
 ) -> Result<ConnectionConfig, String> {
-    use rustscp_core::{known_hosts::expand_tilde, ppk, AuthMethod};
+    use rustscp_core::{embedded_key, known_hosts::expand_tilde, ppk, AuthMethod};
 
-    if let AuthMethod::PrivateKey { path, passphrase } = &mut cfg.auth {
+    if let AuthMethod::PrivateKey {
+        path,
+        passphrase,
+        key_data,
+    } = &mut cfg.auth
+    {
+        if let Some(text) = key_data.take().filter(|k| !k.trim().is_empty()) {
+            let copy = embedded_key::write_openssh_copy(&text, passphrase.as_deref(), keys_dir)
+                .map_err(|e| format!("Could not use the shared key: {}", e))?;
+            *path = copy.to_string_lossy().into_owned();
+            return Ok(cfg);
+        }
         let key_path = expand_tilde(path.trim());
         if ppk::is_ppk_file(&key_path) {
             let copy = ppk::write_openssh_copy(&key_path, passphrase.as_deref(), keys_dir)
@@ -6811,6 +6855,7 @@ mod security_tests {
             AuthMethod::PrivateKey {
                 path: ppk.to_string_lossy().into_owned(),
                 passphrase: None,
+                key_data: None,
             },
         );
         let converted = terminal_ssh_config(cfg, &keys_dir).unwrap();
@@ -6831,6 +6876,7 @@ mod security_tests {
             AuthMethod::PrivateKey {
                 path: openssh.to_string_lossy().into_owned(),
                 passphrase: None,
+                key_data: None,
             },
         );
         assert_eq!(
@@ -6850,6 +6896,7 @@ mod security_tests {
             AuthMethod::PrivateKey {
                 path: ppk.to_string_lossy().into_owned(),
                 passphrase: None,
+                key_data: None,
             },
         );
         assert!(terminal_ssh_config(cfg, &keys_dir)
@@ -6864,6 +6911,7 @@ mod security_tests {
             AuthMethod::PrivateKey {
                 path: "/Users/me/keys/my key".to_string(),
                 passphrase: None,
+                key_data: None,
             },
         );
         cfg.port = 2222;
@@ -7065,10 +7113,13 @@ mod security_tests {
             AuthMethod::PrivateKey {
                 path: "~/.ssh/id_ed25519".into(),
                 passphrase: Some("pp".into()),
+                key_data: None,
             },
         ));
         match &key.auth {
-            AuthMethod::PrivateKey { path, passphrase } => {
+            AuthMethod::PrivateKey {
+                path, passphrase, ..
+            } => {
                 assert_eq!(path, "~/.ssh/id_ed25519");
                 assert_eq!(passphrase.as_deref(), Some(STORED_SECRET_MARKER));
             }
@@ -7080,6 +7131,7 @@ mod security_tests {
             AuthMethod::PrivateKey {
                 path: "k".into(),
                 passphrase: None,
+                key_data: None,
             },
         ));
         assert!(matches!(
@@ -7125,6 +7177,7 @@ mod security_tests {
             AuthMethod::PrivateKey {
                 path: "k".into(),
                 passphrase: Some("pp".into()),
+                key_data: None,
             },
         );
         let mut key_in = site(
@@ -7132,11 +7185,14 @@ mod security_tests {
             AuthMethod::PrivateKey {
                 path: "k2".into(),
                 passphrase: Some(STORED_SECRET_MARKER.into()),
+                key_data: None,
             },
         );
         restore_stored_secret(&mut key_in, Some(&stored_key));
         match &key_in.auth {
-            AuthMethod::PrivateKey { path, passphrase } => {
+            AuthMethod::PrivateKey {
+                path, passphrase, ..
+            } => {
                 assert_eq!(path, "k2");
                 assert_eq!(passphrase.as_deref(), Some("pp"));
             }
@@ -7147,6 +7203,7 @@ mod security_tests {
         key_orphan.auth = AuthMethod::PrivateKey {
             path: "k".into(),
             passphrase: Some(STORED_SECRET_MARKER.into()),
+            key_data: None,
         };
         restore_stored_secret(&mut key_orphan, None);
         assert!(matches!(
@@ -7161,6 +7218,78 @@ mod security_tests {
         let mut round_trip = redact_site(&stored);
         restore_stored_secret(&mut round_trip, Some(&stored));
         assert!(matches!(&round_trip.auth, AuthMethod::Password(p) if p == "hunter2"));
+    }
+
+    #[test]
+    fn embedded_keys_never_reach_the_webview_and_survive_a_save() {
+        const KEY: &str = "-----BEGIN RSA PRIVATE KEY-----\nAAAA\n-----END RSA PRIVATE KEY-----\n";
+        let stored = site(
+            "s1",
+            AuthMethod::PrivateKey {
+                path: String::new(),
+                passphrase: Some("pp".into()),
+                key_data: Some(KEY.into()),
+            },
+        );
+
+        let redacted = redact_site(&stored);
+        let json = serde_json::to_string(&redacted).unwrap();
+        assert!(
+            !json.contains("BEGIN") && !json.contains("\"pp\""),
+            "{json}"
+        );
+        assert!(matches!(
+            &redacted.auth,
+            AuthMethod::PrivateKey { key_data: Some(k), passphrase: Some(p), .. }
+                if k == STORED_SECRET_MARKER && p == STORED_SECRET_MARKER
+        ));
+
+        // The edited site comes back with the markers: the key and passphrase are kept.
+        let mut edited = redacted.clone();
+        edited.name = "Renamed".into();
+        restore_stored_secret(&mut edited, Some(&stored));
+        assert_eq!(edited.auth.embedded_key(), Some(KEY));
+        assert!(matches!(
+            &edited.auth,
+            AuthMethod::PrivateKey { passphrase: Some(p), .. } if p == "pp"
+        ));
+
+        // A marker without a stored key is dropped, never saved or used as a key.
+        let mut orphan = redacted;
+        restore_stored_secret(&mut orphan, None);
+        assert!(matches!(
+            &orphan.auth,
+            AuthMethod::PrivateKey {
+                key_data: None,
+                passphrase: None,
+                ..
+            }
+        ));
+
+        // The system ssh gets the embedded key as a private file.
+        let dir = std::env::temp_dir().join(format!(
+            "rustscp-embedded-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut real = stored.clone();
+        real.auth = AuthMethod::PrivateKey {
+            path: String::new(),
+            passphrase: None,
+            key_data: Some(KEY.into()),
+        };
+        let converted = terminal_ssh_config(real, &dir).unwrap();
+        match &converted.auth {
+            AuthMethod::PrivateKey {
+                path,
+                key_data: None,
+                ..
+            } => {
+                assert!(std::path::Path::new(path).starts_with(&dir));
+                assert_eq!(std::fs::read_to_string(path).unwrap(), KEY);
+            }
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -8743,6 +8872,7 @@ mod winscp_and_move_tests {
         let keyed = |path: &str, passphrase: Option<&str>| AuthMethod::PrivateKey {
             path: path.to_string(),
             passphrase: passphrase.map(str::to_string),
+            key_data: None,
         };
         let with = |f: &dyn Fn(&mut ConnectionConfig)| {
             let mut s = base.clone();
@@ -8874,7 +9004,7 @@ mod winscp_and_move_tests {
         ));
         assert!(matches!(
             &result.sites[1].auth,
-            AuthMethod::PrivateKey { path, passphrase: None } if path == "~/.ssh/id_ed25519"
+            AuthMethod::PrivateKey { path, passphrase: None, .. } if path == "~/.ssh/id_ed25519"
         ));
         assert_eq!(result.sites[0].group.as_deref(), Some("Production/Web"));
         for site in &result.sites {
@@ -8970,6 +9100,7 @@ mod winscp_and_move_tests {
             AuthMethod::PrivateKey {
                 path: "~/.ssh/id_ed25519".to_string(),
                 passphrase: Some("kept-passphrase".to_string()),
+                key_data: None,
             },
         );
         by_name.username = "postgres".to_string();

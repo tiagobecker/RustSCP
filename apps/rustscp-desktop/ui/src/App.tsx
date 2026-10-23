@@ -51,6 +51,9 @@ import { inDir } from './utils/shell.ts';
 import { useRefState } from './utils/useRefState.ts';
 import { useStableHandlers } from './utils/useStableHandlers.ts';
 import { invoke, isTauri } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import type { ShareSource } from './components/ShareConnectionModal.tsx';
+import type { ShareFile } from './components/OpenShareModal.tsx';
 
 // Heavy, rarely used modals are split into their own chunks and mounted only while open.
 const AiAssistantModal = lazy(() => import('./components/AiAssistantModal.tsx').then((m) => ({ default: m.AiAssistantModal })));
@@ -67,6 +70,8 @@ const RemoteTrashModal = lazy(() => import('./components/RemoteTrashModal.tsx').
 const SyncDialog = lazy(() => import('./components/SyncDialog.tsx').then((m) => ({ default: m.SyncDialog })));
 const FindFilesModal = lazy(() => import('./components/FindFilesModal.tsx').then((m) => ({ default: m.FindFilesModal })));
 const FileSystemInfoModal = lazy(() => import('./components/FileSystemInfoModal.tsx').then((m) => ({ default: m.FileSystemInfoModal })));
+const ShareConnectionModal = lazy(() => import('./components/ShareConnectionModal.tsx').then((m) => ({ default: m.ShareConnectionModal })));
+const OpenShareModal = lazy(() => import('./components/OpenShareModal.tsx').then((m) => ({ default: m.OpenShareModal })));
 const CompressionModal = lazy(() => import('./components/CompressionModal.tsx').then((m) => ({ default: m.CompressionModal })));
 const AboutModal = lazy(() => import('./components/AboutModal.tsx').then((m) => ({ default: m.AboutModal })));
 
@@ -335,6 +340,10 @@ export const App: React.FC = () => {
   // Marketplace, trash, settings, about
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
   const [isAboutOpen, setIsAboutOpen] = useState<boolean>(false);
+  // Connection sharing: the connection being shared, and the .rustscp files waiting to be opened
+  // (null: the user asked to pick one). One file is shown at a time.
+  const [shareSource, setShareSource] = useState<ShareSource | null>(null);
+  const [shareFiles, setShareFiles] = useState<Array<ShareFile | null>>([]);
   const [isMarketplaceOpen, setIsMarketplaceOpen] = useState<boolean>(false);
   const [isRemoteTrashOpen, setIsRemoteTrashOpen] = useState<boolean>(false);
   const [remoteTrashEnabled, setRemoteTrashEnabled] = useState<boolean>(() => {
@@ -2240,7 +2249,7 @@ export const App: React.FC = () => {
   // ---------------------------------------------------------------------------------------------
   // Connect / disconnect / sites
   // ---------------------------------------------------------------------------------------------
-  const handleConnect = async (cfg: ConnectionConfig, attempt?: { cancelled: boolean }) => {
+  const handleConnect = async (cfg: ConnectionConfig, attempt?: { cancelled: boolean }, opts?: { startPath?: string }) => {
     const sessionId = await invokeTauri<string>('connect_session', { config: cfg });
     const dropIfCancelled = () => {
       if (!attempt?.cancelled) return false;
@@ -2252,8 +2261,9 @@ export const App: React.FC = () => {
     };
     if (dropIfCancelled()) return;
 
-    let initialPath = '';
-    if (rememberLastRemoteDir && cfg.protocol !== 'local') {
+    // A shared connection opens in the folder it was shared from
+    let initialPath = opts?.startPath?.trim() || '';
+    if (!initialPath && rememberLastRemoteDir && cfg.protocol !== 'local') {
       const lastVisited = getLastRemotePath(cfg);
       if (lastVisited && lastVisited.trim().length > 0) initialPath = lastVisited.trim();
     }
@@ -2315,6 +2325,56 @@ export const App: React.FC = () => {
     await invokeTauri('delete_site', { id });
     setSavedSites((prev) => prev.filter((s) => s.id !== id));
   };
+
+  /** Connects a site accepted from a .rustscp file (already in the vault when `saved`). */
+  const handleOpenSharedSite = async (site: ConnectionConfig, startPath: string, saved: boolean) => {
+    if (saved) setSavedSites((prev) => [...prev.filter((s) => s.id !== site.id), site]);
+    await handleConnect(site, undefined, { startPath });
+    setIsSiteManagerOpen(false);
+  };
+
+  /** Shares the remote connection of the focused pane (or the other pane), opening in its current folder. */
+  const shareCurrentConnection = () => {
+    const focused = focusedPaneRef.current;
+    const ctx = [focused, otherPane(focused)].map(ctxOf).find((c) => c.isRemote && c.session);
+    if (!ctx?.session) {
+      notify.info(
+        tr('Nenhuma conexão remota aberta', 'No remote connection open'),
+        tr('Abra uma conexão, ou compartilhe um site salvo pelo Gerenciador de conexões.', 'Open a connection, or share a saved site from the connection manager.')
+      );
+      return;
+    }
+    const cfg = ctx.session.config;
+    setShareSource({ sessionId: ctx.sessionId, name: cfg.name, host: cfg.host, username: cfg.username, startPath: ctx.path });
+  };
+
+  // .rustscp files the OS hands over (double-click, Open With, a second launch), also the one
+  // that started the app: queued by the backend until this window takes them.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let disposed = false;
+    const unlisteners: Array<() => void> = [];
+    const take = () =>
+      invoke<Array<{ name: string; contents: string | null; error: string | null }>>('take_pending_share_files')
+        .then((files) => {
+          if (disposed || !Array.isArray(files)) return;
+          const ready: ShareFile[] = [];
+          for (const f of files) {
+            if (f.contents != null) ready.push({ name: f.name, contents: f.contents });
+            else notify.error(f.name, f.error ?? undefined);
+          }
+          if (ready.length) setShareFiles((prev) => [...prev, ...ready]);
+        })
+        .catch(() => {});
+    listen('share-files-pending', take)
+      .then((fn) => (disposed ? fn() : unlisteners.push(fn)))
+      .catch(() => {});
+    take();
+    return () => {
+      disposed = true;
+      unlisteners.forEach((fn) => fn());
+    };
+  }, []);
 
   // Persist the last folder of every server when the window goes away
   useEffect(() => {
@@ -2565,6 +2625,8 @@ export const App: React.FC = () => {
     buildPaletteCommands(
       {
         openSiteManager: () => openSiteManager(),
+        shareConnection: shareCurrentConnection,
+        openSharedConnection: () => setShareFiles((prev) => [...prev, null]),
         compareDirectories: handleCompareDirectories,
         openSync,
         toggleSyncBrowsing: () => setSyncBrowsing((v) => !v),
@@ -2755,8 +2817,22 @@ export const App: React.FC = () => {
           onSaveSite={handleSaveSite}
           onDeleteSite={handleDeleteSite}
           onSitesUpdated={(newSites) => setSavedSites(newSites)}
+          onShareSite={(site) => setShareSource({ siteId: site.id, name: site.name, host: site.host, username: site.username, startPath: '' })}
+          onOpenSharedConnection={() => setShareFiles((prev) => [...prev, null])}
         />
       </ModalGuard>
+
+      {/* Connection sharing (.rustscp files); after the Site Manager so they stack above it */}
+      {shareSource && (
+        <ModalGuard title={tr('Compartilhar conexão', 'Share connection')} onClose={() => setShareSource(null)}>
+          <ShareConnectionModal isOpen={!!shareSource} source={shareSource} onClose={() => setShareSource(null)} />
+        </ModalGuard>
+      )}
+      {shareFiles.length > 0 && (
+        <ModalGuard title={tr('Abrir conexão compartilhada', 'Open shared connection')} onClose={() => setShareFiles((prev) => prev.slice(1))}>
+          <OpenShareModal isOpen file={shareFiles[0]} onClose={() => setShareFiles((prev) => prev.slice(1))} onOpen={handleOpenSharedSite} />
+        </ModalGuard>
+      )}
 
       {/* Symlink / hardlink, created in the folder of the pane it was opened from */}
       <ModalGuard title={tr('Criar link', 'Create link')} onClose={() => setSymlinkData((d) => ({ ...d, isOpen: false }))}>

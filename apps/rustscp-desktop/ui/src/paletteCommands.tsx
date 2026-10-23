@@ -23,12 +23,16 @@ import {
   Languages,
   Columns2,
   ListChecks,
+  Share2,
+  FileKey2,
 } from 'lucide-react';
 import type { PaletteCommand } from './components/CommandPalette.tsx';
 import type { ThemeMode } from './theme.ts';
 
 export interface PaletteActions {
   openSiteManager: () => void;
+  shareConnection: () => void;
+  openSharedConnection: () => void;
   compareDirectories: () => void;
   openSync: () => void;
   toggleSyncBrowsing: () => void;
@@ -75,6 +79,8 @@ export function buildPaletteCommands(a: PaletteActions, isPt: boolean): PaletteC
   const on = (v: boolean) => (v ? L(' (ativado)', ' (on)') : '');
   return [
     { id: 'connect', group: g.conn, label: L('Nova conexão…', 'New connection…'), icon: <Plus className={ic} />, keywords: 'site manager servidor ssh sftp ftp s3 login conectar connect', run: a.openSiteManager },
+    { id: 'share', group: g.conn, label: L('Compartilhar esta conexão…', 'Share this connection…'), icon: <Share2 className={ic} />, keywords: 'share compartilhar suporte support enviar send arquivo file rustscp acesso access', run: a.shareConnection },
+    { id: 'open-shared', group: g.conn, label: L('Abrir conexão compartilhada…', 'Open shared connection…'), icon: <FileKey2 className={ic} />, keywords: 'rustscp arquivo file importar import código code receber receive', run: a.openSharedConnection },
     { id: 'refresh', group: g.conn, label: L('Atualizar painel', 'Refresh pane'), icon: <RefreshCw className={ic} />, shortcut: `${a.modKey}R`, keywords: 'reload recarregar', run: a.refresh },
 
     { id: 'compare', group: g.sync, label: L('Comparar pastas', 'Compare folders'), icon: <GitCompare className={ic} />, shortcut: '⇧F2', keywords: 'diff diferenças', run: a.compareDirectories },

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Lets the desktop recognize RustSCP shared connections (*.rustscp) and open them
+     with RustSCP. Installed by the .deb/.rpm packages; the AppImage writes the same
+     definition to ~/.local/share/mime on first start. -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-rustscp">
+    <comment>RustSCP shared connection</comment>
+    <comment xml:lang="pt_BR">Conexão compartilhada do RustSCP</comment>
+    <sub-class-of type="application/json"/>
+    <glob pattern="*.rustscp"/>
+  </mime-type>
+</mime-info>

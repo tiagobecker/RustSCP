@@ -1078,7 +1078,20 @@ impl SftpDriver {
                     )));
                 }
             }
-            AuthMethod::PrivateKey { path, passphrase } => {
+            AuthMethod::PrivateKey {
+                key_data: Some(key_text),
+                passphrase,
+                ..
+            } if !key_text.trim().is_empty() => {
+                // A key received in a share: it never touches the disk.
+                let pass = passphrase.as_deref().filter(|p| !p.is_empty());
+                crate::embedded_key::userauth(sess, user, key_text, pass).map_err(|e| {
+                    CoreError::AuthFailed(format!("Private key authentication failed: {}", e))
+                })?;
+            }
+            AuthMethod::PrivateKey {
+                path, passphrase, ..
+            } => {
                 if path.trim().is_empty() {
                     return Err(CoreError::AuthFailed(
                         "Private key authentication failed: no key file was selected".into(),
@@ -2510,6 +2523,7 @@ mod tests {
             auth: AuthMethod::PrivateKey {
                 path: key.clone(),
                 passphrase: None,
+                key_data: None,
             },
             remote_root: "/".into(),
             tls_fingerprint: None,

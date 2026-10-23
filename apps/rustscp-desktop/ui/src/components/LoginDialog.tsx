@@ -20,6 +20,8 @@ import {
   KeyRound,
   Loader2,
   X,
+  Share2,
+  FileKey2,
 } from 'lucide-react';
 import { ConnectionConfig, Protocol } from '../types.ts';
 import { VaultModal, VaultTab } from './VaultModal.tsx';
@@ -39,6 +41,10 @@ interface LoginDialogProps {
   onSaveSite: (config: ConnectionConfig) => Promise<void>;
   onDeleteSite: (id: string) => Promise<void>;
   onSitesUpdated?: (sites: ConnectionConfig[]) => void;
+  /** Makes a `.rustscp` file of a saved site (its saved version, credentials included). */
+  onShareSite?: (site: ConnectionConfig) => void;
+  /** Opens a `.rustscp` file someone shared. */
+  onOpenSharedConnection?: () => void;
 }
 
 type AuthMode = 'password' | 'key' | 'agent';
@@ -293,6 +299,8 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   onSaveSite,
   onDeleteSite,
   onSitesUpdated,
+  onShareSite,
+  onOpenSharedConnection,
 }) => {
   const { t } = useTranslation();
   const [isVaultModalOpen, setIsVaultModalOpen] = useState(false);
@@ -319,6 +327,8 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   const [passphraseStored, setPassphraseStored] = useState<boolean>(false);
   const [authMode, setAuthMode] = useState<AuthMode>('password');
   const [privateKeyPath, setPrivateKeyPath] = useState<string>('');
+  // The site's key was received in a share: it is kept in the vault, there is no key file
+  const [keyEmbedded, setKeyEmbedded] = useState<boolean>(false);
   const [passphrase, setPassphrase] = useState<string>('');
   const [remoteRoot, setRemoteRoot] = useState<string>('');
   const [tlsFingerprint, setTlsFingerprint] = useState<string>('');
@@ -474,6 +484,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
     setPendingDeleteId(null);
     setPasswordStored(false);
     setPassphraseStored(false);
+    setKeyEmbedded(false);
     if (site.auth.type === 'Password') {
       setAuthMode('password');
       const stored = isStoredSecret(site.auth.value);
@@ -484,6 +495,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
     } else if (site.auth.type === 'PrivateKey') {
       setAuthMode('key');
       setPrivateKeyPath(site.auth.value?.path || '');
+      setKeyEmbedded(isStoredSecret(site.auth.value?.key_data));
       const stored = isStoredSecret(site.auth.value?.passphrase);
       setPassphraseStored(stored);
       setPassphrase(stored ? '' : site.auth.value?.passphrase || '');
@@ -511,6 +523,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
     setPassphraseStored(false);
     setAuthMode('password');
     setPrivateKeyPath('');
+    setKeyEmbedded(false);
     setPassphrase('');
     setRemoteRoot('');
     setTlsFingerprint('');
@@ -547,6 +560,11 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
       const pp = passphrase ? passphrase : passphraseStored ? STORED_SECRET : null;
       return { type: 'PrivateKey', value: { path: privateKeyPath.trim(), passphrase: pp } };
     }
+    if (isSsh(protocol) && authMode === 'key' && keyEmbedded) {
+      // The backend swaps the markers for the key and passphrase kept in the vault
+      const pp = passphrase ? passphrase : passphraseStored ? STORED_SECRET : null;
+      return { type: 'PrivateKey', value: { path: '', passphrase: pp, key_data: STORED_SECRET } };
+    }
     if (isSsh(protocol) && authMode === 'agent') return { type: 'None', value: null };
     if (password) return { type: 'Password', value: password };
     if (passwordStored) return { type: 'Password', value: STORED_SECRET };
@@ -578,7 +596,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
     if (!host.trim()) return t('loginDialog.errHost', 'Enter the server address.');
     const p = parseInt(port, 10);
     if (!Number.isFinite(p) || p < 1 || p > 65535) return t('loginDialog.errPort', 'Port must be a number between 1 and 65535.');
-    if (isSsh(protocol) && authMode === 'key' && !privateKeyPath.trim()) return t('loginDialog.errKey', 'Choose a private key file.');
+    if (isSsh(protocol) && authMode === 'key' && !privateKeyPath.trim() && !keyEmbedded) return t('loginDialog.errKey', 'Choose a private key file.');
     if (protocol === 'ftps' && tlsFingerprint.trim() && !isSha256Fingerprint(tlsFingerprint)) {
       return t('loginDialog.errFingerprint', 'The trusted certificate must be a SHA-256 fingerprint (64 hexadecimal digits).');
     }
@@ -689,6 +707,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
       const selected = await invoke<string | null>('pick_key_file');
       if (selected) {
         setPrivateKeyPath(selected);
+        setKeyEmbedded(false);
         setIsDirty(true);
       }
     } catch (err) {
@@ -845,6 +864,20 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
                       </div>
                     )}
                   </div>
+                  {site.id !== 'local' && onShareSite && !confirming && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onShareSite(site);
+                      }}
+                      title={t('loginDialog.shareSite', 'Share connection…')}
+                      aria-label={t('loginDialog.shareSite', 'Share connection…')}
+                      className="shrink-0 w-6 h-6 rounded-md flex items-center justify-center text-ink-faint hover:text-ink hover:bg-dark-600/60 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-all"
+                    >
+                      <Share2 className="w-3.5 h-3.5" />
+                    </button>
+                  )}
                   {site.id !== 'local' && (
                     <button
                       type="button"
@@ -896,6 +929,17 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
               <FolderInput className="w-3.5 h-3.5" />
               {t('loginDialog.importWinscp', 'Import from WinSCP…')}
             </button>
+            {onOpenSharedConnection && (
+              <button
+                type="button"
+                onClick={onOpenSharedConnection}
+                className="w-full flex items-center gap-2 px-2.5 h-8 rounded-lg text-[12.5px] text-ink-muted hover:text-ink hover:bg-dark-650/50 transition-colors"
+                title={t('loginDialog.openSharedHint', 'Open a .rustscp file someone sent you')}
+              >
+                <FileKey2 className="w-3.5 h-3.5" />
+                {t('loginDialog.openShared', 'Open shared connection…')}
+              </button>
+            )}
           </div>
         </aside>
 
@@ -1066,7 +1110,14 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
 
                   {isSsh(protocol) && authMode === 'key' && (
                     <div className="space-y-3">
-                      <Field label={t('loginDialog.privateKey')} hint={t('loginDialog.keyFileHelper')}>
+                      <Field
+                        label={t('loginDialog.privateKey')}
+                        hint={
+                          keyEmbedded && !privateKeyPath.trim()
+                            ? t('loginDialog.embeddedKeyHint', 'This key came in a shared connection and is kept encrypted in your vault. Choose a file only to replace it.')
+                            : t('loginDialog.keyFileHelper')
+                        }
+                      >
                         {(id) => (
                           <div className="flex items-center gap-2">
                             <TextInput
@@ -1077,7 +1128,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
                                 setPrivateKeyPath(e.target.value);
                                 setIsDirty(true);
                               }}
-                              placeholder="~/.ssh/id_ed25519"
+                              placeholder={keyEmbedded ? t('loginDialog.embeddedKey', 'Received key (in the vault)') : '~/.ssh/id_ed25519'}
                             />
                             <Button onClick={handlePickPrivateKey} icon={<FolderOpen className="w-3.5 h-3.5" />}>
                               {t('loginDialog.browseKey')}
@@ -1092,6 +1143,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
                           const file = e.target.files?.[0];
                           if (file) {
                             setPrivateKeyPath((file as any).path || file.name);
+                            setKeyEmbedded(false);
                             setIsDirty(true);
                           }
                         }}

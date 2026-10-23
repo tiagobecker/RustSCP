@@ -166,8 +166,27 @@ pub enum AuthMethod {
     PrivateKey {
         path: String,
         passphrase: Option<String>,
+        /// The key file's contents (OpenSSH or PuTTY `.ppk`), for a site received in a
+        /// `.rustscp` share: the key lives in the encrypted vault and `path` is empty.
+        /// Used instead of `path` when set. Not written when unset, and older builds
+        /// ignore it, so their vaults still load.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_data: Option<String>,
     },
     KeyringRef(String),
+}
+
+impl AuthMethod {
+    /// The embedded key of a `PrivateKey` site, when it has a non-blank one.
+    pub fn embedded_key(&self) -> Option<&str> {
+        match self {
+            Self::PrivateKey {
+                key_data: Some(data),
+                ..
+            } if !data.trim().is_empty() => Some(data),
+            _ => None,
+        }
+    }
 }
 
 /// Secrets are never printed: `{:?}` of a config may end up in logs or panics.
@@ -183,12 +202,20 @@ impl fmt::Debug for AuthMethod {
         match self {
             Self::None => write!(f, "None"),
             Self::Password(p) => write!(f, "Password({})", redact(p)),
-            Self::PrivateKey { path, passphrase } => f
+            Self::PrivateKey {
+                path,
+                passphrase,
+                key_data,
+            } => f
                 .debug_struct("PrivateKey")
                 .field("path", path)
                 .field(
                     "passphrase",
                     &format_args!("{}", passphrase.as_deref().map(redact).unwrap_or("None")),
+                )
+                .field(
+                    "key_data",
+                    &format_args!("{}", key_data.as_deref().map(redact).unwrap_or("None")),
                 )
                 .finish(),
             Self::KeyringRef(r) => f.debug_tuple("KeyringRef").field(r).finish(),
@@ -495,11 +522,12 @@ mod tests {
             "{:?}",
             AuthMethod::PrivateKey {
                 path: "~/.ssh/id".into(),
-                passphrase: Some("s3cret".into())
+                passphrase: Some("s3cret".into()),
+                key_data: Some("-----BEGIN OPENSSH PRIVATE KEY-----".into()),
             }
         );
         assert!(
-            !key.contains("s3cret") && key.contains("~/.ssh/id"),
+            !key.contains("s3cret") && key.contains("~/.ssh/id") && !key.contains("BEGIN"),
             "{key}"
         );
         // Serialization for the UI and the vault is unchanged.

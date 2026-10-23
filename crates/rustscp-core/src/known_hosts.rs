@@ -367,6 +367,81 @@ impl HostKeyStore {
         types
     }
 
+    /// Host keys recorded for host:port in any file (plain entries, in file order, each
+    /// once). A key that any file lists as `@revoked` for the host is left out.
+    pub fn host_keys(&self, host: &str, port: u16) -> Vec<Vec<u8>> {
+        let lookup = known_hosts_host_name(host, port);
+        let entries: Vec<KnownHostEntry> = self
+            .files()
+            .flat_map(|f| parse_known_hosts(&Self::read(f)))
+            .filter(|e| host_field_matches(&e.hosts, &lookup))
+            .collect();
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        for e in &entries {
+            let revoked = entries
+                .iter()
+                .any(|r| r.marker == KnownHostMarker::Revoked && r.key_blob == e.key_blob);
+            if e.marker == KnownHostMarker::None && !revoked && !keys.contains(&e.key_blob) {
+                keys.push(e.key_blob.clone());
+            }
+        }
+        keys
+    }
+
+    /// Records host keys a shared connection vouches for (see [`crate::share`]) before
+    /// the first connection, so the server is checked against them instead of being
+    /// trusted on first use. Keys already recorded are skipped; returns how many were
+    /// added. Nothing is written, and [`CoreError::HostKeyMismatch`] is returned, when a
+    /// key is listed as `@revoked`, or when this computer already knows the server only
+    /// by other keys: the file and this computer disagree about who the server is.
+    pub fn trust_shared_keys(&self, host: &str, port: u16, keys: &[Vec<u8>]) -> CoreResult<usize> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let lookup = known_hosts_host_name(host, port);
+        let _guard = APP_FILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _file_lock = self.lock_app_file_across_processes();
+
+        let mut known: Vec<Vec<u8>> = Vec::new();
+        for file in self.files() {
+            for e in parse_known_hosts(&Self::read(file)) {
+                if !host_field_matches(&e.hosts, &lookup) {
+                    continue;
+                }
+                match e.marker {
+                    KnownHostMarker::Revoked if keys.contains(&e.key_blob) => {
+                        return Err(CoreError::HostKeyMismatch(format!(
+                            "the shared connection vouches for the host key {} of {}, but {} \
+                             (line {}) marks that key @revoked. Nothing was changed.",
+                            fingerprint_sha256(&e.key_blob),
+                            lookup,
+                            file.display(),
+                            e.line
+                        )));
+                    }
+                    KnownHostMarker::None => known.push(e.key_blob),
+                    _ => {}
+                }
+            }
+        }
+        let new: Vec<&Vec<u8>> = keys.iter().filter(|k| !known.contains(k)).collect();
+        if !known.is_empty() && new.len() == keys.len() {
+            return Err(CoreError::HostKeyMismatch(format!(
+                "this computer already knows {} by the host key {}, but the shared connection \
+                 says the server's key is {}. Someone may be intercepting one of the \
+                 connections, or the server's key was replaced. Ask the sender to confirm \
+                 the server's key; nothing was changed.",
+                lookup,
+                fingerprint_sha256(&known[0]),
+                fingerprint_sha256(&keys[0])
+            )));
+        }
+        for key in &new {
+            append_line(&self.app_file, &known_hosts_line(host, port, key))?;
+        }
+        Ok(new.len())
+    }
+
     /// Exclusive advisory lock on `<app_file>.lock`, shared with other
     /// RustSCP processes (desktop app, MCP gateway). Best effort: None when
     /// the lock file cannot be opened or locked (the in-process lock still
@@ -816,6 +891,94 @@ mod tests {
             vec!["ssh-ed25519"]
         );
         assert!(store.known_key_types("pinned.example", 22).is_empty());
+    }
+
+    #[test]
+    fn host_keys_lists_trusted_keys_of_one_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("known_hosts");
+        let user = dir.path().join("user_known_hosts");
+        std::fs::write(
+            &app,
+            format!("srv.example ssh-ed25519 {K1}\nother.example ssh-ed25519 {K2}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            &user,
+            format!("{K1_HASHED_HOST} ssh-ed25519 {K1}\n[srv.example]:2222 ssh-ed25519 {K2}\n"),
+        )
+        .unwrap();
+        let store = HostKeyStore::new(app.clone(), vec![user.clone()]);
+        assert_eq!(store.host_keys("SRV.example", 22), vec![blob(K1)]);
+        assert_eq!(store.host_keys("srv.example", 2222), vec![blob(K2)]);
+        // Hashed names in ~/.ssh/known_hosts are matched too.
+        assert_eq!(store.host_keys("example.com", 22), vec![blob(K1)]);
+        assert!(store.host_keys("unknown.example", 22).is_empty());
+
+        std::fs::write(&user, format!("@revoked srv.example ssh-ed25519 {K1}\n")).unwrap();
+        assert!(store.host_keys("srv.example", 22).is_empty());
+    }
+
+    #[test]
+    fn shared_host_keys_are_pinned_before_the_first_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("cfg").join("known_hosts");
+        let store = HostKeyStore::new(app.clone(), vec![]);
+
+        // Unknown host: the shared key is recorded, then a different key is refused.
+        assert_eq!(
+            store
+                .trust_shared_keys("srv.example", 2222, &[blob(K1)])
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_to_string(&app).unwrap(),
+            format!("[srv.example]:2222 ssh-ed25519 {K1}\n")
+        );
+        assert!(matches!(
+            store.verify("srv.example", 2222, &blob(K2)),
+            Err(CoreError::HostKeyMismatch(_))
+        ));
+        assert!(matches!(
+            store.verify("srv.example", 2222, &blob(K1)).unwrap(),
+            HostKeyVerdict::Known { .. }
+        ));
+
+        // Already known with that key: nothing added, extra keys of the server are.
+        assert_eq!(
+            store
+                .trust_shared_keys("srv.example", 2222, &[blob(K1)])
+                .unwrap(),
+            0
+        );
+        let rsa = fake_rsa_blob();
+        assert_eq!(
+            store
+                .trust_shared_keys("srv.example", 2222, &[blob(K1), rsa.clone()])
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.host_keys("srv.example", 2222), vec![blob(K1), rsa]);
+
+        // Known only by other keys: refused, nothing written.
+        let before = std::fs::read_to_string(&app).unwrap();
+        let err = store
+            .trust_shared_keys("srv.example", 2222, &[blob(K2)])
+            .unwrap_err();
+        assert!(matches!(err, CoreError::HostKeyMismatch(_)));
+        assert!(err.to_string().contains(K1_FP), "{err}");
+        assert_eq!(std::fs::read_to_string(&app).unwrap(), before);
+
+        // A revoked key is refused.
+        std::fs::write(&app, format!("@revoked revoked.example ssh-ed25519 {K2}\n")).unwrap();
+        assert!(store
+            .trust_shared_keys("revoked.example", 22, &[blob(K2)])
+            .is_err());
+        assert_eq!(
+            store.trust_shared_keys("revoked.example", 22, &[]).unwrap(),
+            0
+        );
     }
 
     #[test]

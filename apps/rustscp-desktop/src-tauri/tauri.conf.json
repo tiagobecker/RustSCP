@@ -19,7 +19,37 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "fileAssociations": [
+      {
+        "ext": [
+          "rustscp"
+        ],
+        "name": "RustSCP Connection",
+        "description": "RustSCP shared connection",
+        "mimeType": "application/x-rustscp",
+        "role": "Viewer",
+        "rank": "Owner",
+        "exportedType": {
+          "identifier": "com.rustscp.connection",
+          "conformsTo": [
+            "public.json"
+          ]
+        }
+      }
+    ],
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/share/mime/packages/rustscp.xml": "linux/rustscp-mime.xml"
+        }
+      },
+      "rpm": {
+        "files": {
+          "/usr/share/mime/packages/rustscp.xml": "linux/rustscp-mime.xml"
+        }
+      }
+    }
   },
   "app": {
     "windows": [

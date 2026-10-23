@@ -556,6 +556,7 @@ fn session_auth(
                 return AuthMethod::PrivateKey {
                     path,
                     passphrase: None,
+                    key_data: None,
                 };
             }
         }
@@ -958,7 +959,9 @@ mod tests {
         assert_eq!(oracle.port, 22);
         assert_eq!(oracle.remote_root, "");
         match &oracle.auth {
-            AuthMethod::PrivateKey { path, passphrase } => {
+            AuthMethod::PrivateKey {
+                path, passphrase, ..
+            } => {
                 assert_eq!(path, "C:/Users/João/.ssh/oracle.ppk");
                 assert!(passphrase.is_none());
             }

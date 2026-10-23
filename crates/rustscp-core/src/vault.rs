@@ -1134,6 +1134,7 @@ mod tests {
                 auth: AuthMethod::PrivateKey {
                     path: "/home/user/.ssh/id_ed25519".to_string(),
                     passphrase: Some("key-passphrase-xyz".to_string()),
+                    key_data: None,
                 },
                 remote_root: "/root".to_string(),
                 tls_fingerprint: None,
@@ -1169,6 +1170,7 @@ mod tests {
         if let AuthMethod::PrivateKey {
             ref path,
             ref passphrase,
+            ..
         } = decrypted[2].auth
         {
             assert_eq!(path, "/home/user/.ssh/id_ed25519");

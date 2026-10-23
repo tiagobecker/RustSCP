@@ -322,7 +322,12 @@
     "filterHint": "Filtrar por nome, servidor, usuário ou pasta",
     "clearFilter": "Limpar filtro",
     "importWinscp": "Importar do WinSCP…",
-    "winscpHint": "Traga os sites, as pastas e as senhas salvas do WinSCP"
+    "winscpHint": "Traga os sites, as pastas e as senhas salvas do WinSCP",
+    "shareSite": "Compartilhar conexão…",
+    "openShared": "Abrir conexão compartilhada…",
+    "openSharedHint": "Abra um arquivo .rustscp que alguém enviou para você",
+    "embeddedKey": "Chave recebida (no cofre)",
+    "embeddedKeyHint": "Esta chave veio em uma conexão compartilhada e fica cifrada no seu cofre. Escolha um arquivo só se quiser trocá-la."
   },
   "virtualDisk": {
     "title": "Disco Virtual & Drive Nativo",

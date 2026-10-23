@@ -442,22 +442,32 @@ pub fn write_openssh_copy(
     passphrase: Option<&str>,
     dir: &Path,
 ) -> Result<PathBuf, PpkError> {
-    use std::io::Write;
-
     let key = PpkKey::from_file(ppk_path, passphrase)?;
     let pem = key.to_openssh(if key.is_encrypted() { passphrase } else { None })?;
 
-    let io = |e: std::io::Error| PpkError::Io(e.to_string());
-    std::fs::create_dir_all(dir).map_err(io)?;
+    let source = std::fs::canonicalize(ppk_path).unwrap_or_else(|_| ppk_path.to_path_buf());
+    let digest = Sha256::digest(source.to_string_lossy().as_bytes());
+    let name = format!("putty-{}", hex::encode(&digest[..12]));
+    write_private_key_file(dir, &name, &pem).map_err(|e| PpkError::Io(e.to_string()))
+}
+
+/// Writes `contents` atomically as `dir/name`, private to the user (0600 in a 0700
+/// folder on Unix), replacing an older file of that name.
+pub(crate) fn write_private_key_file(
+    dir: &Path,
+    name: &str,
+    contents: &str,
+) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+
+    std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(io)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    let source = std::fs::canonicalize(ppk_path).unwrap_or_else(|_| ppk_path.to_path_buf());
-    let digest = Sha256::digest(source.to_string_lossy().as_bytes());
-    let target = dir.join(format!("putty-{}", hex::encode(&digest[..12])));
-    let temp = dir.join(format!(".putty-{}.tmp", uuid::Uuid::new_v4().simple()));
+    let target = dir.join(name);
+    let temp = dir.join(format!(".{}-{}.tmp", name, uuid::Uuid::new_v4().simple()));
 
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -468,11 +478,11 @@ pub fn write_openssh_copy(
     }
     let written = options
         .open(&temp)
-        .and_then(|mut f| f.write_all(pem.as_bytes()).and_then(|()| f.sync_all()))
+        .and_then(|mut f| f.write_all(contents.as_bytes()).and_then(|()| f.sync_all()))
         .and_then(|()| std::fs::rename(&temp, &target));
     if let Err(e) = written {
         let _ = std::fs::remove_file(&temp);
-        return Err(io(e));
+        return Err(e);
     }
     Ok(target)
 }
@@ -651,12 +661,12 @@ impl<'a> Lines<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // Test vectors from PuTTY's own test suite (`test/cryptsuite.py`, testPPKLoadSave):
     // one Ed25519 key saved in both formats, in the clear and with a passphrase.
-    const V3_CLEAR: &str = "\
+    pub(crate) const V3_CLEAR: &str = "\
 PuTTY-User-Key-File-3: ssh-ed25519
 Encryption: none
 Comment: ed25519-key-20200105
@@ -667,7 +677,7 @@ Private-Lines: 1
 AAAAIGvvIpl8jyqn8Xufkw6v3FnEGtXF3KWw55AP3/AGEBpY
 Private-MAC: 816c84093fc4877e8411b8e5139c5ce35d8387a2630ff087214911d67417a54d
 ";
-    const V3_ENCRYPTED: &str = "\
+    pub(crate) const V3_ENCRYPTED: &str = "\
 PuTTY-User-Key-File-3: ssh-ed25519
 Encryption: aes256-cbc
 Comment: ed25519-key-20200105
@@ -683,7 +693,7 @@ Private-Lines: 1
 amviz4sVUBN64jLO3gt4HGXJosUArghc4Soi7aVVLb2Tir5Baj0OQClorycuaPRd
 Private-MAC: 6f5e588e475e55434106ec2c3569695b03f423228b44993a9e97d52ffe7be5a8
 ";
-    const V2_CLEAR: &str = "\
+    pub(crate) const V2_CLEAR: &str = "\
 PuTTY-User-Key-File-2: ssh-ed25519
 Encryption: none
 Comment: ed25519-key-20200105
@@ -694,7 +704,7 @@ Private-Lines: 1
 AAAAIGvvIpl8jyqn8Xufkw6v3FnEGtXF3KWw55AP3/AGEBpY
 Private-MAC: 2a629acfcfbe28488a1ba9b6948c36406bc28422
 ";
-    const V2_ENCRYPTED: &str = "\
+    pub(crate) const V2_ENCRYPTED: &str = "\
 PuTTY-User-Key-File-2: ssh-ed25519
 Encryption: aes256-cbc
 Comment: ed25519-key-20200105
@@ -705,8 +715,8 @@ Private-Lines: 1
 4/jKlTgC652oa9HLVGrMjHZw7tj0sKRuZaJPOuLhGTvb25Jzpcqpbi+Uf+y+uo+Z
 Private-MAC: 5b1f6f4cc43eb0060d2c3e181bc0129343adba2b
 ";
-    const PASSPHRASE: &str = "test-passphrase";
-    const PUBLIC_KEY: &str =
+    pub(crate) const PASSPHRASE: &str = "test-passphrase";
+    pub(crate) const PUBLIC_KEY: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHJCszOHaI9X/yGLtjn22f0hO6VPMQDVtctkym6FJH1W";
     /// The 32-byte secret of the test key, in the clear in its private blob.
     const SECRET_HEX: &str = "6bef22997c8f2aa7f17b9f930eafdc59c41ad5c5dca5b0e7900fdff006101a58";

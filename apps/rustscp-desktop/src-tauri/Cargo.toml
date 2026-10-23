@@ -25,6 +25,14 @@ uuid.workspace = true
 sha2.workspace = true
 chrono.workspace = true
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+# A double-clicked `.rustscp` file starts a second process on Windows / Linux; it hands
+# the file to the running window instead.
+tauri-plugin-single-instance = "2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSImage"] }

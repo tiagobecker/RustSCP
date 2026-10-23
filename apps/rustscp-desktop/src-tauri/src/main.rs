@@ -1,8 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod sharing;
 
 use commands::*;
+use sharing::*;
 
 #[cfg(target_os = "macos")]
 fn setup_macos_dock_icon() {
@@ -63,14 +65,38 @@ fn main() {
     #[cfg(target_os = "macos")]
     disable_macos_text_substitutions();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Windows and Linux start a new process for every double-clicked `.rustscp` file:
+    // that second launch hands its arguments to the running window and exits. (macOS
+    // sends files to the running app itself, as `RunEvent::Opened`.)
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+        let files = share_files_in_args(argv.iter().skip(1), Some(std::path::Path::new(&cwd)));
+        receive_share_files(app, files);
+        use tauri::Manager;
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }));
+
+    builder
         .setup(|app| {
             #[cfg(target_os = "macos")]
             setup_macos_dock_icon();
+            #[cfg(target_os = "linux")]
+            register_linux_share_handler();
+            // A `.rustscp` file this process was started with (Windows, Linux).
+            receive_share_files(
+                app.handle(),
+                share_files_in_args(std::env::args().skip(1), None),
+            );
             tauri::async_runtime::spawn(start_mcp_gateway(app.handle().clone()));
             Ok(())
         })
         .manage(AppState::new())
+        .manage(SharingState::default())
         .invoke_handler(tauri::generate_handler![
             connect_session,
             disconnect_session,
@@ -143,10 +169,22 @@ fn main() {
             open_in_external_editor,
             save_text_file_dialog,
             invalidate_directory_cache,
+            create_connection_share,
+            check_connection_share,
+            open_connection_share,
+            accept_connection_share,
+            discard_connection_share,
+            take_pending_share_files,
         ])
         .build(tauri::generate_context!())
         .expect("error while building RustSCP desktop application")
         .run(|app, event| {
+            // Double-clicked / "Open With" files, also the one that launched the app.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Opened { urls } = &event {
+                let files = urls.iter().filter_map(|u| u.to_file_path().ok()).collect();
+                receive_share_files(app, files);
+            }
             if matches!(
                 event,
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit

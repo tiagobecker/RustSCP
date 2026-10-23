@@ -406,6 +406,7 @@ mod tests {
                 AuthMethod::PrivateKey {
                     path: "/home/u/.ssh/id_ed25519".into(),
                     passphrase: Some(SECRET.into()),
+                    key_data: None,
                 },
                 Protocol::Sftp,
             ),
