@@ -5221,6 +5221,28 @@ pub(crate) fn ssh_terminal_args(
     Ok(args)
 }
 
+/// `cfg` with its PuTTY (`.ppk`) key, if it has one, swapped for an OpenSSH copy saved in
+/// `keys_dir`: the system `ssh` client only reads OpenSSH keys. The copy is encrypted with
+/// the key's passphrase when the original is, so ssh asks for that passphrase as usual.
+fn terminal_ssh_config(
+    mut cfg: ConnectionConfig,
+    keys_dir: &std::path::Path,
+) -> Result<ConnectionConfig, String> {
+    use rustscp_core::{known_hosts::expand_tilde, ppk, AuthMethod};
+
+    if let AuthMethod::PrivateKey { path, passphrase } = &mut cfg.auth {
+        let key_path = expand_tilde(path.trim());
+        if ppk::is_ppk_file(&key_path) {
+            let copy = ppk::write_openssh_copy(&key_path, passphrase.as_deref(), keys_dir)
+                .map_err(|e| {
+                    format!("Could not use the PuTTY key {}: {}", key_path.display(), e)
+                })?;
+            *path = copy.to_string_lossy().into_owned();
+        }
+    }
+    Ok(cfg)
+}
+
 /// Writes a private (0600), self-deleting `/bin/sh` script that runs `ssh <args>`.
 /// Terminal.app then only types `/bin/sh '<script>'` into the user's shell, so remote
 /// data is never parsed by that shell (which may be zsh, bash or fish).
@@ -5357,13 +5379,20 @@ pub async fn open_native_terminal(
 
     // Remote SSH session: build ssh's argument vector once; each platform passes it on
     // without a local shell string.
-    let mut ssh_args = {
-        let configs = state.session_configs.read().await;
-        let cfg = configs
-            .get(&session_id)
-            .ok_or_else(|| format!("Session config for '{}' not found", session_id))?;
-        ssh_terminal_args(cfg, &path)?
-    };
+    let cfg = state
+        .session_configs
+        .read()
+        .await
+        .get(&session_id)
+        .cloned()
+        .ok_or_else(|| format!("Session config for '{}' not found", session_id))?;
+    // Converting a PuTTY key runs its key derivation (Argon2, bcrypt): off the async runtime.
+    let cfg = tokio::task::spawn_blocking(move || {
+        terminal_ssh_config(cfg, &get_rustscp_config_dir().join("openssh-keys"))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let mut ssh_args = ssh_terminal_args(&cfg, &path)?;
     // The `cd '<path>'` command is parsed by the server's login shell. When that shell
     // does not quote like `sh` (fish, cmd.exe, PowerShell), open a plain login shell in
     // the home folder instead of letting it parse the folder name.
@@ -6754,6 +6783,78 @@ mod security_tests {
             windows_tar_extract_args("C:\\a.zip", "C:\\out", false),
             vec!["-x", "-k", "-f", "C:\\a.zip", "-C", "C:\\out"]
         );
+    }
+
+    #[test]
+    fn terminal_ssh_uses_an_openssh_copy_of_putty_keys() {
+        // An Ed25519 key from PuTTY's test suite (`test/cryptsuite.py`).
+        const PPK: &str = "PuTTY-User-Key-File-2: ssh-ed25519\n\
+            Encryption: none\n\
+            Comment: ed25519-key-20200105\n\
+            Public-Lines: 2\n\
+            AAAAC3NzaC1lZDI1NTE5AAAAIHJCszOHaI9X/yGLtjn22f0hO6VPMQDVtctkym6F\n\
+            JH1W\n\
+            Private-Lines: 1\n\
+            AAAAIGvvIpl8jyqn8Xufkw6v3FnEGtXF3KWw55AP3/AGEBpY\n\
+            Private-MAC: 2a629acfcfbe28488a1ba9b6948c36406bc28422\n";
+        let dir = ScratchDir::new("terminal-ppk");
+        let keys_dir = dir.path().join("openssh-keys");
+        let ppk = dir.path().join("server.ppk");
+        std::fs::write(&ppk, PPK).unwrap();
+        let key_path = |cfg: &ConnectionConfig| match &cfg.auth {
+            AuthMethod::PrivateKey { path, .. } => path.clone(),
+            _ => unreachable!(),
+        };
+
+        let cfg = site(
+            "s1",
+            AuthMethod::PrivateKey {
+                path: ppk.to_string_lossy().into_owned(),
+                passphrase: None,
+            },
+        );
+        let converted = terminal_ssh_config(cfg, &keys_dir).unwrap();
+        let copy = std::path::PathBuf::from(key_path(&converted));
+        assert!(copy.starts_with(&keys_dir));
+        assert!(std::fs::read_to_string(&copy)
+            .unwrap()
+            .starts_with("-----BEGIN OPENSSH PRIVATE KEY-----\n"));
+        assert!(ssh_terminal_args(&converted, "/")
+            .unwrap()
+            .contains(&copy.to_string_lossy().into_owned()));
+
+        // OpenSSH keys and password sites are left alone.
+        let openssh = dir.path().join("id_ed25519");
+        std::fs::write(&openssh, "-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
+        let cfg = site(
+            "s2",
+            AuthMethod::PrivateKey {
+                path: openssh.to_string_lossy().into_owned(),
+                passphrase: None,
+            },
+        );
+        assert_eq!(
+            key_path(&terminal_ssh_config(cfg, &keys_dir).unwrap()),
+            openssh.to_string_lossy()
+        );
+        let cfg = site("s3", AuthMethod::Password("pw".into()));
+        assert!(matches!(
+            terminal_ssh_config(cfg, &keys_dir).unwrap().auth,
+            AuthMethod::Password(_)
+        ));
+
+        // A damaged PuTTY key is reported instead of handed to ssh.
+        std::fs::write(&ppk, PPK.replace("2a629a", "000000")).unwrap();
+        let cfg = site(
+            "s4",
+            AuthMethod::PrivateKey {
+                path: ppk.to_string_lossy().into_owned(),
+                passphrase: None,
+            },
+        );
+        assert!(terminal_ssh_config(cfg, &keys_dir)
+            .unwrap_err()
+            .contains("PuTTY key"));
     }
 
     #[test]

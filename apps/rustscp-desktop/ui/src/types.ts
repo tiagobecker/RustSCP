@@ -53,7 +53,7 @@ export interface WinScpImportResult {
   sites: ConnectionConfig[];
   /** Stored passwords that could not be recovered; those sites are imported without one. */
   undecrypted_passwords?: number;
-  /** Key sites whose key is a PuTTY .ppk file (must be converted to OpenSSH format). */
+  /** Key sites whose key is a PuTTY .ppk file (RustSCP reads these directly). */
   ppk_key_sessions?: number;
   /** Key sites whose key file does not exist on this computer. */
   missing_key_files?: number;

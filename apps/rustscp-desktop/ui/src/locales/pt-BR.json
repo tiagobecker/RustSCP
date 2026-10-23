@@ -279,7 +279,7 @@
     "deleteConfirm": "Tem certeza que deseja excluir esta conexão?",
     "cancelConnecting": "Parar",
     "savedSuccess": "Salvo com sucesso!",
-    "keyFileHelper": "Suporta arquivos .pem, .key, OpenSSH e certificados.",
+    "keyFileHelper": "Suporta arquivos .pem, .key, OpenSSH, PuTTY (.ppk) e certificados.",
     "remoteRootHelper": "Deixe vazio para abrir a pasta home do usuário (~).",
     "errHost": "Informe o endereço do servidor.",
     "errPort": "A porta deve ser um número entre 1 e 65535.",
