@@ -32,6 +32,18 @@ sha2 = "0.10"
 regex = "1.11"
 tempfile = "3.17"
 
+# Key derivation of passphrase-protected PuTTY keys (Argon2) and of the OpenSSH copies
+# made for the system `ssh` client (bcrypt) runs in about 0.1 s optimized and many
+# times that unoptimized, so debug builds optimize these crates too.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+[profile.dev.package.bcrypt-pbkdf]
+opt-level = 3
+[profile.dev.package.blowfish]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 lto = true

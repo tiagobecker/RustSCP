@@ -49,9 +49,7 @@ pub struct WinScpImportResult {
     /// or a damaged value); they are imported without one.
     #[serde(default)]
     pub undecrypted_passwords: usize,
-    /// Key sites whose key is a PuTTY `.ppk` file. The SSH library RustSCP uses cannot
-    /// read that format: convert the key with PuTTYgen (Conversions > Export OpenSSH key)
-    /// and point the site at the converted file.
+    /// Key sites whose key is a PuTTY `.ppk` file (read directly, see [`crate::ppk`]).
     #[serde(default)]
     pub ppk_key_sessions: usize,
     /// Key sites whose key file does not exist on this computer.
@@ -385,28 +383,10 @@ fn normalize_key_path_in(raw: &str, env: &KeyPathEnv<'_>) -> String {
     unix_style
 }
 
-/// First line of every PuTTY private key file (`.ppk`, versions 2 and 3).
-const PPK_HEADER: &[u8] = b"PuTTY-User-Key-File-";
-
 /// Whether `path` is a PuTTY private key (`.ppk`), judged by its first bytes, not its
-/// name. The SSH library RustSCP uses cannot read that format; `false` when the file
-/// cannot be read.
+/// name; `false` when the file cannot be read.
 pub fn is_putty_private_key(path: &Path) -> bool {
-    let mut head = [0u8; PPK_HEADER.len() + 3];
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut read = 0;
-    let mut reader = file.take(head.len() as u64);
-    while read < head.len() {
-        match reader.read(&mut head[read..]) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => read += n,
-        }
-    }
-    let head = &head[..read];
-    let head = head.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(head);
-    head.starts_with(PPK_HEADER)
+    crate::ppk::is_ppk_file(path)
 }
 
 /// Turns the `PublicKeyFile` of a WinSCP session into a key path for this computer:

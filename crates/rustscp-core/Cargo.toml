@@ -27,6 +27,16 @@ libc = "0.2"
 aes-gcm = "0.10"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 rand = "0.8"
+# PuTTY private keys (.ppk): AES-256-CBC, SHA-1/HMAC-SHA-1 (format 2) and Argon2 +
+# HMAC-SHA-256 (format 3). bcrypt-pbkdf + AES-CTR re-encrypt a converted key in
+# OpenSSH's own format for the system `ssh` client.
+aes = "0.8"
+cbc = "0.1"
+ctr = "0.9"
+sha1 = "0.10"
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+bcrypt-pbkdf = { version = "0.10", default-features = false, features = ["alloc"] }
+zeroize = "1"
 # FTPS (FTP over TLS). The same rustls build reqwest already uses: aws-lc-rs
 # crypto and the operating system's certificate verifier.
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }

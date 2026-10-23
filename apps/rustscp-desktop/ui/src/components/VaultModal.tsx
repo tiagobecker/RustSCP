@@ -953,7 +953,6 @@ export const VaultModal = ({ isOpen, onClose, siteCount, onSitesUpdated, initial
   });
   const winscpShown = winscpFiltered.slice(0, MAX_WINSCP_PREVIEW_ROWS);
   const winscpKeySites = winscpSites.filter((s) => s.auth?.type === 'PrivateKey').length;
-  const winscpPuttyKeys = winscpPreview?.ppk_key_sessions ?? winscpSites.filter(isPuttyKey).length;
   // undefined when the backend does not check key files: a general note is shown instead
   const winscpMissingKeys = winscpPreview?.missing_key_files;
   const winscpUndecrypted = winscpPreview?.undecrypted_passwords ?? 0;
@@ -1182,19 +1181,6 @@ export const VaultModal = ({ isOpen, onClose, siteCount, onSitesUpdated, initial
                       `${winscpUndecrypted} saved passwords could not be recovered; those connections are imported without one.`
                     )
               )}
-          {winscpPuttyKeys > 0 &&
-            winscpNote(
-              winscpPuttyKeys === 1
-                ? tr(
-                    '1 conexão usa uma chave do PuTTY (.ppk), que o RustSCP não lê. Converta a chave no PuTTYgen (Conversions › Export OpenSSH key) e escolha o arquivo novo na conexão.',
-                    '1 connection uses a PuTTY key (.ppk), which RustSCP cannot read. Convert the key in PuTTYgen (Conversions › Export OpenSSH key) and choose the new file in the connection.'
-                  )
-                : tr(
-                    `${winscpPuttyKeys} conexões usam chaves do PuTTY (.ppk), que o RustSCP não lê. Converta as chaves no PuTTYgen (Conversions › Export OpenSSH key) e escolha os arquivos novos nas conexões.`,
-                    `${winscpPuttyKeys} connections use PuTTY keys (.ppk), which RustSCP cannot read. Convert the keys in PuTTYgen (Conversions › Export OpenSSH key) and choose the new files in the connections.`
-                  ),
-              true
-            )}
           {winscpMissingKeys === undefined
             ? winscpKeySites > 0 &&
               winscpNote(

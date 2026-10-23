@@ -1092,20 +1092,26 @@ impl SftpDriver {
                     )));
                 }
                 let pass = passphrase.as_deref().filter(|p| !p.is_empty());
-                sess.userauth_pubkey_file(user, None, &key_path, pass)
-                    .map_err(|e| {
-                        // Sites imported from WinSCP usually point at PuTTY keys.
-                        if crate::winscp::is_putty_private_key(&key_path) {
-                            return CoreError::AuthFailed(format!(
-                                "Private key authentication failed: {} is a PuTTY (.ppk) key, \
-                                 which RustSCP cannot read. Convert it in PuTTYgen \
-                                 (Conversions > Export OpenSSH key) and choose the converted \
-                                 file for this site",
-                                key_path.display()
-                            ));
-                        }
-                        CoreError::AuthFailed(format!("Private key authentication failed: {}", e))
-                    })?;
+                let result = if crate::ppk::is_ppk_file(&key_path) {
+                    // libssh2 cannot read PuTTY keys (sites imported from WinSCP usually
+                    // use them): the key is decrypted here and handed over in OpenSSH
+                    // format, from memory.
+                    let (public_key, private_key) = crate::ppk::PpkKey::from_file(&key_path, pass)
+                        .and_then(|key| Ok((key.public_key(), key.to_openssh(None)?)))
+                        .map_err(|e| {
+                            CoreError::AuthFailed(format!(
+                                "Private key authentication failed: {}: {}",
+                                key_path.display(),
+                                e
+                            ))
+                        })?;
+                    sess.userauth_pubkey_memory(user, Some(&public_key), &private_key, None)
+                } else {
+                    sess.userauth_pubkey_file(user, None, &key_path, pass)
+                };
+                result.map_err(|e| {
+                    CoreError::AuthFailed(format!("Private key authentication failed: {}", e))
+                })?;
             }
             AuthMethod::KeyringRef(_) | AuthMethod::None => {
                 let mut errors: Vec<String> = Vec::new();
