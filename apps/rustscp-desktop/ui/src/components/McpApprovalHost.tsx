@@ -70,9 +70,71 @@ export const McpApprovalHost: React.FC = () => {
     });
   };
 
-  const replacing = current.previous_size !== null && current.previous_size !== undefined;
   const secondsLeft = Math.max(0, Math.ceil((current.expires_at_ms - now) / 1000));
   const countdown = `${Math.floor(secondsLeft / 60)}:${String(secondsLeft % 60).padStart(2, '0')}`;
+  const queuePos =
+    queue.length > 1 ? (
+      <span className="font-sans text-ink-faint"> · {isPt ? `1 de ${queue.length}` : `1 of ${queue.length}`}</span>
+    ) : null;
+  const deniedIn = isPt ? `Negado automaticamente em ${countdown}.` : `Denied automatically in ${countdown}.`;
+
+  // A command request looks and reads differently from a file write.
+  const isCommand = current.kind === 'command';
+  if (isCommand) {
+    const risk = (current.risk ?? 'caution') as 'safe' | 'caution' | 'dangerous';
+    const dangerous = risk === 'dangerous';
+    const riskLabel = isPt
+      ? { safe: 'Baixo risco', caution: 'Atenção', dangerous: 'Perigoso' }[risk]
+      : { safe: 'Low risk', caution: 'Caution', dangerous: 'Dangerous' }[risk];
+    return (
+      <AutomationConfirm
+        isOpen
+        tone={dangerous ? 'danger' : 'primary'}
+        title={isPt ? 'Permitir que um agente de IA execute este comando?' : 'Allow an AI agent to run this command?'}
+        message={
+          isPt ? (
+            <>
+              <span className="text-ink">{current.agent_id}</span> quer executar um comando em{' '}
+              <span className="text-ink">{current.connection_name}</span>.
+            </>
+          ) : (
+            <>
+              <span className="text-ink">{current.agent_id}</span> wants to run a command on{' '}
+              <span className="text-ink">{current.connection_name}</span>.
+            </>
+          )
+        }
+        target={<span className="font-mono break-all">{current.connection_name}{queuePos}</span>}
+        command={current.command ?? undefined}
+        confirmLabel={isPt ? 'Permitir' : 'Allow'}
+        cancelLabel={isPt ? 'Negar' : 'Deny'}
+        onConfirm={() => answer(true)}
+        onCancel={() => answer(false)}
+      >
+        <div className="space-y-1 text-[12px] text-ink-faint">
+          <div>
+            <span
+              className={
+                dangerous
+                  ? 'text-red-600 dark:text-red-400'
+                  : risk === 'caution'
+                    ? 'text-amber-700 dark:text-amber-400'
+                    : 'text-ink-faint'
+              }
+            >
+              {riskLabel}
+            </span>
+            {isPt
+              ? ' · roda com as credenciais já conectadas'
+              : ' · runs with the already-connected credentials'}
+          </div>
+          <div>{deniedIn}</div>
+        </div>
+      </AutomationConfirm>
+    );
+  }
+
+  const replacing = current.previous_size !== null && current.previous_size !== undefined;
   const sizeLine = replacing
     ? `${formatBytes(current.previous_size ?? 0)} → ${formatBytes(current.new_size)}`
     : isPt
@@ -106,7 +168,7 @@ export const McpApprovalHost: React.FC = () => {
       target={
         <span className="font-mono break-all">
           {current.path}
-          {queue.length > 1 && <span className="font-sans text-ink-faint"> · {isPt ? `1 de ${queue.length}` : `1 of ${queue.length}`}</span>}
+          {queuePos}
         </span>
       }
       command={current.preview !== null && current.preview !== undefined ? current.preview + (current.preview_truncated ? '\n…' : '') : undefined}
@@ -127,9 +189,7 @@ export const McpApprovalHost: React.FC = () => {
         <div className="font-mono break-all" title="SHA-256">
           sha256 {current.new_sha256}
         </div>
-        <div>
-          {isPt ? `Negado automaticamente em ${countdown}.` : `Denied automatically in ${countdown}.`}
-        </div>
+        <div>{deniedIn}</div>
       </div>
     </AutomationConfirm>
   );

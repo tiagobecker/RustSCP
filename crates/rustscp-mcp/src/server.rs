@@ -1,4 +1,5 @@
 use crate::audit::AuditLogger;
+use crate::policy::{classify_command, CommandAccess, CommandDecision, CommandRisk};
 use crate::protocol::{JsonRpcResponse, McpContent, McpToolDefinition, McpToolResult};
 use crate::rpc::{RpcSession, ToolBackend};
 use async_trait::async_trait;
@@ -9,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 /// An MCP stdio transport ships with this build: `rustscp-desktop --mcp-stdio` (or the
@@ -28,8 +30,15 @@ const MAX_HASHED_PREVIOUS_BYTES: u64 = 8 * 1024 * 1024;
 pub const APPROVAL_PREVIEW_BYTES: usize = 4096;
 /// Audit status of a write whose call ended while it waited for approval.
 const WITHDRAWN_STATUS: &str = "withdrawn: the agent cancelled or disconnected";
+/// Default and maximum seconds a `run_command` call may run before it is stopped.
+pub const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 120;
+pub const MAX_COMMAND_TIMEOUT_SECS: u64 = 1800;
+/// Command output beyond this many bytes is trimmed (head + tail) in the tool result.
+const MAX_COMMAND_OUTPUT_BYTES: usize = 48 * 1024;
 
-/// Tools that change data; each call waits for a person's approval (see [`ToolApprover`]).
+/// Tools that always change data and so always ask, whatever the policy. A command's
+/// approval depends on the person's [`CommandAccess`] choice and the command's risk, so
+/// it is decided per call, not here.
 pub fn tool_requires_approval(tool_name: &str) -> bool {
     matches!(tool_name, "fs_write_file")
 }
@@ -44,9 +53,26 @@ pub struct ConnectionInfo {
     pub host: String,
 }
 
-/// A change an agent asked for, shown to the person who allows or denies it.
+/// What kind of action an [`ApprovalRequest`] is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalKind {
+    /// An `fs_write_file` call (the fields describe the new file).
+    #[default]
+    Write,
+    /// A `run_command` call (`command` and `risk` are set).
+    Command,
+}
+
+/// A change an agent asked for, shown to the person who allows or denies it. A write and a
+/// command share this shape; [`kind`](Self::kind) says which, and the fields that do not
+/// apply are left at their defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
+    /// What is being approved. Older windows that do not read it treat every request as a
+    /// write; the command fields below still render.
+    #[serde(default)]
+    pub kind: ApprovalKind,
     pub agent_id: String,
     pub tool_name: String,
     pub connection_id: String,
@@ -61,6 +87,34 @@ pub struct ApprovalRequest {
     /// Start of the new content when it is UTF-8 text (at most [`APPROVAL_PREVIEW_BYTES`]).
     pub preview: Option<String>,
     pub preview_truncated: bool,
+    /// The exact command line, for a [`Command`](ApprovalKind::Command) request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// How risky the command looks ("safe", "caution", "dangerous").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<String>,
+}
+
+impl ApprovalRequest {
+    /// An empty request of `kind`, filled in by the caller.
+    fn new(kind: ApprovalKind) -> Self {
+        Self {
+            kind,
+            agent_id: String::new(),
+            tool_name: String::new(),
+            connection_id: String::new(),
+            connection_name: String::new(),
+            path: String::new(),
+            summary: String::new(),
+            new_size: 0,
+            new_sha256: String::new(),
+            previous_size: None,
+            preview: None,
+            preview_truncated: false,
+            command: None,
+            risk: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +134,25 @@ pub trait ToolApprover: Send + Sync {
 struct RegisteredConnection {
     info: ConnectionInfo,
     vfs: Arc<dyn VirtualFileSystem>,
+}
+
+/// [`CommandAccess`] as the one byte stored in [`McpServer::command_access`].
+fn access_code(access: CommandAccess) -> u8 {
+    match access {
+        CommandAccess::Off => 0,
+        CommandAccess::Ask => 1,
+        CommandAccess::Auto => 2,
+        CommandAccess::Trusted => 3,
+    }
+}
+
+fn access_from_code(code: u8) -> CommandAccess {
+    match code {
+        0 => CommandAccess::Off,
+        2 => CommandAccess::Auto,
+        3 => CommandAccess::Trusted,
+        _ => CommandAccess::Ask,
+    }
 }
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -185,16 +258,11 @@ fn write_approval_request(
         Some(old) => format!("Replace {path} ({old} bytes) with {} bytes", data.len()),
         None => format!("Create {path} ({} bytes)", data.len()),
     };
-    let connection_name = if info.name.is_empty() {
-        conn_id.to_string()
-    } else {
-        info.name.clone()
-    };
     ApprovalRequest {
         agent_id: agent_id.to_string(),
         tool_name: tool_name.to_string(),
         connection_id: conn_id.to_string(),
-        connection_name,
+        connection_name: display_connection_name(conn_id, info),
         path: path.to_string(),
         summary,
         new_size: data.len() as u64,
@@ -202,6 +270,66 @@ fn write_approval_request(
         previous_size,
         preview_truncated: preview.is_some() && used < data.len(),
         preview,
+        ..ApprovalRequest::new(ApprovalKind::Write)
+    }
+}
+
+/// Command output for the agent: the whole thing when it is small, otherwise the head and
+/// the tail with a marker between (so both the start and the latest lines survive). Returns
+/// (text, whether it was trimmed). Cuts on a UTF-8 boundary.
+fn trim_output(text: &str) -> (String, bool) {
+    if text.len() <= MAX_COMMAND_OUTPUT_BYTES {
+        return (text.to_string(), false);
+    }
+    let half = MAX_COMMAND_OUTPUT_BYTES / 2;
+    let head_end = (0..=half)
+        .rev()
+        .find(|&i| text.is_char_boundary(i))
+        .unwrap_or(0);
+    let tail_start = (text.len() - half..text.len())
+        .find(|&i| text.is_char_boundary(i))
+        .unwrap_or(text.len());
+    let omitted = tail_start.saturating_sub(head_end);
+    (
+        format!(
+            "{}\n…[{} bytes omitted]…\n{}",
+            &text[..head_end],
+            omitted,
+            &text[tail_start..]
+        ),
+        true,
+    )
+}
+
+/// The name shown for a connection, falling back to its id.
+fn display_connection_name(conn_id: &str, info: &ConnectionInfo) -> String {
+    if info.name.is_empty() {
+        conn_id.to_string()
+    } else {
+        info.name.clone()
+    }
+}
+
+/// What the person approving a `run_command` call is shown.
+fn command_approval_request(
+    agent_id: &str,
+    conn_id: &str,
+    info: &ConnectionInfo,
+    command: &str,
+    risk: CommandRisk,
+) -> ApprovalRequest {
+    ApprovalRequest {
+        agent_id: agent_id.to_string(),
+        tool_name: "run_command".to_string(),
+        connection_id: conn_id.to_string(),
+        connection_name: display_connection_name(conn_id, info),
+        summary: format!(
+            "Run a command on {}",
+            display_connection_name(conn_id, info)
+        ),
+        command: Some(command.to_string()),
+        risk: Some(risk.as_str().to_string()),
+        ..ApprovalRequest::new(ApprovalKind::Command)
     }
 }
 
@@ -332,6 +460,9 @@ pub struct McpServer {
     /// unrestricted local filesystem is never registered by default.
     connections: Arc<RwLock<HashMap<String, RegisteredConnection>>>,
     approver: std::sync::RwLock<Option<Arc<dyn ToolApprover>>>,
+    /// How agent commands are handled right now (the person's choice; see
+    /// [`CommandAccess`]). Defaults to [`CommandAccess::Ask`].
+    command_access: std::sync::atomic::AtomicU8,
 }
 
 impl McpServer {
@@ -340,7 +471,22 @@ impl McpServer {
             audit_logger,
             connections: Arc::new(RwLock::new(HashMap::new())),
             approver: std::sync::RwLock::new(None),
+            command_access: std::sync::atomic::AtomicU8::new(access_code(CommandAccess::default())),
         }
+    }
+
+    /// Sets how agent commands are handled (from the gateway settings).
+    pub fn set_command_access(&self, access: CommandAccess) {
+        self.command_access
+            .store(access_code(access), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How agent commands are handled right now.
+    pub fn command_access(&self) -> CommandAccess {
+        access_from_code(
+            self.command_access
+                .load(std::sync::atomic::Ordering::SeqCst),
+        )
     }
 
     pub fn audit_logger(&self) -> &AuditLogger {
@@ -482,6 +628,32 @@ impl McpServer {
                 })),
             },
             McpToolDefinition {
+                name: "run_command".to_string(),
+                description: format!(
+                    "Run a shell command on a connected SSH server and return its exit code, stdout and stderr. \
+                     The command runs with the credentials RustSCP is already connected with (password, key, PuTTY key or certificate) — you never see or send them. \
+                     Depending on the user's setting each command either runs straight away or waits for the user to allow it in the RustSCP window; a command the user denies, or that nobody answers, does not run. \
+                     Every command is recorded in the activity log. Default time limit {DEFAULT_COMMAND_TIMEOUT_SECS}s, maximum {MAX_COMMAND_TIMEOUT_SECS}s; a command still running at the limit is stopped and reported as an error. \
+                     Only SSH/SFTP connections run commands (S3 and FTP do not). Prefer one non-interactive command per call; it does not keep a shell between calls, so use 'cd /path && ...' to set the directory."
+                ),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["connection_id", "command"],
+                    "properties": {
+                        "connection_id": { "type": "string", "description": "Session ID from session_list" },
+                        "command": { "type": "string", "description": "The shell command to run (POSIX sh/bash on the server)" },
+                        "working_dir": { "type": "string", "description": "Optional directory to run in (the server does 'cd' there first)" },
+                        "timeout_seconds": { "type": "integer", "description": format!("Optional time limit in seconds (default {DEFAULT_COMMAND_TIMEOUT_SECS}, max {MAX_COMMAND_TIMEOUT_SECS})") }
+                    }
+                }),
+                annotations: Some(json!({
+                    "title": "Run a shell command",
+                    "readOnlyHint": false,
+                    "destructiveHint": true,
+                    "openWorldHint": true
+                })),
+            },
+            McpToolDefinition {
                 name: "fs_search".to_string(),
                 description: "Search for files by pattern inside an active connection".to_string(),
                 input_schema: json!({
@@ -553,6 +725,200 @@ impl McpServer {
             .collect()
     }
 
+    /// Runs a shell command on a connected server for an agent: checks the command can
+    /// run, classifies its risk, applies the person's [`CommandAccess`] choice (deny, ask,
+    /// or run on its own), runs it with a time limit, and records the outcome.
+    async fn handle_run_command(
+        &self,
+        agent_id: &str,
+        conn_id: &str,
+        info: &ConnectionInfo,
+        vfs: Arc<dyn VirtualFileSystem>,
+        arguments: &Value,
+    ) -> McpToolResult {
+        let tool_name = "run_command";
+        let command = arguments
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if command.is_empty() {
+            self.audit(
+                agent_id,
+                tool_name,
+                conn_id,
+                "",
+                "error: empty command",
+                None,
+            )
+            .await;
+            return McpToolResult::error_text("command is required and must not be empty");
+        }
+        if !vfs.supports_shell() {
+            self.audit(
+                agent_id,
+                tool_name,
+                conn_id,
+                command,
+                "error: no shell on this connection",
+                None,
+            )
+            .await;
+            return McpToolResult::error_text(format!(
+                "The '{}' connection does not run shell commands (only SSH/SFTP servers do). \
+                 Use the file tools instead.",
+                display_connection_name(conn_id, info)
+            ));
+        }
+
+        let timeout_secs = arguments
+            .get("timeout_seconds")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS)
+            .clamp(1, MAX_COMMAND_TIMEOUT_SECS);
+        let working_dir = arguments
+            .get("working_dir")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|d| !d.is_empty());
+        let effective = match working_dir {
+            Some(dir) => format!("cd {} && {}", rustscp_core::shell::sh_quote(dir), command),
+            None => command.to_string(),
+        };
+
+        let risk = classify_command(command);
+        let access = self.command_access();
+        let summary = match working_dir {
+            Some(dir) => format!("{command}  (in {dir})"),
+            None => command.to_string(),
+        };
+
+        // Decide: deny outright, ask the person, or run on its own.
+        match access.decide(risk) {
+            CommandDecision::Deny(reason) => {
+                self.audit(
+                    agent_id,
+                    tool_name,
+                    conn_id,
+                    &summary,
+                    &format!("denied by policy: {reason}"),
+                    Some(format!("risk={}", risk.as_str())),
+                )
+                .await;
+                return McpToolResult::error_text(format!(
+                    "This command was not run: {reason} (risk: {}).",
+                    risk.as_str()
+                ));
+            }
+            CommandDecision::Ask => {
+                let request = command_approval_request(agent_id, conn_id, info, command, risk);
+                let decision = match self.current_approver() {
+                    Some(approver) => {
+                        let mut withdrawn = WithdrawnWriteAudit {
+                            audit: self.audit_logger.clone(),
+                            agent_id: agent_id.to_string(),
+                            tool_name: tool_name.to_string(),
+                            conn_id: conn_id.to_string(),
+                            path: summary.clone(),
+                            diff: format!("risk={}", risk.as_str()),
+                            answered: false,
+                        };
+                        let decision = approver.approve(request).await;
+                        withdrawn.answered = true;
+                        decision
+                    }
+                    None => ApprovalDecision::Denied(
+                        "no RustSCP window is available to approve it".to_string(),
+                    ),
+                };
+                if let ApprovalDecision::Denied(reason) = decision {
+                    self.audit(
+                        agent_id,
+                        tool_name,
+                        conn_id,
+                        &summary,
+                        &format!("denied: {reason}"),
+                        Some(format!("risk={}", risk.as_str())),
+                    )
+                    .await;
+                    return McpToolResult::error_text(format!(
+                        "The command was not allowed ({reason}). Nothing was run."
+                    ));
+                }
+            }
+            CommandDecision::Allow => {
+                // Runs on its own under the person's setting; still fully recorded below.
+            }
+        }
+
+        // The command runs as its own task, so an agent that disconnects mid-call still
+        // gets a complete audit entry (the command keeps running on the server regardless).
+        let audit = self.audit_logger.clone();
+        let agent = agent_id.to_string();
+        let conn = conn_id.to_string();
+        let run_summary = summary.clone();
+        let risk_str = risk.as_str();
+        let access_str = access.as_str();
+        let task = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let outcome = vfs
+                .execute_command_with_timeout(&effective, Duration::from_secs(timeout_secs))
+                .await;
+            let elapsed = started.elapsed().as_millis();
+            match outcome {
+                Ok((code, stdout, stderr)) => {
+                    let (out_text, out_trunc) = trim_output(&stdout);
+                    let (err_text, err_trunc) = trim_output(&stderr);
+                    audit
+                        .log(
+                            &agent,
+                            tool_name,
+                            &conn,
+                            &run_summary,
+                            &format!("exit {code}"),
+                            Some(format!(
+                                "risk={risk_str} access={access_str} exit={code} \
+                                 stdout={}B stderr={}B {}ms",
+                                stdout.len(),
+                                stderr.len(),
+                                elapsed
+                            )),
+                        )
+                        .await;
+                    McpToolResult::success_text(
+                        json!({
+                            "exit_code": code,
+                            "stdout": out_text,
+                            "stderr": err_text,
+                            "stdout_truncated": out_trunc,
+                            "stderr_truncated": err_trunc,
+                            "risk": risk_str,
+                            "duration_ms": elapsed,
+                        })
+                        .to_string(),
+                    )
+                }
+                Err(err) => {
+                    audit
+                        .log(
+                            &agent,
+                            tool_name,
+                            &conn,
+                            &run_summary,
+                            &format!("error: {err}"),
+                            Some(format!("risk={risk_str} access={access_str} {elapsed}ms")),
+                        )
+                        .await;
+                    McpToolResult::error_text(format!("The command failed: {err}"))
+                }
+            }
+        });
+        match task.await {
+            Ok(result) => result,
+            Err(e) => McpToolResult::error_text(format!("Command task failed: {e}")),
+        }
+    }
+
     pub async fn handle_tool_call(
         &self,
         agent_id: &str,
@@ -565,10 +931,13 @@ impl McpServer {
 
         let needs_connection = matches!(
             tool_name,
-            "fs_list_dir" | "fs_read_file" | "fs_write_file" | "fs_search"
+            "fs_list_dir" | "fs_read_file" | "fs_write_file" | "fs_search" | "run_command"
         );
         let (vfs, info) = if needs_connection {
-            let summary = str_arg("path").or(str_arg("pattern")).unwrap_or("");
+            let summary = str_arg("path")
+                .or(str_arg("pattern"))
+                .or(str_arg("command"))
+                .unwrap_or("");
             let Some(requested) = conn_arg else {
                 self.audit(
                     agent_id,
@@ -848,6 +1217,12 @@ impl McpServer {
                     Ok(result) => result,
                     Err(e) => McpToolResult::error_text(format!("Write task failed: {e}")),
                 }
+            }
+
+            "run_command" => {
+                let vfs = vfs.expect("connection checked");
+                self.handle_run_command(agent_id, conn_id, &info, vfs, arguments)
+                    .await
             }
 
             "fs_search" => {
@@ -1335,15 +1710,12 @@ mod tests {
         assert_eq!(seen.preview.as_deref(), Some("replaced"));
         assert!(seen.summary.starts_with("Replace "), "{}", seen.summary);
 
-        // Every tool that is not read-only is gated.
+        // Every tool that is not read-only is gated: a write always asks
+        // (`tool_requires_approval`), a command asks or not by policy (decided per call).
         for tool in McpServer::tool_definitions() {
             let read_only = tool.annotations.as_ref().unwrap()["readOnlyHint"] == true;
-            assert_eq!(
-                tool_requires_approval(&tool.name),
-                !read_only,
-                "{}",
-                tool.name
-            );
+            let gated = tool_requires_approval(&tool.name) || tool.name == "run_command";
+            assert_eq!(gated, !read_only, "{}", tool.name);
         }
     }
 
@@ -1512,5 +1884,142 @@ mod tests {
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
         assert!(base64_decode("Zm9=v").is_err());
         assert!(base64_decode("Zg==Zg==").is_err());
+    }
+
+    #[tokio::test]
+    async fn run_command_is_denied_when_access_is_off() {
+        let server = local_server(AuditLogger::new()).await;
+        server.set_command_access(CommandAccess::Off);
+        let res = server
+            .handle_tool_call(
+                "agent",
+                "run_command",
+                &json!({ "connection_id": "local", "command": "echo hi" }),
+            )
+            .await;
+        assert!(res.is_error);
+        assert!(text_of(&res, 0).contains("not run"), "{}", text_of(&res, 0));
+    }
+
+    #[tokio::test]
+    async fn run_command_asks_and_runs_when_allowed() {
+        let audit = AuditLogger::new();
+        let server = local_server(audit.clone()).await;
+        server.set_command_access(CommandAccess::Ask);
+        let approver = FixedApprover::new(ApprovalDecision::Approved);
+        server.set_approver(approver.clone());
+        let res = server
+            .handle_tool_call(
+                "agent",
+                "run_command",
+                &json!({ "connection_id": "local", "command": "echo rustscp-run-ok" }),
+            )
+            .await;
+        assert!(!res.is_error, "{}", text_of(&res, 0));
+        let v: Value = serde_json::from_str(&text_of(&res, 0)).unwrap();
+        assert_eq!(v["exit_code"], 0);
+        assert!(v["stdout"].as_str().unwrap().contains("rustscp-run-ok"));
+        assert_eq!(v["risk"], "safe");
+        // The prompt the user saw was a command request with the command and risk.
+        let seen = approver.seen.lock().unwrap()[0].clone();
+        assert_eq!(seen.kind, ApprovalKind::Command);
+        assert_eq!(seen.command.as_deref(), Some("echo rustscp-run-ok"));
+        assert_eq!(seen.risk.as_deref(), Some("safe"));
+        assert_eq!(seen.tool_name, "run_command");
+        // Audited with the exit code.
+        let ev = &audit.get_recent_events(1).await[0];
+        assert_eq!(ev.tool_name, "run_command");
+        assert_eq!(ev.status, "exit 0");
+    }
+
+    #[tokio::test]
+    async fn run_command_denied_by_user_runs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("touched");
+        let server = local_server(AuditLogger::new()).await;
+        server.set_command_access(CommandAccess::Ask);
+        server.set_approver(FixedApprover::new(ApprovalDecision::Denied("no".into())));
+        let res = server
+            .handle_tool_call(
+                "agent",
+                "run_command",
+                &json!({ "connection_id": "local", "command": format!("touch {}", marker.display()) }),
+            )
+            .await;
+        assert!(res.is_error);
+        assert!(!marker.exists(), "a denied command must not run");
+    }
+
+    #[tokio::test]
+    async fn run_command_auto_runs_safe_but_asks_for_dangerous() {
+        let server = local_server(AuditLogger::new()).await;
+        server.set_command_access(CommandAccess::Auto);
+        // No approver set: an Ask would be denied. A safe command still runs (no ask).
+        let res = server
+            .handle_tool_call(
+                "agent",
+                "run_command",
+                &json!({ "connection_id": "local", "command": "echo safe-auto" }),
+            )
+            .await;
+        assert!(!res.is_error, "{}", text_of(&res, 0));
+        assert!(text_of(&res, 0).contains("safe-auto"));
+
+        // A dangerous command asks; with nobody to ask it is denied and does not run.
+        let res = server
+            .handle_tool_call(
+                "agent",
+                "run_command",
+                &json!({ "connection_id": "local", "command": "rm -rf /tmp/rustscp-should-not-happen" }),
+            )
+            .await;
+        assert!(res.is_error);
+        assert!(
+            text_of(&res, 0).contains("not allowed"),
+            "{}",
+            text_of(&res, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_needs_a_shell_connection() {
+        // An S3 bucket has no shell: the command is refused before anything is attempted.
+        let s3 = rustscp_core::S3Driver::new(rustscp_core::S3Config {
+            endpoint: "https://s3.example.com".into(),
+            region: "us-east-1".into(),
+            access_key: "k".into(),
+            secret_key: "s".into(),
+            bucket: Some("b".into()),
+        });
+        assert!(!s3.supports_shell());
+        let server = Arc::new(McpServer::new(AuditLogger::new()));
+        server
+            .register_connection("bucket".into(), Arc::new(s3))
+            .await;
+        server.set_command_access(CommandAccess::Trusted);
+        let res = server
+            .handle_tool_call(
+                "agent",
+                "run_command",
+                &json!({ "connection_id": "bucket", "command": "echo hi" }),
+            )
+            .await;
+        assert!(res.is_error);
+        assert!(
+            text_of(&res, 0).contains("does not run shell"),
+            "{}",
+            text_of(&res, 0)
+        );
+    }
+
+    #[test]
+    fn trim_output_keeps_head_and_tail() {
+        let small = "hello";
+        assert_eq!(trim_output(small), ("hello".to_string(), false));
+        let big = "a".repeat(MAX_COMMAND_OUTPUT_BYTES * 2);
+        let (text, trunc) = trim_output(&big);
+        assert!(trunc);
+        assert!(text.contains("bytes omitted"));
+        assert!(text.len() < big.len());
     }
 }

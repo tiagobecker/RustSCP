@@ -9,6 +9,7 @@ const DEMO_HOME = '/home/demo';
 
 /** The AI gateway switch in preview mode. */
 let previewGatewayOff = false;
+let previewCommandAccess = 'ask';
 
 export function getFallbackData<T>(cmd: string, args?: any): T {
   if (cmd === 'list_directory') {
@@ -102,8 +103,9 @@ export function getFallbackData<T>(cmd: string, args?: any): T {
     return [] as unknown as T;
   }
 
-  if (cmd === 'get_mcp_status' || cmd === 'set_mcp_gateway_enabled') {
+  if (cmd === 'get_mcp_status' || cmd === 'set_mcp_gateway_enabled' || cmd === 'set_mcp_command_access') {
     if (cmd === 'set_mcp_gateway_enabled') previewGatewayOff = args?.enabled === false;
+    if (cmd === 'set_mcp_command_access' && typeof args?.access === 'string') previewCommandAccess = args.access;
     return {
       enabled: false,
       active_sessions_count: 0,
@@ -115,6 +117,7 @@ export function getFallbackData<T>(cmd: string, args?: any): T {
       setup_json: null,
       gateway_error: previewGatewayOff ? null : 'Preview mode: the gateway runs in the desktop app.',
       turned_off: previewGatewayOff,
+      command_access: previewCommandAccess,
     } as unknown as T;
   }
 

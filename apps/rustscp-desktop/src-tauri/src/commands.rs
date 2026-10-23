@@ -9,8 +9,8 @@ use rustscp_core::{
     WebDavServer, WinScpImportResult,
 };
 use rustscp_mcp::{
-    ApprovalDecision, ApprovalRequest, AuditEvent, AuditLogger, ConnectionInfo, GatewaySettings,
-    McpGateway, McpServer, ToolApprover,
+    ApprovalDecision, ApprovalRequest, AuditEvent, AuditLogger, CommandAccess, ConnectionInfo,
+    GatewaySettings, McpGateway, McpServer, ToolApprover,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -47,6 +47,13 @@ pub struct McpStatusInfo {
     /// The person turned the gateway off (it stays off across restarts).
     #[serde(default)]
     pub turned_off: bool,
+    /// How agent shell commands are handled: "off", "ask", "auto" or "trusted".
+    #[serde(default = "default_command_access")]
+    pub command_access: String,
+}
+
+fn default_command_access() -> String {
+    rustscp_mcp::CommandAccess::default().as_str().to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2824,6 +2831,7 @@ pub async fn get_mcp_status(state: tauri::State<'_, AppState>) -> Result<McpStat
         reachable_sessions,
         total_audit_events,
         exe.as_deref(),
+        state.mcp_server.command_access(),
     ))
 }
 
@@ -2843,6 +2851,7 @@ fn mcp_status_info(
     active_sessions_count: usize,
     total_audit_events: usize,
     exe: Option<&str>,
+    command_access: CommandAccess,
 ) -> McpStatusInfo {
     let running = transport_available && gateway.running;
     McpStatusInfo {
@@ -2856,6 +2865,7 @@ fn mcp_status_info(
         setup_json: exe.filter(|_| transport_available).map(mcp_setup_json),
         gateway_error: gateway.error,
         turned_off: gateway.turned_off,
+        command_access: command_access.as_str().to_string(),
     }
 }
 
@@ -2871,6 +2881,8 @@ const MCP_APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 const MCP_APPROVAL_REQUEST_EVENT: &str = "mcp-approval-request";
 /// Event with the id of a prompt that is no longer pending (answered, timed out, withdrawn).
 const MCP_APPROVAL_RESOLVED_EVENT: &str = "mcp-approval-resolved";
+/// Event carrying each [`AuditEvent`] to the window as it is logged (live activity).
+const MCP_ACTIVITY_EVENT: &str = "mcp-activity";
 
 #[derive(Default)]
 pub struct McpGatewayState {
@@ -2932,6 +2944,21 @@ pub async fn start_mcp_gateway(app: tauri::AppHandle) {
         app: app.clone(),
         approvals: state.mcp_approvals.clone(),
     }));
+    // Mirror every agent action to the window as it happens, so the activity log is live
+    // (not only on the next poll) and auto-run commands are seen the moment they run.
+    {
+        use tauri::Emitter;
+        let emitter = app.clone();
+        state
+            .audit_logger
+            .set_observer(Arc::new(move |event: &AuditEvent| {
+                let _ = emitter.emit(MCP_ACTIVITY_EVENT, event);
+            }));
+    }
+    // Apply the saved command-access choice before any agent can connect.
+    state
+        .mcp_server
+        .set_command_access(GatewaySettings::load(&get_rustscp_config_dir()).commands);
     resume_mcp_gateway(
         &state.mcp_gateway,
         &state.mcp_server,
@@ -2956,6 +2983,38 @@ pub async fn set_mcp_gateway_enabled(
     get_mcp_status(state).await
 }
 
+/// Sets how agent shell commands are handled ("off", "ask", "auto" or "trusted") and
+/// remembers it across restarts. Applies at once to the running gateway.
+#[tauri::command]
+pub async fn set_mcp_command_access(
+    state: tauri::State<'_, AppState>,
+    access: String,
+) -> Result<McpStatusInfo, String> {
+    let access = parse_command_access(&access)?;
+    state.mcp_server.set_command_access(access);
+    let config_dir = get_rustscp_config_dir();
+    tokio::task::spawn_blocking(move || {
+        let mut settings = GatewaySettings::load(&config_dir);
+        settings.commands = access;
+        settings.save(&config_dir)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("The command setting could not be saved: {e}"))?;
+    get_mcp_status(state).await
+}
+
+/// Parses the command-access level sent by the window.
+fn parse_command_access(value: &str) -> Result<CommandAccess, String> {
+    match value {
+        "off" => Ok(CommandAccess::Off),
+        "ask" => Ok(CommandAccess::Ask),
+        "auto" => Ok(CommandAccess::Auto),
+        "trusted" => Ok(CommandAccess::Trusted),
+        other => Err(format!("unknown command access level '{other}'")),
+    }
+}
+
 /// Starts the gateway at launch unless the person turned it off.
 async fn resume_mcp_gateway(
     slot: &std::sync::Mutex<McpGatewayState>,
@@ -2967,7 +3026,7 @@ async fn resume_mcp_gateway(
     switch_mcp_gateway(slot, server, config_dir, on).await;
 }
 
-/// Applies the person's choice, then saves it.
+/// Applies the person's on/off choice, then saves it (keeping the command-access choice).
 async fn turn_mcp_gateway(
     slot: &std::sync::Mutex<McpGatewayState>,
     server: &Arc<McpServer>,
@@ -2976,10 +3035,14 @@ async fn turn_mcp_gateway(
 ) -> Result<(), String> {
     let _switching = MCP_GATEWAY_SWITCH.lock().await;
     switch_mcp_gateway(slot, server, &config_dir, on).await;
-    tokio::task::spawn_blocking(move || GatewaySettings { enabled: on }.save(&config_dir))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| format!("The AI gateway setting could not be saved: {e}"))
+    tokio::task::spawn_blocking(move || {
+        let mut settings = GatewaySettings::load(&config_dir);
+        settings.enabled = on;
+        settings.save(&config_dir)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("The AI gateway setting could not be saved: {e}"))
 }
 
 /// Starts the listener (again) or stops it. Stopping disconnects every agent, which
@@ -8197,7 +8260,7 @@ mod correctness_tests {
     fn mcp_gateway_is_enabled_only_while_it_listens() {
         assert!(rustscp_mcp::transport_available());
         let exe = "/Applications/RustSCP.app/Contents/MacOS/rustscp-desktop";
-        let info = mcp_status_info(true, gateway(true), 2, 7, Some(exe));
+        let info = mcp_status_info(true, gateway(true), 2, 7, Some(exe), CommandAccess::Ask);
         assert!(info.enabled && info.transport_available && info.transport_running);
         assert_eq!(info.connected_agents, 2);
         assert_eq!(
@@ -8220,6 +8283,7 @@ mod correctness_tests {
             1,
             0,
             Some(exe),
+            CommandAccess::Ask,
         );
         assert!(!stopped.enabled && !stopped.transport_running && !stopped.turned_off);
         assert_eq!(stopped.gateway_error.as_deref(), Some("address in use"));
@@ -8234,10 +8298,11 @@ mod correctness_tests {
             1,
             0,
             Some(exe),
+            CommandAccess::Off,
         );
         assert!(!off.enabled && off.turned_off && off.gateway_error.is_none());
 
-        let offline = mcp_status_info(false, gateway(true), 1, 0, Some(exe));
+        let offline = mcp_status_info(false, gateway(true), 1, 0, Some(exe), CommandAccess::Ask);
         assert!(!offline.enabled && !offline.transport_available);
         assert!(offline.setup_command.is_none());
         let json = serde_json::to_value(&offline).unwrap();
@@ -8326,6 +8391,7 @@ mod correctness_tests {
         let prompt = McpApprovalPrompt {
             id: "a1".into(),
             request: ApprovalRequest {
+                kind: rustscp_mcp::ApprovalKind::Write,
                 agent_id: "claude-code (stdio)".into(),
                 tool_name: "fs_write_file".into(),
                 connection_id: "prod".into(),
@@ -8337,6 +8403,8 @@ mod correctness_tests {
                 previous_size: Some(3),
                 preview: Some("hello".into()),
                 preview_truncated: false,
+                command: None,
+                risk: None,
             },
             expires_at_ms: 1,
         };

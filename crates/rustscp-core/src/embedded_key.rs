@@ -195,6 +195,41 @@ pub fn write_openssh_copy(text: &str, passphrase: Option<&str>, dir: &Path) -> C
         .map_err(|e| CoreError::General(format!("could not save the key for ssh: {}", e)))
 }
 
+/// Largest OpenSSH certificate file read next to a key (they are a few KiB).
+const MAX_CERTIFICATE_BYTES: u64 = 64 * 1024;
+
+/// The OpenSSH certificate that goes with the key file at `key_path`, with its text:
+/// `<key>-cert.pub`, which `ssh -i <key>` also loads by itself, or `<name>-cert.pub` for a
+/// PuTTY `<name>.ppk`. Servers that trust a certificate authority (`TrustedUserCAKeys`)
+/// accept the key only with its certificate. `None` when there is none, or when the file
+/// is not a certificate (its key type does not end in `-cert-v01@openssh.com`).
+pub fn certificate_for_key(key_path: &Path) -> Option<(PathBuf, String)> {
+    let mut candidates = Vec::new();
+    let mut sibling = key_path.as_os_str().to_owned();
+    sibling.push("-cert.pub");
+    candidates.push(PathBuf::from(sibling));
+    if key_path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("ppk"))
+    {
+        let mut stem = key_path.with_extension("").into_os_string();
+        stem.push("-cert.pub");
+        candidates.push(PathBuf::from(stem));
+    }
+    candidates.into_iter().find_map(|path| {
+        let file = std::fs::File::open(&path).ok()?;
+        let mut text = String::new();
+        file.take(MAX_CERTIFICATE_BYTES)
+            .read_to_string(&mut text)
+            .ok()?;
+        let line = text.trim().lines().next()?.trim().to_string();
+        let key_type = line.split_whitespace().next()?;
+        key_type
+            .ends_with("-cert-v01@openssh.com")
+            .then_some((path, line))
+    })
+}
+
 /// Saves a private copy of the key file at `path` inside `dir` when the system `ssh`
 /// client would refuse the original, and returns the copy's path. ssh ignores a key that
 /// other users can read ("UNPROTECTED PRIVATE KEY FILE"), which is how a key downloaded

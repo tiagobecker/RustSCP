@@ -786,6 +786,11 @@ export const App: React.FC = () => {
     []
   );
 
+  const setMcpCommandAccess = useCallback(
+    (access: string) => invokeTauri<McpStatusInfo>('set_mcp_command_access', { access }).then(setMcpStatus),
+    []
+  );
+
   // MCP status and audit log are refreshed while the gateway modal is open
   useEffect(() => {
     if (!isMcpOpen) return;
@@ -803,6 +808,24 @@ export const App: React.FC = () => {
     return () => {
       cancelled = true;
       clearInterval(timer);
+    };
+  }, [isMcpOpen]);
+
+  // Agent activity streams in live (not only on the 3s poll) while the gateway modal is open.
+  useEffect(() => {
+    if (!isMcpOpen || !isTauri()) return;
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    listen<AuditEvent>('mcp-activity', (e) => {
+      const ev = e.payload;
+      if (!ev || typeof ev.id !== 'string') return;
+      setAuditLogs((prev) => (prev.some((p) => p.id === ev.id) ? prev : [ev, ...prev].slice(0, 200)));
+    })
+      .then((fn) => (disposed ? fn() : (unlisten = fn)))
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten?.();
     };
   }, [isMcpOpen]);
 
@@ -3180,6 +3203,7 @@ export const App: React.FC = () => {
             status={mcpStatus}
             auditLogs={auditLogs}
             onSetEnabled={setMcpGatewayEnabled}
+            onSetCommandAccess={setMcpCommandAccess}
           />
         </ModalGuard>
       )}

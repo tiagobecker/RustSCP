@@ -1,9 +1,9 @@
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Bot, Check, Copy, Info } from 'lucide-react';
-import { AuditEvent, McpStatusInfo } from '../types.ts';
+import { Bot, Check, Copy, Info, Terminal } from 'lucide-react';
+import { AuditEvent, CommandAccess, McpStatusInfo } from '../types.ts';
 import { Modal } from './ui/Modal.tsx';
-import { Button, Disclosure, IconButton, Toggle } from './ui/controls.tsx';
+import { Button, Disclosure, IconButton, Segmented, Toggle } from './ui/controls.tsx';
 import { notify } from './ui/toast.tsx';
 
 interface McpGatewayModalProps {
@@ -13,6 +13,8 @@ interface McpGatewayModalProps {
   auditLogs: AuditEvent[];
   /** Turns the gateway on or off (remembered across restarts). */
   onSetEnabled?: (enabled: boolean) => Promise<unknown>;
+  /** Sets how agent shell commands are handled (remembered across restarts). */
+  onSetCommandAccess?: (access: CommandAccess) => Promise<unknown>;
 }
 
 /** Monospaced, selectable snippet with a copy button. */
@@ -42,11 +44,20 @@ const CopyBlock: React.FC<{ label: React.ReactNode; text: string; copyLabel: str
   );
 };
 
-export const McpGatewayModal: React.FC<McpGatewayModalProps> = ({ isOpen, onClose, status, auditLogs, onSetEnabled }) => {
+export const McpGatewayModal: React.FC<McpGatewayModalProps> = ({
+  isOpen,
+  onClose,
+  status,
+  auditLogs,
+  onSetEnabled,
+  onSetCommandAccess,
+}) => {
   const { i18n } = useTranslation();
   const isPt = i18n.language.startsWith('pt');
   // The value being applied while the switch is busy.
   const [switching, setSwitching] = useState<boolean | null>(null);
+  // The command-access value being applied while that control is busy.
+  const [applyingAccess, setApplyingAccess] = useState<CommandAccess | null>(null);
 
   if (!isOpen) return null;
 
@@ -69,6 +80,55 @@ export const McpGatewayModal: React.FC<McpGatewayModalProps> = ({ isOpen, onClos
     } finally {
       setSwitching(null);
     }
+  };
+
+  const commandAccess: CommandAccess = applyingAccess ?? s?.command_access ?? 'ask';
+  const handleAccess = async (access: CommandAccess) => {
+    if (!onSetCommandAccess || applyingAccess !== null || access === commandAccess) return;
+    setApplyingAccess(access);
+    try {
+      await onSetCommandAccess(access);
+    } catch (e) {
+      notify.error(isPt ? 'Não foi possível alterar o acesso a comandos' : 'The command access could not be changed', e);
+    } finally {
+      setApplyingAccess(null);
+    }
+  };
+  const accessOptions: Array<{ value: CommandAccess; label: string; title: string }> = [
+    {
+      value: 'off',
+      label: isPt ? 'Desligado' : 'Off',
+      title: isPt ? 'Agentes não executam comandos.' : 'Agents cannot run commands.',
+    },
+    {
+      value: 'ask',
+      label: isPt ? 'Perguntar' : 'Ask',
+      title: isPt ? 'Cada comando pede sua permissão.' : 'Every command asks you first.',
+    },
+    {
+      value: 'auto',
+      label: isPt ? 'Automático' : 'Auto',
+      title: isPt
+        ? 'Comandos comuns rodam sozinhos; os perigosos ainda perguntam.'
+        : 'Ordinary commands run on their own; dangerous ones still ask.',
+    },
+    {
+      value: 'trusted',
+      label: isPt ? 'Confiável' : 'Trusted',
+      title: isPt ? 'Todos os comandos rodam sozinhos.' : 'Every command runs on its own.',
+    },
+  ];
+  const accessHint: Record<CommandAccess, string> = {
+    off: isPt ? 'Agentes não conseguem executar comandos neste momento.' : 'Agents cannot run commands right now.',
+    ask: isPt
+      ? 'Cada comando aparece aqui para você permitir antes de rodar. Nada roda sem sua confirmação.'
+      : 'Every command appears here for you to allow before it runs. Nothing runs without your confirmation.',
+    auto: isPt
+      ? 'Comandos de leitura e rotina rodam direto; comandos perigosos (apagar, formatar, desligar) ainda pedem sua permissão. Tudo fica registrado.'
+      : 'Read and routine commands run straight away; dangerous ones (delete, format, shut down) still ask. Everything is logged.',
+    trusted: isPt
+      ? 'O agente executa qualquer comando sem pedir, inclusive perigosos. Use apenas em servidores descartáveis. Tudo fica registrado.'
+      : 'The agent runs any command without asking, dangerous ones included. Use only on throwaway servers. Everything is logged.',
   };
 
   const badge = !s
@@ -113,6 +173,12 @@ export const McpGatewayModal: React.FC<McpGatewayModalProps> = ({ isOpen, onClos
       body: isPt
         ? 'Antes de um agente gravar um arquivo, o RustSCP pergunta se você permite. Nada é alterado se você negar ou não responder em 2 minutos.'
         : 'Before an agent writes a file, RustSCP asks you to allow it. Nothing changes if you deny it or do not answer within 2 minutes.',
+    },
+    {
+      title: isPt ? 'Comandos no servidor, do seu jeito' : 'Commands on the server, your way',
+      body: isPt
+        ? 'Agentes podem rodar comandos pela conexão aberta usando as mesmas credenciais (senha, chave ou certificado) — sem nunca vê-las. Você escolhe acima se cada comando pede permissão, se os comuns rodam sozinhos ou se tudo é liberado; os perigosos são sempre destacados.'
+        : 'Agents can run commands over the open connection with the same credentials (password, key or certificate) — without ever seeing them. You choose above whether each command asks, ordinary ones run on their own, or everything is allowed; dangerous ones are always flagged.',
     },
     {
       title: isPt ? 'Registro de atividade' : 'Activity log',
@@ -160,6 +226,41 @@ export const McpGatewayModal: React.FC<McpGatewayModalProps> = ({ isOpen, onClos
               </div>
             </div>
             <Toggle checked={switchedOn} onChange={handleSwitch} disabled={!onSetEnabled || switching !== null} label={allowLabel} />
+          </div>
+        )}
+
+        {shipsTransport && (
+          <div className="ui-card px-3.5 py-3 space-y-2.5">
+            <div className="flex items-center gap-2">
+              <Terminal className="w-4 h-4 text-ink-muted" />
+              <div className="min-w-0 flex-1">
+                <div className="text-[13px] text-ink">{isPt ? 'Comandos no servidor' : 'Commands on the server'}</div>
+                <div className="text-[12px] text-ink-faint leading-snug">
+                  {isPt
+                    ? 'Como os agentes podem rodar comandos pela conexão aberta (com as credenciais já usadas; senha, chave ou certificado).'
+                    : 'How agents may run commands over the open connection (with the credentials already in use; password, key or certificate).'}
+                </div>
+              </div>
+            </div>
+            <Segmented
+              value={commandAccess}
+              onChange={handleAccess}
+              options={accessOptions}
+              size="sm"
+              className="w-full"
+              ariaLabel={isPt ? 'Acesso a comandos' : 'Command access'}
+            />
+            <div className="text-[12px] text-ink-faint leading-snug">{accessHint[commandAccess]}</div>
+            {commandAccess === 'trusted' && (
+              <div className="flex items-start gap-2 rounded-lg bg-red-500/10 px-2.5 py-2 text-[12px] text-red-700 dark:text-red-300">
+                <Info className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+                <span>
+                  {isPt
+                    ? 'Nada será perguntado — nem comandos destrutivos. Prefira “Automático”.'
+                    : 'Nothing will be asked — destructive commands included. Prefer “Auto”.'}
+                </span>
+              </div>
+            )}
           </div>
         )}
 

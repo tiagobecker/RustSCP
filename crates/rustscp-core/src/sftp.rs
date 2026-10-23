@@ -1128,7 +1128,12 @@ impl SftpDriver {
                     )));
                 }
                 let pass = passphrase.as_deref().filter(|p| !p.is_empty());
-                let result = if crate::ppk::is_ppk_file(&key_path) {
+                // An OpenSSH certificate next to the key (`<key>-cert.pub`, as `ssh -i`
+                // loads it) is offered first; servers that trust the key itself still
+                // accept the plain key afterwards.
+                let certificate = crate::embedded_key::certificate_for_key(&key_path);
+                let mut errors = Vec::new();
+                if crate::ppk::is_ppk_file(&key_path) {
                     // libssh2 cannot read PuTTY keys (sites imported from WinSCP usually
                     // use them): the key is decrypted here and handed over in OpenSSH
                     // format, from memory.
@@ -1141,13 +1146,40 @@ impl SftpDriver {
                                 e
                             ))
                         })?;
-                    sess.userauth_pubkey_memory(user, Some(&public_key), &private_key, None)
+                    if let Some((cert_path, cert)) = &certificate {
+                        if let Err(e) =
+                            sess.userauth_pubkey_memory(user, Some(cert), &private_key, None)
+                        {
+                            errors.push(format!("certificate {}: {}", cert_path.display(), e));
+                        }
+                    }
+                    if !sess.authenticated() {
+                        if let Err(e) =
+                            sess.userauth_pubkey_memory(user, Some(&public_key), &private_key, None)
+                        {
+                            errors.push(e.to_string());
+                        }
+                    }
                 } else {
-                    sess.userauth_pubkey_file(user, None, &key_path, pass)
-                };
-                result.map_err(|e| {
-                    CoreError::AuthFailed(format!("Private key authentication failed: {}", e))
-                })?;
+                    if let Some((cert_path, _)) = &certificate {
+                        if let Err(e) =
+                            sess.userauth_pubkey_file(user, Some(cert_path), &key_path, pass)
+                        {
+                            errors.push(format!("certificate {}: {}", cert_path.display(), e));
+                        }
+                    }
+                    if !sess.authenticated() {
+                        if let Err(e) = sess.userauth_pubkey_file(user, None, &key_path, pass) {
+                            errors.push(e.to_string());
+                        }
+                    }
+                }
+                if !sess.authenticated() {
+                    return Err(CoreError::AuthFailed(format!(
+                        "Private key authentication failed: {}",
+                        errors.join("; ")
+                    )));
+                }
             }
             AuthMethod::KeyringRef(_) | AuthMethod::None => {
                 let mut errors: Vec<String> = Vec::new();
@@ -1194,6 +1226,13 @@ impl SftpDriver {
                             let key = home.join(".ssh").join(name);
                             if !key.exists() {
                                 continue;
+                            }
+                            if let Some((cert, _)) = crate::embedded_key::certificate_for_key(&key)
+                            {
+                                match sess.userauth_pubkey_file(user, Some(&cert), &key, None) {
+                                    Ok(()) => break,
+                                    Err(e) => errors.push(format!("{}: {}", cert.display(), e)),
+                                }
                             }
                             match sess.userauth_pubkey_file(user, None, &key, None) {
                                 Ok(()) => break,
@@ -2418,6 +2457,15 @@ impl VirtualFileSystem for SftpDriver {
 
     async fn execute_command(&self, cmd: &str) -> CoreResult<(i32, String, String)> {
         self.execute_remote_command(cmd.to_string()).await
+    }
+
+    async fn execute_command_with_timeout(
+        &self,
+        cmd: &str,
+        timeout: Duration,
+    ) -> CoreResult<(i32, String, String)> {
+        self.execute_remote_command_with_timeout(cmd.to_string(), timeout)
+            .await
     }
 }
 

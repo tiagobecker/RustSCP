@@ -151,11 +151,21 @@ export interface McpStatusInfo {
   gateway_error?: string | null;
   /** The user turned the gateway off (it stays off across restarts). */
   turned_off?: boolean;
+  /** How agent shell commands are handled: 'off', 'ask', 'auto' or 'trusted'. */
+  command_access?: CommandAccess;
 }
 
-/** An AI agent's file write waiting for Allow / Deny (`mcp-approval-request` event). */
+/** How agent shell commands (`run_command`) are handled. */
+export type CommandAccess = 'off' | 'ask' | 'auto' | 'trusted';
+
+/** What an agent's pending request is about. */
+export type ApprovalKind = 'write' | 'command';
+
+/** An AI agent's file write or command waiting for Allow / Deny (`mcp-approval-request` event). */
 export interface McpApprovalPrompt {
   id: string;
+  /** 'write' (the default) or 'command'. */
+  kind?: ApprovalKind;
   agent_id: string;
   tool_name: string;
   connection_id: string;
@@ -169,7 +179,11 @@ export interface McpApprovalPrompt {
   /** Start of the new content when it is text. */
   preview: string | null;
   preview_truncated: boolean;
-  /** Unix time (ms) at which the write is denied if nobody answers. */
+  /** The command line, for a 'command' request. */
+  command?: string | null;
+  /** How risky the command looks: 'safe', 'caution' or 'dangerous'. */
+  risk?: string | null;
+  /** Unix time (ms) at which the request is denied if nobody answers. */
   expires_at_ms: number;
 }
 

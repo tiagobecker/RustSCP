@@ -36,11 +36,17 @@ pub const SETTINGS_FILE: &str = "mcp-gateway-settings.json";
 #[serde(default)]
 pub struct GatewaySettings {
     pub enabled: bool,
+    /// How agent shell commands (`run_command`) are handled. Older settings files have no
+    /// such field and default to [`CommandAccess::Ask`], so commands ask before running.
+    pub commands: crate::policy::CommandAccess,
 }
 
 impl Default for GatewaySettings {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            commands: crate::policy::CommandAccess::default(),
+        }
     }
 }
 
@@ -58,7 +64,10 @@ impl GatewaySettings {
                 "{} is unreadable ({e}); the AI gateway stays off",
                 path.display()
             );
-            Self { enabled: false }
+            Self {
+                enabled: false,
+                ..Self::default()
+            }
         };
         match std::fs::read(&path) {
             Ok(data) => serde_json::from_slice(&data).unwrap_or_else(|e| unreadable(&e)),
@@ -561,7 +570,12 @@ mod tests {
         assert!(GatewaySettings::load(config.path()).enabled);
 
         let dir = config.path().join("nested");
-        GatewaySettings { enabled: false }.save(&dir).unwrap();
+        GatewaySettings {
+            enabled: false,
+            ..Default::default()
+        }
+        .save(&dir)
+        .unwrap();
         assert!(!GatewaySettings::load(&dir).enabled);
         #[cfg(unix)]
         {
@@ -572,7 +586,12 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
-        GatewaySettings { enabled: true }.save(&dir).unwrap();
+        GatewaySettings {
+            enabled: true,
+            ..Default::default()
+        }
+        .save(&dir)
+        .unwrap();
         assert!(GatewaySettings::load(&dir).enabled);
 
         // An unreadable choice keeps the gateway off; fields added later default.
@@ -580,6 +599,20 @@ mod tests {
         assert!(!GatewaySettings::load(&dir).enabled);
         std::fs::write(GatewaySettings::file_path(&dir), b"{}").unwrap();
         assert!(GatewaySettings::load(&dir).enabled);
+
+        // Command access defaults to "ask" and round-trips; an old file with only
+        // `enabled` still loads (commands default to ask).
+        use crate::policy::CommandAccess;
+        assert_eq!(GatewaySettings::default().commands, CommandAccess::Ask);
+        GatewaySettings {
+            enabled: true,
+            commands: CommandAccess::Trusted,
+        }
+        .save(&dir)
+        .unwrap();
+        assert_eq!(GatewaySettings::load(&dir).commands, CommandAccess::Trusted);
+        std::fs::write(GatewaySettings::file_path(&dir), br#"{"enabled":true}"#).unwrap();
+        assert_eq!(GatewaySettings::load(&dir).commands, CommandAccess::Ask);
     }
 
     #[cfg(unix)]

@@ -97,6 +97,17 @@ pub trait VirtualFileSystem: Send + Sync + Debug {
         )))
     }
 
+    /// [`execute_command`](Self::execute_command) with an explicit time limit. A command
+    /// still running at the limit is an error, never a success. The default ignores the
+    /// limit; drivers that can honor it (SFTP) override this.
+    async fn execute_command_with_timeout(
+        &self,
+        cmd: &str,
+        _timeout: std::time::Duration,
+    ) -> CoreResult<(i32, String, String)> {
+        self.execute_command(cmd).await
+    }
+
     /// Check if protocol supports shell command execution
     fn supports_shell(&self) -> bool {
         matches!(self.protocol(), Protocol::Local | Protocol::Sftp)

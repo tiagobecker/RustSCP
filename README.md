@@ -29,7 +29,7 @@ For more than two decades, **WinSCP** set the gold standard for dual-pane file m
 
 **RustSCP** reimagines this legacy with modern systems engineering:
 - 🚀 **Blazing Native Performance:** Built with pure asynchronous Rust ([Tokio](https://tokio.rs/)) and [Tauri v2](https://v2.tauri.app/). Consumes **under 40 MB of RAM** — eliminating the heavy CPU & memory overhead of Electron.
-- 🤖 **Native AI Gateway (Model Context Protocol / MCP):** An audited, sandboxed bastion server allowing LLM agents (Claude Code, Hermes, Antigravity, OpenClaw, Cursor) to safely query, inspect, and manage remote infrastructure without exposing raw credentials or private SSH keys.
+- 🤖 **Native AI Gateway (Model Context Protocol / MCP):** An audited, sandboxed bastion server allowing LLM agents (Claude Code, Hermes, Antigravity, OpenClaw, Cursor) to safely query, inspect, edit, and **run commands on** remote infrastructure — with risk classification and human-in-the-loop approvals — without ever exposing raw credentials, private SSH keys, or certificates.
 - 🛡️ **Guaranteed Memory Safety:** Zero segfaults, zero memory leaks, and resilient concurrency guaranteed by Rust's ownership model.
 - ⚡ **Proactive Dual-Session SSH Architecture:** Automatically authenticates an SFTP data channel *and* an interactive remote shell session during initial login. Execute instantaneous Linux commands (`rm -rf`, `sha256sum`, `systemctl`) without extra logins or latency.
 
@@ -65,9 +65,11 @@ For more than two decades, **WinSCP** set the gold standard for dual-pane file m
 
 ### 🤖 2. Model Context Protocol (MCP) AI Gateway
 RustSCP includes an embedded JSON-RPC 2.0 MCP server (`rustscp-mcp`) acting as a secure bastion:
-- Enables AI tools (**Claude Code, Hermes, Antigravity, Cursor, OpenClaw**) to list directories, read configuration files, and perform authorized server actions.
-- Enforces granular permission controls, human-in-the-loop approvals, and structured audit logs.
-- Never reveals raw SSH credentials or root passwords to the AI model.
+- Enables AI tools (**Claude Code, Hermes, Antigravity, Cursor, OpenClaw**) to list directories, read and write files, and run shell commands on the servers you have connected — all through the connection RustSCP already holds.
+- Enforces granular permission controls, human-in-the-loop approvals, risk classification, and structured audit logs.
+- Never reveals raw SSH credentials or root passwords to the AI model: the agent works over the session you logged in with (password, key, PuTTY `.ppk`, SSH agent, or **OpenSSH certificate**), and never sees the secret.
+
+**Tools exposed to agents.** `session_list` (the connected sessions, no credentials), `fs_list_dir`, `fs_read_file`, `fs_write_file` (approval-gated), `fs_search`, `render_smart_action` (renders a vetted command for review, never executes), and **`run_command`** — run a shell command on a connected SSH server and get back the exit code, stdout and stderr.
 
 **Connecting an agent.** The desktop executable doubles as an MCP stdio server: `rustscp-desktop --mcp-stdio` speaks MCP on stdin/stdout and forwards tool calls to the running RustSCP window over a private, token-protected local channel (a 0600 Unix socket, or loopback TCP on Windows). The exact command for your install is shown in **AI gateway (MCP)** inside the app, for example:
 
@@ -75,7 +77,17 @@ RustSCP includes an embedded JSON-RPC 2.0 MCP server (`rustscp-mcp`) acting as a
 claude mcp add rustscp -- /Applications/RustSCP.app/Contents/MacOS/rustscp-desktop --mcp-stdio
 ```
 
-Agents see only the remote sessions connected in the app (never the local disk), every call lands in the activity log (`mcp-audit.log` in the RustSCP config folder), and each `fs_write_file` waits until you click **Allow** in the app (it is denied after 2 minutes without an answer). A write the agent cancels leaves the app's dialog at once. The **Allow AI agents** switch in that window turns the gateway off and on; the choice is kept across restarts.
+Agents see only the remote sessions connected in the app (never the local disk), and every call lands in the activity log (`mcp-audit.log` in the RustSCP config folder), shown live in the gateway window.
+
+**File writes** wait until you click **Allow** in the app (denied after 2 minutes without an answer); a write the agent cancels leaves the dialog at once.
+
+**Commands** follow a setting you choose per taste in the gateway window, under *Commands on the server*:
+- **Off** — agents cannot run commands.
+- **Ask** (default) — every command shows up for you to allow before it runs.
+- **Auto** — ordinary commands run on their own; anything RustSCP classifies as *dangerous* (`rm -rf`, `mkfs`, `dd of=/dev/…`, `shutdown`, a fork bomb, piping a download into a shell, …) still asks.
+- **Trusted** — full autonomy; every command runs on its own. For throwaway servers only.
+
+Whatever the level, each command is classified (safe / caution / dangerous) and fully recorded. The **Allow AI agents** switch turns the whole gateway off and on; both choices are kept across restarts.
 
 ### 🔄 3. Dual-Session Proactive SSH Architecture
 Unlike traditional tools that disconnect or force a second login prompt when running terminal operations:

@@ -23,12 +23,26 @@ pub struct AuditEvent {
     pub diff: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+/// Notified of every event as it is logged, so the app can show agent activity live (not
+/// only on the next poll). Called from the logging task; it must not block.
+pub type AuditObserver = Arc<dyn Fn(&AuditEvent) + Send + Sync>;
+
+#[derive(Clone, Default)]
 pub struct AuditLogger {
     events: Arc<RwLock<VecDeque<AuditEvent>>>,
     /// Optional append-only JSON-lines file (0600) that survives restarts.
     log_file: Option<Arc<PathBuf>>,
     file_lock: Arc<Mutex<()>>,
+    /// Set by the app to mirror each event to the window as it happens.
+    observer: Arc<std::sync::RwLock<Option<AuditObserver>>>,
+}
+
+impl std::fmt::Debug for AuditLogger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditLogger")
+            .field("log_file", &self.log_file)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AuditLogger {
@@ -49,6 +63,14 @@ impl AuditLogger {
     /// Path of the persistent log, when one is configured.
     pub fn log_file_path(&self) -> Option<&PathBuf> {
         self.log_file.as_deref()
+    }
+
+    /// Mirrors every event to `observer` as it is logged (the app emits it to the window).
+    pub fn set_observer(&self, observer: AuditObserver) {
+        match self.observer.write() {
+            Ok(mut o) => *o = Some(observer),
+            Err(e) => *e.into_inner() = Some(observer),
+        }
     }
 
     pub async fn log(
@@ -75,6 +97,15 @@ impl AuditLogger {
             if let Err(e) = self.append_to_file(path, &event).await {
                 tracing::warn!("could not write MCP audit log {}: {e}", path.display());
             }
+        }
+
+        // Show it in the window right away (before the next poll), if the app is watching.
+        let observer = match self.observer.read() {
+            Ok(o) => o.clone(),
+            Err(e) => e.into_inner().clone(),
+        };
+        if let Some(observer) = observer {
+            observer(&event);
         }
 
         let mut lock = self.events.write().await;

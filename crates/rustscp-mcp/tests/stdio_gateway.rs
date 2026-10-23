@@ -427,6 +427,72 @@ async fn writes_go_through_the_app_approval() {
 }
 
 #[tokio::test]
+async fn commands_run_through_the_app_with_approval_and_policy() {
+    let config = tempfile::tempdir().unwrap();
+    let files = tempfile::tempdir().unwrap();
+    let (server, audit) = app_with_session(files.path()).await;
+
+    // Off: the command is refused before anything runs, whatever the agent asks.
+    server.set_command_access(rustscp_mcp::CommandAccess::Off);
+    let _gateway = McpGateway::start(server.clone(), config.path())
+        .await
+        .unwrap();
+    let mut agent = start_bridge(config.path());
+    agent.initialize().await;
+    let (is_error, text) = agent
+        .call(
+            "run_command",
+            json!({ "connection_id": "demo", "command": "echo mcp-e2e" }),
+        )
+        .await;
+    assert!(is_error);
+    assert!(text.contains("not run"), "{text}");
+
+    // Ask + the user allows: it runs, and the prompt was a command request.
+    let approver = Arc::new(RecordingApprover {
+        allow: true,
+        seen: Mutex::new(Vec::new()),
+    });
+    server.set_approver(approver.clone());
+    server.set_command_access(rustscp_mcp::CommandAccess::Ask);
+    let (is_error, text) = agent
+        .call(
+            "run_command",
+            json!({ "connection_id": "demo", "command": "echo mcp-e2e" }),
+        )
+        .await;
+    assert!(!is_error, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["exit_code"], 0);
+    assert!(v["stdout"].as_str().unwrap().contains("mcp-e2e"), "{text}");
+    {
+        let seen = approver.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].kind, rustscp_mcp::ApprovalKind::Command);
+        assert_eq!(seen[0].command.as_deref(), Some("echo mcp-e2e"));
+        assert_eq!(seen[0].risk.as_deref(), Some("safe"));
+    }
+    assert_eq!(audit.get_recent_events(1).await[0].status, "exit 0");
+
+    // Auto: a safe command runs with no prompt (no approver would answer a dangerous one).
+    server.set_approver(Arc::new(RecordingApprover {
+        allow: false,
+        seen: Mutex::new(Vec::new()),
+    }));
+    server.set_command_access(rustscp_mcp::CommandAccess::Auto);
+    let (is_error, text) = agent
+        .call(
+            "run_command",
+            json!({ "connection_id": "demo", "command": "echo auto-ok" }),
+        )
+        .await;
+    assert!(!is_error, "{text}");
+    assert!(text.contains("auto-ok"), "{text}");
+
+    agent.finish().await;
+}
+
+#[tokio::test]
 async fn cancelling_a_write_withdraws_its_approval_and_it_is_never_answered() {
     let config = tempfile::tempdir().unwrap();
     let files = tempfile::tempdir().unwrap();
@@ -540,9 +606,12 @@ async fn an_approved_write_finishes_even_when_the_agent_cancels_it() {
 #[tokio::test]
 async fn a_turned_off_gateway_tells_the_agent() {
     let config = tempfile::tempdir().unwrap();
-    GatewaySettings { enabled: false }
-        .save(config.path())
-        .unwrap();
+    GatewaySettings {
+        enabled: false,
+        ..Default::default()
+    }
+    .save(config.path())
+    .unwrap();
     let mut agent = start_bridge(config.path());
     agent.initialize().await;
     let (is_error, text) = agent.call("session_list", json!({})).await;
