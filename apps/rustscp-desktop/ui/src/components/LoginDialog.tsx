@@ -17,7 +17,7 @@ import { VaultModal, VaultTab } from './VaultModal.tsx';
 import { invoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
 import { Modal } from './ui/Modal.tsx';
-import { Button, Disclosure, Field, Segmented, TextInput } from './ui/controls.tsx';
+import { Button, Disclosure, Field, Segmented, Select, TextInput } from './ui/controls.tsx';
 import { plainTextInputProps } from '../utils/inputHardening.ts';
 import { STORED_SECRET, isStoredSecret } from '../utils/secrets.ts';
 import { isMacPlatform } from './fileListUtils.ts';
@@ -245,6 +245,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   const [passphrase, setPassphrase] = useState<string>('');
   const [remoteRoot, setRemoteRoot] = useState<string>('');
   const [tlsFingerprint, setTlsFingerprint] = useState<string>('');
+  const [sftpMode, setSftpMode] = useState<'auto' | 'subsystem_only'>('auto');
   const [showPassword, setShowPassword] = useState<boolean>(false);
   const [isConnecting, setIsConnecting] = useState<boolean>(false);
   const [isSaving, setIsSaving] = useState<boolean>(false);
@@ -467,6 +468,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
     setUsername(site.username);
     setRemoteRoot(site.remote_root || '');
     setTlsFingerprint(site.tls_fingerprint || '');
+    setSftpMode(site.sftp_mode === 'subsystem_only' ? 'subsystem_only' : 'auto');
     setErrorMessage('');
     setShowPassword(false);
     setPendingDeleteId(null);
@@ -516,6 +518,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
     setPassphrase('');
     setRemoteRoot('');
     setTlsFingerprint('');
+    setSftpMode('auto');
     setErrorMessage('');
     setShowPassword(false);
     setPendingDeleteId(null);
@@ -605,6 +608,8 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
       auth: buildAuth(),
       remote_root: remoteRoot.trim(),
       tls_fingerprint: protocol === 'ftps' && tlsFingerprint.trim() ? tlsFingerprint.trim() : null,
+      // Automatic is the default: only the other choice is sent (and saved)
+      sftp_mode: isSsh(protocol) && sftpMode === 'subsystem_only' ? 'subsystem_only' : undefined,
       // The built-in Local site always stays at the top level. Each level takes the casing of an
       // existing folder ("infra" goes into "Infra"): the tree never holds case-variant siblings
       group: selectedSiteId === 'local' ? null : matchFolderCasing(normalizeGroup(group), knownFolders) || null,
@@ -1235,7 +1240,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
 
               {/* The built-in Local site has nothing advanced to set (it always stays at the top level) */}
               {!isBuiltInLocal && (
-                <Disclosure label={t('loginDialog.advancedTab')} defaultOpen={(!isS3 && !isLocal && !!remoteRoot) || (protocol === 'ftps' && !!tlsFingerprint)}>
+                <Disclosure label={t('loginDialog.advancedTab')} defaultOpen={(!isS3 && !isLocal && !!remoteRoot) || (protocol === 'ftps' && !!tlsFingerprint) || (isSsh(protocol) && sftpMode === 'subsystem_only')}>
                   <div className="space-y-4">
                     <Field
                       label={t('loginDialog.folder', 'Folder')}
@@ -1283,6 +1288,30 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
                             }}
                             placeholder="AB:CD:EF:…"
                           />
+                        )}
+                      </Field>
+                    )}
+                    {/* SCP runs over the same SSH connection and SFTP driver, so it has the setting too */}
+                    {isSsh(protocol) && (
+                      <Field
+                        label={t('loginDialog.sftpMode', 'SFTP compatibility')}
+                        hint={t(
+                          'loginDialog.sftpModeHint',
+                          'If the server refuses or breaks the SFTP subsystem, RustSCP starts sftp-server as a command instead. Choose Subsystem only to never do that.'
+                        )}
+                      >
+                        {(id) => (
+                          <Select
+                            id={id}
+                            value={sftpMode}
+                            onChange={(e) => {
+                              setSftpMode(e.target.value === 'subsystem_only' ? 'subsystem_only' : 'auto');
+                              setIsDirty(true);
+                            }}
+                          >
+                            <option value="auto">{t('loginDialog.sftpModeAuto', 'Automatic (recommended)')}</option>
+                            <option value="subsystem_only">{t('loginDialog.sftpModeSubsystemOnly', 'Subsystem only')}</option>
+                          </Select>
                         )}
                       </Field>
                     )}

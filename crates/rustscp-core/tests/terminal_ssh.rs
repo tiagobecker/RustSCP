@@ -8,7 +8,7 @@
 
 use rustscp_core::terminal::{ShellEvent, ShellEventParser};
 use rustscp_core::{
-    shell_bootstrap, AuthMethod, ConnectionConfig, Protocol, SftpDriver, TerminalOptions,
+    shell_bootstrap, AuthMethod, ConnectionConfig, Protocol, SftpDriver, SftpMode, TerminalOptions,
     TerminalSink, TerminalSize,
 };
 use std::time::Duration;
@@ -94,6 +94,7 @@ async fn terminal_streams_a_real_shell() {
         },
         remote_root: "/".into(),
         tls_fingerprint: None,
+        sftp_mode: SftpMode::Auto,
         group: None,
     });
     driver.connect().await.unwrap();

@@ -7,7 +7,9 @@
 //! A throwaway server needs no root (see `terminal_ssh.rs`); add `TrustedUserCAKeys
 //! <ca>.pub` and sign the key with `ssh-keygen -s <ca> -I id -n <user> <key>.pub`.
 
-use rustscp_core::{AuthMethod, ConnectionConfig, Protocol, SftpDriver, VirtualFileSystem};
+use rustscp_core::{
+    AuthMethod, ConnectionConfig, Protocol, SftpDriver, SftpMode, VirtualFileSystem,
+};
 use std::time::Duration;
 
 #[tokio::test]
@@ -37,6 +39,7 @@ async fn logs_in_with_an_openssh_certificate() {
         },
         remote_root: "/".into(),
         tls_fingerprint: None,
+        sftp_mode: SftpMode::Auto,
         group: None,
     });
     driver.connect().await.expect("certificate login");

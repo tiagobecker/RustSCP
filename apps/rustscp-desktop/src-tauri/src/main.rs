@@ -124,6 +124,7 @@ fn main() {
             get_vault_security_info,
             list_directory,
             get_session_default_path,
+            get_session_compat,
             read_file_content,
             write_file_content,
             create_new_directory,

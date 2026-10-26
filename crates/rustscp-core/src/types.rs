@@ -223,6 +223,25 @@ impl fmt::Debug for AuthMethod {
     }
 }
 
+/// How an SFTP site starts SFTP on the SSH connection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SftpMode {
+    /// The `sftp` subsystem; when the server refuses or breaks it, RustSCP starts
+    /// `sftp-server` as a command instead and speaks SFTP over that channel
+    /// (compatibility mode).
+    #[default]
+    Auto,
+    /// The `sftp` subsystem only: never start `sftp-server` as a command.
+    SubsystemOnly,
+}
+
+impl SftpMode {
+    pub fn is_auto(&self) -> bool {
+        *self == Self::Auto
+    }
+}
+
 fn default_ssh_port() -> u16 {
     22
 }
@@ -252,6 +271,11 @@ pub struct ConnectionConfig {
     /// unset, so other sites serialize exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_fingerprint: Option<String>,
+    /// SFTP only: whether RustSCP may start `sftp-server` as a command when the
+    /// server refuses or breaks the SFTP subsystem. Not written when `Auto`, so
+    /// other sites serialize exactly as before.
+    #[serde(default, skip_serializing_if = "SftpMode::is_auto")]
+    pub sftp_mode: SftpMode,
     /// Folder the site is filed under in the site list, as a `/`-separated path
     /// ("Production/Web"); `None` for sites at the top level. Vaults written before
     /// folders existed have no such field, and ungrouped sites do not write one.
@@ -271,6 +295,7 @@ impl ConnectionConfig {
             auth: AuthMethod::None,
             remote_root: "/".to_string(),
             tls_fingerprint: None,
+            sftp_mode: SftpMode::Auto,
             group: None,
         }
     }
@@ -487,6 +512,36 @@ mod tests {
         let back: ConnectionConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.group.as_deref(), Some("Production/Web"));
         assert_eq!(ConnectionConfig::local().group, None);
+    }
+
+    #[test]
+    fn sftp_mode_defaults_to_auto_and_is_only_written_when_set() {
+        // Sites saved before the setting existed: no field, so Auto.
+        let old: ConnectionConfig =
+            serde_json::from_str(r#"{"id":"a","name":"A","host":"h","username":"u"}"#).unwrap();
+        assert_eq!(old.sftp_mode, SftpMode::Auto);
+        assert!(old.sftp_mode.is_auto());
+        assert_eq!(ConnectionConfig::local().sftp_mode, SftpMode::Auto);
+
+        // Auto sites serialize exactly as before.
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(!json.contains("sftp_mode"), "{json}");
+
+        // Subsystem only is written as snake_case and survives a round trip.
+        let strict = ConnectionConfig {
+            sftp_mode: SftpMode::SubsystemOnly,
+            ..old
+        };
+        let json = serde_json::to_string(&strict).unwrap();
+        assert!(json.contains(r#""sftp_mode":"subsystem_only""#), "{json}");
+        let back: ConnectionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sftp_mode, SftpMode::SubsystemOnly);
+        assert!(!back.sftp_mode.is_auto());
+
+        // An explicit "auto" (the UI may send it) loads as Auto.
+        let explicit: ConnectionConfig =
+            serde_json::from_str(r#"{"id":"a","host":"h","sftp_mode":"auto"}"#).unwrap();
+        assert_eq!(explicit.sftp_mode, SftpMode::Auto);
     }
 
     #[test]

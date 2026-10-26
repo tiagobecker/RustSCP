@@ -37,6 +37,11 @@ export interface ConnectionConfig {
   remote_root: string;
   /** FTPS only: SHA-256 fingerprint of a self-signed server certificate to trust. */
   tls_fingerprint?: string | null;
+  /**
+   * SFTP only: 'auto' (missing means the same) starts sftp-server as a command when the server
+   * refuses or breaks the SFTP subsystem; 'subsystem_only' never does.
+   */
+  sftp_mode?: 'auto' | 'subsystem_only';
   /** Folder in the site list, '/'-separated (e.g. "Production/Web"). Missing or null: top level. */
   group?: string | null;
 }

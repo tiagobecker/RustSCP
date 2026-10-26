@@ -122,4 +122,12 @@ pub trait VirtualFileSystem: Send + Sync + Debug {
     fn supports_symlinks(&self) -> bool {
         matches!(self.protocol(), Protocol::Local | Protocol::Sftp)
     }
+
+    /// `Some(description)` when the session reaches the server through a compatibility
+    /// path: for SFTP, the `sftp-server` program started as a command because the server
+    /// refused or broke the SFTP subsystem (e.g. `"/usr/libexec/openssh/sftp-server"`).
+    /// `None` for the standard path.
+    fn compatibility_mode(&self) -> Option<String> {
+        None
+    }
 }

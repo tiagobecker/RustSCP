@@ -1,9 +1,10 @@
+use crate::exec_sftp::{ExecDir, ExecFile, ExecSftp, StartError};
 use crate::file_masks::FileMaskFilter;
 use crate::known_hosts::{self, HostKeyStore};
 use crate::shell::sh_quote;
 use crate::types::{
     AuthMethod, ConnectionConfig, CoreError, CoreResult, FileEntry, FileSystemInfo, FileType,
-    FindFileMatch, FindFileQuery, Permissions, Protocol,
+    FindFileMatch, FindFileQuery, Permissions, Protocol, SftpMode,
 };
 use crate::vfs::VirtualFileSystem;
 use async_trait::async_trait;
@@ -13,11 +14,12 @@ use ssh2::{
     ErrorCode, FileStat, HashType, KeyboardInteractivePrompt, MethodType, OpenFlags, OpenType,
     Prompt, Session, Sftp,
 };
+use std::collections::HashSet;
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::task;
@@ -53,6 +55,8 @@ const LIBSSH2_ERROR_SOCKET_SEND: i32 = -7;
 const LIBSSH2_ERROR_TIMEOUT: i32 = -9;
 const LIBSSH2_ERROR_SOCKET_DISCONNECT: i32 = -13;
 const LIBSSH2_ERROR_FILE: i32 = -16;
+const LIBSSH2_ERROR_CHANNEL_FAILURE: i32 = -21;
+const LIBSSH2_ERROR_CHANNEL_CLOSED: i32 = -26;
 const LIBSSH2_ERROR_SOCKET_TIMEOUT: i32 = -30;
 const LIBSSH2_ERROR_EAGAIN: i32 = -37;
 const LIBSSH2_ERROR_SOCKET_RECV: i32 = -43;
@@ -65,6 +69,35 @@ const SFTP_NO_SUCH_PATH: i32 = 10;
 const SHELL_UNKNOWN: u8 = 0;
 const SHELL_AVAILABLE: u8 = 1;
 const SHELL_UNAVAILABLE: u8 = 2;
+
+/// How SFTP was started on one session generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GenMode {
+    Unknown,
+    Native,
+    /// sftp-server runs as a command (compatibility mode).
+    Exec,
+    /// The native start failed (connection trouble or a timeout); libssh2
+    /// cannot start it again on this session, so the next try uses a new one.
+    NativeFailed,
+    /// The server answered but SFTP cannot run (refused subsystem and no
+    /// usable compatibility mode). Later operations get this error at once
+    /// instead of logging in again; reconnecting tries again.
+    Refused(String),
+}
+
+/// Servers (host, port, user, host key) where native SFTP only fails after a
+/// timeout. Remembered for this run of the app, so later connections go
+/// straight to compatibility mode instead of waiting for the timeout again.
+static SLOW_SUBSYSTEM_FAILURES: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
+
+fn slow_subsystem_failures() -> MutexGuard<'static, HashSet<String>> {
+    lock(SLOW_SUBSYSTEM_FAILURES.get_or_init(Default::default))
+}
+
+const SUBSYSTEM_HINT: &str = "The server refused or broke the SFTP subsystem: check the \
+\"Subsystem sftp\" line in its /etc/ssh/sshd_config (it must name an existing program, such as \
+/usr/libexec/openssh/sftp-server, or internal-sftp)";
 
 /// Connection details captured once after login (no blocking libssh2 calls
 /// on the async runtime later).
@@ -81,7 +114,17 @@ struct DriverState {
     session_gen: AtomicU64,
     /// One SFTP subsystem channel reused by all operations of a session
     /// (opening one costs several round trips).
-    sftp_cache: StdMutex<Option<(u64, Arc<Sftp>)>>,
+    sftp_cache: StdMutex<Option<(u64, Arc<SftpBackend>)>>,
+    /// Lets one operation start SFTP while the others wait for it. Only taken
+    /// when the cache is empty.
+    sftp_start_lock: Arc<Mutex<()>>,
+    /// How SFTP was started on a session generation. libssh2 cannot retry a
+    /// failed start on the same session, so a generation is never asked twice.
+    sftp_gen_mode: StdMutex<(u64, GenMode)>,
+    /// Native SFTP has worked in this driver: never use compatibility mode.
+    native_proven: AtomicBool,
+    /// The sftp-server program while in compatibility mode.
+    compat_server: StdMutex<Option<String>>,
     /// Host key accepted for this driver; later logins must present it.
     host_key_pin: StdMutex<Option<Vec<u8>>>,
     info: StdMutex<SessionInfo>,
@@ -131,7 +174,11 @@ fn no_shell_error() -> CoreError {
     )
 }
 
-fn is_connection_lost_code(code: i32) -> bool {
+fn is_lost(e: &ssh2::Error) -> bool {
+    matches!(e.code(), ErrorCode::Session(c) if is_connection_lost_code(c))
+}
+
+pub(crate) fn is_connection_lost_code(code: i32) -> bool {
     matches!(
         code,
         LIBSSH2_ERROR_SOCKET_NONE
@@ -181,6 +228,166 @@ fn io_error(e: std::io::Error, context: impl std::fmt::Display) -> CoreError {
         ErrorKind::NotFound => CoreError::NotFound(msg),
         ErrorKind::PermissionDenied => CoreError::PermissionDenied(msg),
         kind => CoreError::Io(std::io::Error::new(kind, msg)),
+    }
+}
+
+/// How SFTP reaches the server: libssh2's subsystem channel, or (only after
+/// that failed to start) sftp-server started as a command. Both expose the
+/// calls the driver uses, with the same errors, so the code above them is
+/// shared. The native arm forwards every call unchanged.
+pub(crate) enum SftpBackend {
+    Native(Sftp),
+    Exec(ExecSftp),
+}
+
+impl SftpBackend {
+    fn opendir(&self, p: &Path) -> Result<RemoteDir, ssh2::Error> {
+        match self {
+            Self::Native(s) => s.opendir(p).map(RemoteDir::Native),
+            Self::Exec(s) => s.opendir(p).map(RemoteDir::Exec),
+        }
+    }
+
+    fn open(&self, p: &Path) -> Result<RemoteFile, ssh2::Error> {
+        match self {
+            Self::Native(s) => s.open(p).map(RemoteFile::Native),
+            Self::Exec(s) => s.open(p).map(RemoteFile::Exec),
+        }
+    }
+
+    fn open_mode(
+        &self,
+        p: &Path,
+        flags: OpenFlags,
+        mode: i32,
+        open_type: OpenType,
+    ) -> Result<RemoteFile, ssh2::Error> {
+        match self {
+            Self::Native(s) => s
+                .open_mode(p, flags, mode, open_type)
+                .map(RemoteFile::Native),
+            Self::Exec(s) => s.open_mode(p, flags, mode, open_type).map(RemoteFile::Exec),
+        }
+    }
+
+    fn stat(&self, p: &Path) -> Result<FileStat, ssh2::Error> {
+        match self {
+            Self::Native(s) => s.stat(p),
+            Self::Exec(s) => s.stat(p),
+        }
+    }
+
+    fn lstat(&self, p: &Path) -> Result<FileStat, ssh2::Error> {
+        match self {
+            Self::Native(s) => s.lstat(p),
+            Self::Exec(s) => s.lstat(p),
+        }
+    }
+
+    fn setstat(&self, p: &Path, stat: FileStat) -> Result<(), ssh2::Error> {
+        match self {
+            Self::Native(s) => s.setstat(p, stat),
+            Self::Exec(s) => s.setstat(p, stat),
+        }
+    }
+
+    fn mkdir(&self, p: &Path, mode: i32) -> Result<(), ssh2::Error> {
+        match self {
+            Self::Native(s) => s.mkdir(p, mode),
+            Self::Exec(s) => s.mkdir(p, mode),
+        }
+    }
+
+    fn rmdir(&self, p: &Path) -> Result<(), ssh2::Error> {
+        match self {
+            Self::Native(s) => s.rmdir(p),
+            Self::Exec(s) => s.rmdir(p),
+        }
+    }
+
+    fn unlink(&self, p: &Path) -> Result<(), ssh2::Error> {
+        match self {
+            Self::Native(s) => s.unlink(p),
+            Self::Exec(s) => s.unlink(p),
+        }
+    }
+
+    fn rename(&self, src: &Path, dst: &Path) -> Result<(), ssh2::Error> {
+        match self {
+            Self::Native(s) => s.rename(src, dst, None),
+            Self::Exec(s) => s.rename(src, dst),
+        }
+    }
+
+    fn realpath(&self, p: &Path) -> Result<std::path::PathBuf, ssh2::Error> {
+        match self {
+            Self::Native(s) => s.realpath(p),
+            Self::Exec(s) => s.realpath(p),
+        }
+    }
+}
+
+enum RemoteDir {
+    Native(ssh2::File),
+    Exec(ExecDir),
+}
+
+impl RemoteDir {
+    fn readdir(&mut self) -> Result<(std::path::PathBuf, FileStat), ssh2::Error> {
+        match self {
+            Self::Native(d) => d.readdir(),
+            Self::Exec(d) => d.readdir(),
+        }
+    }
+}
+
+/// An open remote file. Calls pass the caller's buffer through unchanged, so
+/// buffer sizing that steers read-ahead (sftp_read_range) keeps working.
+enum RemoteFile {
+    Native(ssh2::File),
+    Exec(ExecFile),
+}
+
+impl RemoteFile {
+    fn stat(&mut self) -> Result<FileStat, ssh2::Error> {
+        match self {
+            Self::Native(f) => f.stat(),
+            Self::Exec(f) => f.stat(),
+        }
+    }
+}
+
+impl Read for RemoteFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Native(f) => f.read(buf),
+            Self::Exec(f) => f.read(buf),
+        }
+    }
+}
+
+impl Write for RemoteFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Native(f) => f.write(buf),
+            Self::Exec(f) => f.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Native(f) => f.flush(),
+            Self::Exec(f) => f.flush(),
+        }
+    }
+}
+
+impl Seek for RemoteFile {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        match self {
+            Self::Native(f) => f.seek(pos),
+            Self::Exec(f) => f.seek(pos),
+        }
     }
 }
 
@@ -302,7 +509,7 @@ fn is_valid_listing_name(name: &str) -> bool {
 
 /// readdir returning raw entry names (not std::path joins), without . and ..
 /// and without names that are not a single path component.
-fn read_dir_raw(sftp: &Sftp, dir: &str) -> Result<Vec<(String, FileStat)>, ssh2::Error> {
+fn read_dir_raw(sftp: &SftpBackend, dir: &str) -> Result<Vec<(String, FileStat)>, ssh2::Error> {
     let mut handle = sftp.opendir(Path::new(dir))?;
     let mut out = Vec::new();
     loop {
@@ -330,7 +537,7 @@ fn read_dir_raw(sftp: &Sftp, dir: &str) -> Result<Vec<(String, FileStat)>, ssh2:
 }
 
 /// mkdir -p over SFTP. An existing directory is success.
-fn mkdir_p(sftp: &Sftp, dir: &str) -> Result<(), ssh2::Error> {
+fn mkdir_p(sftp: &SftpBackend, dir: &str) -> Result<(), ssh2::Error> {
     let dir = trim_remote_dir(dir);
     if dir.is_empty() || dir == "/" {
         return Ok(());
@@ -361,7 +568,7 @@ fn mkdir_p(sftp: &Sftp, dir: &str) -> Result<(), ssh2::Error> {
 
 /// Recursive delete over SFTP. Entries come from readdir (lstat semantics),
 /// so symbolic links are unlinked, never followed.
-fn remove_dir_all_sftp(sftp: &Sftp, dir: &str) -> Result<(), ssh2::Error> {
+fn remove_dir_all_sftp(sftp: &SftpBackend, dir: &str) -> Result<(), ssh2::Error> {
     let mut first_err = None;
     match read_dir_raw(sftp, dir) {
         Ok(entries) => {
@@ -388,7 +595,7 @@ fn remove_dir_all_sftp(sftp: &Sftp, dir: &str) -> Result<(), ssh2::Error> {
 }
 
 /// Sum of file sizes below `path` over SFTP (fallback when `du` is unavailable).
-fn sftp_tree_size(sftp: &Sftp, path: &str) -> u64 {
+fn sftp_tree_size(sftp: &SftpBackend, path: &str) -> u64 {
     let root = match sftp.stat(Path::new(path)) {
         Ok(st) => st,
         Err(_) => return 0,
@@ -413,7 +620,7 @@ fn sftp_tree_size(sftp: &Sftp, path: &str) -> u64 {
 }
 
 /// Read up to `length` bytes at `offset`, looping over short reads.
-fn sftp_read_range(sftp: &Sftp, path: &str, offset: u64, length: u64) -> CoreResult<Bytes> {
+fn sftp_read_range(sftp: &SftpBackend, path: &str, offset: u64, length: u64) -> CoreResult<Bytes> {
     if length == 0 {
         return Ok(Bytes::new());
     }
@@ -448,7 +655,7 @@ fn sftp_read_range(sftp: &Sftp, path: &str, offset: u64, length: u64) -> CoreRes
 
 /// Open for writing; `truncate` creates or truncates and creates missing
 /// parent folders.
-fn sftp_open_for_write(sftp: &Sftp, path: &str, truncate: bool) -> CoreResult<ssh2::File> {
+fn sftp_open_for_write(sftp: &SftpBackend, path: &str, truncate: bool) -> CoreResult<RemoteFile> {
     let p = Path::new(path);
     let flags = if truncate {
         OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE
@@ -784,7 +991,11 @@ const CONTENT_SEARCH_MAX_FILE: u64 = 10 * 1024 * 1024;
 
 /// Find Files over plain SFTP, for accounts without a shell: breadth-first
 /// walk with mask matching and an in-memory content search.
-fn sftp_find_walk(sftp: &Sftp, query: &FindFileQuery, mask: &FileMaskFilter) -> Vec<FindFileMatch> {
+fn sftp_find_walk(
+    sftp: &SftpBackend,
+    query: &FindFileQuery,
+    mask: &FileMaskFilter,
+) -> Vec<FindFileMatch> {
     let mut results = Vec::new();
     let base = if query.base_path.is_empty() {
         ".".to_string()
@@ -889,6 +1100,10 @@ impl SftpDriver {
             state: Arc::new(DriverState {
                 session_gen: AtomicU64::new(0),
                 sftp_cache: StdMutex::new(None),
+                sftp_start_lock: Arc::new(Mutex::new(())),
+                sftp_gen_mode: StdMutex::new((0, GenMode::Unknown)),
+                native_proven: AtomicBool::new(false),
+                compat_server: StdMutex::new(None),
                 host_key_pin: StdMutex::new(None),
                 info: StdMutex::new(SessionInfo::default()),
                 shell_retry_after: StdMutex::new(None),
@@ -1409,31 +1624,331 @@ impl SftpDriver {
             .map_err(join_error)
     }
 
-    async fn acquire_sftp(&self) -> CoreResult<(Session, Arc<Sftp>)> {
-        let (sess, gen) = self.current_session().await?;
-        if let Some((g, sftp)) = lock(&self.state.sftp_cache).as_ref() {
-            if *g == gen {
-                return Ok((sess, sftp.clone()));
+    /// Start sftp-server as a command on `sess` (compatibility mode).
+    async fn init_exec(sess: Session) -> CoreResult<Result<ExecSftp, StartError>> {
+        task::spawn_blocking(move || ExecSftp::start(&sess))
+            .await
+            .map_err(join_error)
+    }
+
+    /// Open and drop a channel: tells a refused request from a dead socket
+    /// (libssh2 reports both as -21).
+    async fn probe_channel(sess: Session) -> CoreResult<Result<(), ssh2::Error>> {
+        task::spawn_blocking(move || sess.channel_session().map(|_| ()))
+            .await
+            .map_err(join_error)
+    }
+
+    fn cached_sftp(&self, gen: u64) -> Option<Arc<SftpBackend>> {
+        match lock(&self.state.sftp_cache).as_ref() {
+            Some((g, sftp)) if *g == gen => Some(sftp.clone()),
+            _ => None,
+        }
+    }
+
+    fn gen_mode(&self, gen: u64) -> GenMode {
+        match &*lock(&self.state.sftp_gen_mode) {
+            (g, mode) if *g == gen => mode.clone(),
+            _ => GenMode::Unknown,
+        }
+    }
+
+    /// Remember a definite refusal for this session and return it.
+    fn refuse(&self, gen: u64, err: CoreError) -> CoreError {
+        if let CoreError::Protocol(msg) = &err {
+            self.set_gen_mode(gen, GenMode::Refused(msg.clone()));
+        }
+        err
+    }
+
+    fn set_gen_mode(&self, gen: u64, mode: GenMode) {
+        *lock(&self.state.sftp_gen_mode) = (gen, mode);
+    }
+
+    /// Compatibility mode is allowed: the site did not turn it off, and native
+    /// SFTP never worked in this driver (a known-good server never falls back
+    /// because of a transient error).
+    fn exec_allowed(&self) -> bool {
+        self.config.sftp_mode == SftpMode::Auto && !self.state.native_proven.load(Ordering::SeqCst)
+    }
+
+    fn slow_failure_key(&self) -> Option<String> {
+        let fp = lock(&self.state.info).fingerprint_sha256.clone()?;
+        Some(format!(
+            "{}\n{}\n{}\n{}",
+            self.config.host, self.config.port, self.config.username, fp
+        ))
+    }
+
+    fn use_native(&self, gen: u64, sftp: Sftp) -> SftpBackend {
+        self.set_gen_mode(gen, GenMode::Native);
+        self.state.native_proven.store(true, Ordering::SeqCst);
+        *lock(&self.state.compat_server) = None;
+        SftpBackend::Native(sftp)
+    }
+
+    /// Start compatibility mode on `sess`; `why` names the trigger for the log.
+    async fn try_exec(
+        &self,
+        sess: Session,
+        gen: u64,
+        why: &str,
+    ) -> CoreResult<Result<SftpBackend, StartError>> {
+        match Self::init_exec(sess).await? {
+            Ok(exec) => {
+                tracing::warn!(
+                    "{}:{}: native SFTP unavailable ({}); using compatibility mode with {}",
+                    self.config.host,
+                    self.config.port,
+                    why,
+                    exec.server_path()
+                );
+                self.set_gen_mode(gen, GenMode::Exec);
+                *lock(&self.state.compat_server) = Some(exec.server_path().to_string());
+                Ok(Ok(SftpBackend::Exec(exec)))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "{}:{}: compatibility mode could not start ({}): {:?}",
+                    self.config.host,
+                    self.config.port,
+                    why,
+                    e
+                );
+                Ok(Err(e))
             }
         }
-        let (sess, gen, sftp) = match Self::init_sftp(sess.clone()).await? {
-            Ok(sftp) => (sess, gen, sftp),
-            Err(e) => {
-                let lost = matches!(e.code(), ErrorCode::Session(c) if is_connection_lost_code(c));
-                if !lost {
-                    return Err(ssh_error(e, "Could not start the SFTP subsystem"));
+    }
+
+    /// The error for a server whose SFTP subsystem does not start, with the
+    /// sshd_config hint and why compatibility mode did not help.
+    fn subsystem_error(&self, e: ssh2::Error, exec: Option<StartError>) -> CoreError {
+        let tail = match exec {
+            Some(StartError::Unavailable(why)) => {
+                format!(" Compatibility mode could not start either: {}.", why)
+            }
+            Some(StartError::Channel(ce)) => {
+                format!(" Compatibility mode could not start either: {}.", ce)
+            }
+            None if self.config.sftp_mode == SftpMode::SubsystemOnly => {
+                " Compatibility mode is turned off for this site.".to_string()
+            }
+            None => String::new(),
+        };
+        CoreError::Protocol(format!(
+            "Could not start the SFTP subsystem: {}. {}.{}",
+            e, SUBSYSTEM_HINT, tail
+        ))
+    }
+
+    async fn acquire_sftp(&self) -> CoreResult<(Session, Arc<SftpBackend>)> {
+        let (sess, gen) = self.current_session().await?;
+        if let Some(sftp) = self.cached_sftp(gen) {
+            return Ok((sess, sftp));
+        }
+        // One start at a time: concurrent first operations wait for it. It
+        // runs as its own task, so a caller that gives up cannot leave a
+        // half-done start behind (libssh2 cannot retry one on the session).
+        let start = self.state.sftp_start_lock.clone().lock_owned().await;
+        let this = self.clone();
+        task::spawn(async move {
+            let _start = start;
+            let (sess, gen) = this.current_session().await?;
+            if let Some(sftp) = this.cached_sftp(gen) {
+                return Ok((sess, sftp));
+            }
+            let (sess, gen, sftp) = this.start_sftp(sess, gen).await?;
+            let sftp = Arc::new(sftp);
+            *lock(&this.state.sftp_cache) = Some((gen, sftp.clone()));
+            Ok((sess, sftp))
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    /// Start SFTP on a session with an empty cache: native SFTP first; when
+    /// the server refuses or breaks the subsystem, sftp-server as a command.
+    async fn start_sftp(&self, sess: Session, gen: u64) -> CoreResult<(Session, u64, SftpBackend)> {
+        match self.gen_mode(gen) {
+            GenMode::Exec => {
+                // The command's channel broke: start a new one.
+                match self.try_exec(sess.clone(), gen, "restart").await? {
+                    Ok(sftp) => return Ok((sess, gen, sftp)),
+                    Err(StartError::Channel(e)) if is_lost(&e) => {}
+                    Err(StartError::Channel(e)) => {
+                        return Err(ssh_error(e, "Could not restart SFTP (compatibility mode)"))
+                    }
+                    Err(StartError::Unavailable(why)) => {
+                        return Err(CoreError::Protocol(format!(
+                            "Could not restart SFTP (compatibility mode): {}",
+                            why
+                        )))
+                    }
                 }
                 self.reconnect(gen).await?;
                 let (sess, gen) = self.current_session().await?;
-                let sftp = Self::init_sftp(sess.clone())
-                    .await?
-                    .map_err(|e| ssh_error(e, "Could not start the SFTP subsystem"))?;
-                (sess, gen, sftp)
+                return self.start_on_new_session(sess, gen).await;
             }
+            GenMode::NativeFailed => {
+                // libssh2 cannot start SFTP twice on one session.
+                self.reconnect(gen).await?;
+                let (sess, gen) = self.current_session().await?;
+                return self.start_on_new_session(sess, gen).await;
+            }
+            GenMode::Refused(msg) => return Err(CoreError::Protocol(msg)),
+            GenMode::Unknown | GenMode::Native => {}
+        }
+
+        // This server's subsystem only fails after a timeout: skip the wait.
+        let key = self.slow_failure_key();
+        let remembered = key
+            .as_ref()
+            .is_some_and(|k| slow_subsystem_failures().contains(k));
+        if remembered && self.exec_allowed() {
+            match self
+                .try_exec(sess.clone(), gen, "remembered for this server")
+                .await?
+            {
+                Ok(sftp) => return Ok((sess, gen, sftp)),
+                Err(_) => {
+                    if let Some(k) = &key {
+                        slow_subsystem_failures().remove(k);
+                    }
+                }
+            }
+        }
+
+        match Self::init_sftp(sess.clone()).await? {
+            Ok(sftp) => Ok((sess, gen, self.use_native(gen, sftp))),
+            Err(e) if e.code() == ErrorCode::Session(LIBSSH2_ERROR_CHANNEL_FAILURE) => {
+                self.after_subsystem_refused(sess, gen, e).await
+            }
+            Err(e) if is_lost(&e) => {
+                // A timeout here is a dead connection or a broken subsystem;
+                // only a fresh session can tell (no probe on this one).
+                self.set_gen_mode(gen, GenMode::NativeFailed);
+                self.reconnect(gen).await?;
+                let (sess, gen) = self.current_session().await?;
+                self.start_on_new_session(sess, gen).await
+            }
+            Err(e) => {
+                self.set_gen_mode(gen, GenMode::NativeFailed);
+                Err(ssh_error(e, "Could not start the SFTP subsystem"))
+            }
+        }
+    }
+
+    /// Native SFTP failed with -21: the server refused the subsystem, or the
+    /// socket is dead. The channel compatibility mode opens tells them apart.
+    async fn after_subsystem_refused(
+        &self,
+        sess: Session,
+        gen: u64,
+        e: ssh2::Error,
+    ) -> CoreResult<(Session, u64, SftpBackend)> {
+        self.set_gen_mode(gen, GenMode::NativeFailed);
+        if self.exec_allowed() {
+            match self
+                .try_exec(sess.clone(), gen, "subsystem refused")
+                .await?
+            {
+                Ok(sftp) => return Ok((sess, gen, sftp)),
+                Err(StartError::Channel(ce)) if is_lost(&ce) => {}
+                Err(other) => {
+                    let err = self.subsystem_error(e, Some(other));
+                    return Err(self.refuse(gen, err));
+                }
+            }
+        } else {
+            match Self::probe_channel(sess).await? {
+                Err(pe) if is_lost(&pe) => {}
+                // A server where native SFTP worked before: a passing problem
+                // (for example too many channels), reported as before.
+                _ if self.state.native_proven.load(Ordering::SeqCst) => {
+                    return Err(ssh_error(e, "Could not start the SFTP subsystem"));
+                }
+                _ => {
+                    let err = self.subsystem_error(e, None);
+                    return Err(self.refuse(gen, err));
+                }
+            }
+        }
+        // The connection is gone (for example reset by a firewall).
+        self.reconnect(gen).await?;
+        let (sess, gen) = self.current_session().await?;
+        self.start_on_new_session(sess, gen).await
+    }
+
+    /// Native SFTP on a session a reconnect just opened. If it fails the way a
+    /// broken subsystem does, compatibility mode on that same session.
+    async fn start_on_new_session(
+        &self,
+        sess: Session,
+        gen: u64,
+    ) -> CoreResult<(Session, u64, SftpBackend)> {
+        // This server's subsystem only fails after a timeout: skip the wait.
+        let key = self.slow_failure_key();
+        let remembered = key
+            .as_ref()
+            .is_some_and(|k| slow_subsystem_failures().contains(k));
+        if remembered && self.exec_allowed() {
+            match self
+                .try_exec(sess.clone(), gen, "remembered for this server")
+                .await?
+            {
+                Ok(sftp) => return Ok((sess, gen, sftp)),
+                Err(_) => {
+                    if let Some(k) = &key {
+                        slow_subsystem_failures().remove(k);
+                    }
+                }
+            }
+        }
+        let e = match Self::init_sftp(sess.clone()).await? {
+            Ok(sftp) => return Ok((sess, gen, self.use_native(gen, sftp))),
+            Err(e) => e,
         };
-        let sftp = Arc::new(sftp);
-        *lock(&self.state.sftp_cache) = Some((gen, sftp.clone()));
-        Ok((sess, sftp))
+        self.set_gen_mode(gen, GenMode::NativeFailed);
+        let code = match e.code() {
+            ErrorCode::Session(c) => c,
+            ErrorCode::SFTP(_) => 0,
+        };
+        let refused = code == LIBSSH2_ERROR_CHANNEL_FAILURE;
+        let slow = matches!(
+            code,
+            LIBSSH2_ERROR_TIMEOUT | LIBSSH2_ERROR_SOCKET_RECV | LIBSSH2_ERROR_CHANNEL_CLOSED
+        );
+        // A server where native SFTP worked before has a passing problem.
+        if !(refused || slow) || self.state.native_proven.load(Ordering::SeqCst) {
+            return Err(ssh_error(e, "Could not start the SFTP subsystem"));
+        }
+        if !self.exec_allowed() {
+            let err = self.subsystem_error(e, None);
+            // A timeout may be a slow server: only a refusal is final.
+            return Err(if refused { self.refuse(gen, err) } else { err });
+        }
+        let why = if refused {
+            "subsystem refused"
+        } else {
+            "subsystem timed out twice"
+        };
+        match self.try_exec(sess.clone(), gen, why).await? {
+            Ok(sftp) => {
+                if slow {
+                    if let Some(k) = self.slow_failure_key() {
+                        slow_subsystem_failures().insert(k);
+                    }
+                }
+                Ok((sess, gen, sftp))
+            }
+            Err(StartError::Channel(ce)) if is_lost(&ce) => {
+                Err(ssh_error(ce, "Could not start the SFTP subsystem"))
+            }
+            Err(se) => {
+                let err = self.subsystem_error(e, Some(se));
+                Err(self.refuse(gen, err))
+            }
+        }
     }
 
     /// Run a blocking SFTP operation on the shared SFTP channel. The session
@@ -1441,21 +1956,28 @@ impl SftpDriver {
     async fn with_sftp<T, F>(&self, op: F) -> CoreResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&Session, &Sftp) -> CoreResult<T> + Send + 'static,
+        F: FnOnce(&Session, &SftpBackend) -> CoreResult<T> + Send + 'static,
     {
         let (sess, sftp) = self.acquire_sftp().await?;
         let sftp_for_op = sftp.clone();
+        // A panicked operation (JoinError) may have left the channel mid-request.
         let result = task::spawn_blocking(move || op(&sess, &sftp_for_op))
             .await
-            .map_err(join_error)?;
-        if matches!(
-            result,
-            Err(CoreError::ConnectionFailed(_))
-                | Err(CoreError::Timeout(_))
-                | Err(CoreError::Io(_))
-                | Err(CoreError::General(_))
-        ) {
-            // The channel may be broken: open a fresh one next time.
+            .unwrap_or_else(|e| Err(join_error(e)));
+        // The channel may be broken: open a fresh one next time. A
+        // compatibility-mode channel knows whether it is, whatever the error
+        // (a listing maps a dead channel to "not found").
+        let broken = match &*sftp {
+            SftpBackend::Native(_) => matches!(
+                result,
+                Err(CoreError::ConnectionFailed(_))
+                    | Err(CoreError::Timeout(_))
+                    | Err(CoreError::Io(_))
+                    | Err(CoreError::General(_))
+            ),
+            SftpBackend::Exec(exec) => result.is_err() && exec.is_broken(),
+        };
+        if broken {
             let mut cache = lock(&self.state.sftp_cache);
             if matches!(cache.as_ref(), Some((_, cached)) if Arc::ptr_eq(cached, &sftp)) {
                 *cache = None;
@@ -1931,6 +2453,10 @@ impl VirtualFileSystem for SftpDriver {
         self.state.shell_state.load(Ordering::SeqCst) != SHELL_UNAVAILABLE
     }
 
+    fn compatibility_mode(&self) -> Option<String> {
+        lock(&self.state.compat_server).clone()
+    }
+
     async fn list_dir(&self, path: &str) -> CoreResult<Vec<FileEntry>> {
         let path_owned = self.expand_home(path).await?;
         self.with_sftp(move |_, sftp| {
@@ -2148,7 +2674,7 @@ impl VirtualFileSystem for SftpDriver {
         let from_owned = self.expand_home(from).await?;
         let to_owned = self.expand_home(to).await?;
         self.with_sftp(move |_, sftp| {
-            sftp.rename(Path::new(&from_owned), Path::new(&to_owned), None)
+            sftp.rename(Path::new(&from_owned), Path::new(&to_owned))
                 .map_err(|e| {
                     ssh_error(
                         e,
@@ -2356,7 +2882,10 @@ impl VirtualFileSystem for SftpDriver {
             used_bytes,
             total_inodes,
             free_inodes,
-            protocol_name: "SFTP / SSH-2.0".to_string(),
+            protocol_name: match lock(&self.state.compat_server).clone() {
+                Some(server) => format!("SFTP / SSH-2.0 (compatibility mode: {})", server),
+                None => "SFTP / SSH-2.0".to_string(),
+            },
             protocol_version: "SFTP-3".to_string(),
             host_key_fingerprint_sha256: info.fingerprint_sha256,
             host_key_fingerprint_md5: info.fingerprint_md5,
@@ -2599,6 +3128,7 @@ mod tests {
             remote_root: "/".into(),
             tls_fingerprint: None,
             group: None,
+            sftp_mode: crate::types::SftpMode::Auto,
         };
 
         // Trust on first use, then known.
@@ -2861,6 +3391,7 @@ mod tests {
             remote_root: "/".into(),
             tls_fingerprint: None,
             group: None,
+            sftp_mode: crate::types::SftpMode::Auto,
         };
         let dbg = format!("{:?}", SftpDriver::new(cfg));
         assert!(!dbg.contains("hunter2"), "{dbg}");

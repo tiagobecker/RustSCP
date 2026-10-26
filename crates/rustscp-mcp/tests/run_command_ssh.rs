@@ -4,7 +4,7 @@
 //! - `RUSTSCP_TEST_SSH_PORT`: port of an SSH server on 127.0.0.1
 //! - `RUSTSCP_TEST_SSH_KEY`: a private key that logs in as the current user
 
-use rustscp_core::{AuthMethod, ConnectionConfig, Protocol, SftpDriver};
+use rustscp_core::{AuthMethod, ConnectionConfig, Protocol, SftpDriver, SftpMode};
 use rustscp_mcp::{AuditLogger, CommandAccess, McpServer};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -36,6 +36,7 @@ async fn agent_runs_a_command_on_a_real_ssh_session() {
         },
         remote_root: "/".into(),
         tls_fingerprint: None,
+        sftp_mode: SftpMode::Auto,
         group: None,
     });
     driver.connect().await.expect("connect");

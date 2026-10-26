@@ -1229,7 +1229,7 @@ pub fn local_vault_security_info(site_count: usize) -> VaultSecurityInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{AuthMethod, Protocol};
+    use crate::types::{AuthMethod, Protocol, SftpMode};
     use tempfile::tempdir;
 
     /// Low iteration count for tests that only exercise the format, not the KDF cost.
@@ -1247,6 +1247,7 @@ mod tests {
                 auth: AuthMethod::Password("SuperSecretP@ss123!".to_string()),
                 remote_root: "/var/www/html".to_string(),
                 tls_fingerprint: None,
+                sftp_mode: SftpMode::Auto,
                 group: Some("Production/Web".to_string()),
             },
             ConnectionConfig {
@@ -1259,6 +1260,7 @@ mod tests {
                 auth: AuthMethod::Password("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
                 remote_root: "prod-bucket".to_string(),
                 tls_fingerprint: None,
+                sftp_mode: SftpMode::Auto,
                 group: Some("Cloud/Storage".to_string()),
             },
             ConnectionConfig {
@@ -1275,6 +1277,7 @@ mod tests {
                 },
                 remote_root: "/root".to_string(),
                 tls_fingerprint: None,
+                sftp_mode: SftpMode::Auto,
                 group: None,
             },
         ]

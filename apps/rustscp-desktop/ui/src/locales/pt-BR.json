@@ -237,7 +237,9 @@
     "close": "Fechar",
     "noTabs": "Sem conexão",
     "connections": "Conexões",
-    "newConnection": "Nova conexão"
+    "newConnection": "Nova conexão",
+    "compat": "Compatibilidade",
+    "compatTip": "Este servidor recusa o subsistema SFTP padrão, então o RustSCP iniciou {{path}} como comando. Tudo funciona; peça ao administrador do servidor para corrigir a linha 'Subsystem sftp' no sshd_config."
   },
   "filePanel": {
     "dropFilesPrompt": "Solte os itens aqui para transferir",
@@ -314,6 +316,10 @@
     "tlsFingerprint": "Certificado confiável (SHA-256)",
     "tlsFingerprintHint": "Só para servidores com certificado autoassinado. Certificados em que o sistema confia são sempre aceitos. Se a conexão acusar um certificado não confiável, compare a impressão digital com a do servidor e cole-a aqui.",
     "errFingerprint": "O certificado confiável deve ser uma impressão digital SHA-256 (64 dígitos hexadecimais).",
+    "sftpMode": "Compatibilidade SFTP",
+    "sftpModeHint": "Se o servidor recusar o subsistema SFTP ou ele não funcionar, o RustSCP inicia o sftp-server como comando. Escolha Somente subsistema para que isso nunca aconteça.",
+    "sftpModeAuto": "Automática (recomendado)",
+    "sftpModeSubsystemOnly": "Somente subsistema",
     "folder": "Pasta",
     "folderHint": "Agrupa esta conexão na lista de sites. Use / para subpastas; deixe vazio para o nível principal.",
     "folderPlaceholder": "ex.: Produção/Web",

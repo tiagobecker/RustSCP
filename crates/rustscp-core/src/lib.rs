@@ -2,6 +2,7 @@ pub mod code_generator;
 pub mod continuous_sync;
 pub mod disk_cache;
 pub mod embedded_key;
+mod exec_sftp;
 pub mod file_masks;
 pub mod ftp;
 pub mod known_hosts;
