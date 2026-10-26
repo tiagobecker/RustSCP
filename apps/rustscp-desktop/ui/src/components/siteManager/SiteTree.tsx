@@ -1,15 +1,15 @@
-import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef } from 'react';
+import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
 import type { MutableRefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
-import { Folder } from 'lucide-react';
+import { ChevronRight, Folder } from 'lucide-react';
 import { isMacPlatform } from '../fileListUtils.ts';
 import type { MenuAnchor } from '../ui/contextMenuUtils.ts';
 import { useVirtualRows } from '../../utils/useVirtualRows.ts';
 import type { ScrollAlign } from '../../utils/useVirtualRows.ts';
 import { ProtocolGlyph, SiteTreeRow } from './SiteTreeRow.tsx';
 import type { RowEditState } from './SiteTreeRow.tsx';
-import { formatCount, isInside, rowFolderPath } from './siteTreeModel.ts';
+import { baseName, folderChain, folderKey, formatCount, isInside, rowFolderPath } from './siteTreeModel.ts';
 import { inDropBlock } from './treeDragModel.ts';
 import type { DragPayload, DropSpot } from './treeDragModel.ts';
 import type { TreeRow } from './types.ts';
@@ -64,6 +64,20 @@ export interface TreeActions {
   dragHover: (spot: DropSpot | null, valid: boolean, copy: boolean) => void;
   /** A valid drop: move (or copy, with ⌥/Alt) into `folder` */
   drop: (payload: DragPayload, folder: string, copy: boolean, springOpened: string[]) => void;
+  /** A drag started or ended (an empty Favorites section shows a drop zone meanwhile) */
+  dragActive: (on: boolean) => void;
+  /** Whether dropping on Favorites at `index` changes the list */
+  canFavorite: (payload: DragPayload, index: number) => boolean;
+  /** A drop on Favorites: the items join (or move to) position `index` */
+  dropFavorite: (payload: DragPayload, index: number) => void;
+  /** ⌘D (the selection, or the row) and the row's Star button (`onlyRow`): add to favorites or remove */
+  toggleFavorite: (row: TreeRow, onlyRow: boolean) => void;
+  /** ⌥⌘↑ / ⌥⌘↓ on a favorite: one place up or down */
+  reorderFavorite: (row: TreeRow, delta: number) => void;
+  /** The Recent header's "Clear" link */
+  clearRecent: () => void;
+  /** A breadcrumb segment: scroll to that folder row, select and focus it */
+  revealCrumb: (path: string) => void;
 }
 
 export interface SiteTreeHandle {
@@ -96,6 +110,11 @@ interface SiteTreeProps {
   cutKeys: ReadonlySet<string>;
 }
 
+/** Height of the sticky breadcrumb over the list */
+const CRUMB_H = 22;
+
+const cx = (...parts: Array<string | false | null | undefined>) => parts.filter(Boolean).join(' ');
+
 const isPrintable = (e: React.KeyboardEvent) =>
   e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey && e.key !== ' ' && e.key !== '*' && e.key !== '/';
 
@@ -111,7 +130,26 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
   const editIndex = edit ? indexByKey.get(edit.rowKey) ?? -1 : -1;
   // The row being edited stays rendered like the active one (it usually is the active one)
   const pinIndex = editIndex >= 0 ? editIndex : activeIndex;
-  const { scrollRef, onScroll, range, totalHeight, isPinnedOutside, scrollToIndex, pageSize } = useVirtualRows({ count: rows.length, rowHeight, pinIndex });
+  const [crumbShown, setCrumbShown] = useState(false);
+  const { scrollRef, onScroll, range, totalHeight, isPinnedOutside, scrollToIndex, pageSize, viewportTop } = useVirtualRows({
+    count: rows.length,
+    rowHeight,
+    pinIndex,
+    // Rows scrolled into view land below the breadcrumb while it shows
+    topInset: crumbShown ? CRUMB_H : 0,
+  });
+
+  // Sticky breadcrumb: the folders above the first row under it, once that row's parent has scrolled away
+  const crumbPath = useMemo(() => {
+    if (viewportTop <= 0 || rows.length === 0) return '';
+    const top = Math.min(rows.length - 1, Math.floor((viewportTop + CRUMB_H) / rowHeight));
+    const row = rows[top];
+    if (!row || row.section !== 'all' || row.kind === 'section' || row.kind === 'address') return '';
+    const path = rowFolderPath(row);
+    const parent = path ? indexByKey.get(folderKey(path)) : undefined;
+    return parent !== undefined && parent < top ? path : '';
+  }, [viewportTop, rows, rowHeight, indexByKey]);
+  useEffect(() => setCrumbShown(crumbPath !== ''), [crumbPath]);
 
   // Drag and drop asks the owner through the actions (always the latest ones)
   const dragHost = useRef<TreeDragHost>({
@@ -119,6 +157,9 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
     setExpanded: (paths, expanded) => actionsRef.current.dragExpand(paths, expanded),
     hover: (spot, valid, copy) => actionsRef.current.dragHover(spot, valid, copy),
     drop: (payload, folder, copy, springOpened) => actionsRef.current.drop(payload, folder, copy, springOpened),
+    active: (on) => actionsRef.current.dragActive(on),
+    canFavorite: (payload, index) => actionsRef.current.canFavorite(payload, index),
+    dropFavorite: (payload, index) => actionsRef.current.dropFavorite(payload, index),
   });
   const drag = useTreeDrag({ scrollRef, rows, rowHeight, hostRef: dragHost });
   const dragCancel = drag.cancel;
@@ -216,7 +257,7 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
     const key = e.key;
     const lower = key.length === 1 ? key.toLowerCase() : key;
 
-    if (key === 'ArrowDown' && mod) {
+    if (key === 'ArrowDown' && mod && !e.altKey) {
       // ⌘↓ opens like Enter
       if (cur) a.open(cur.row);
       return handled();
@@ -224,6 +265,11 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
     switch (key) {
       case 'ArrowDown':
       case 'ArrowUp': {
+        // ⌥⌘↑ / ⌥⌘↓ (Ctrl+Alt elsewhere) reorders favorites
+        if (e.altKey && mod && !e.shiftKey) {
+          if (cur) a.reorderFavorite(cur.row, key === 'ArrowDown' ? 1 : -1);
+          return handled();
+        }
         if (e.altKey || mod) return;
         const to = moveIndex(rows.length, cur && activeIndex >= 0 ? cur.index : -1, key === 'ArrowDown' ? 1 : -1);
         if (e.shiftKey) extendTo(to);
@@ -339,6 +385,10 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
         if (cur) a.duplicate(cur.row);
         return handled();
       }
+      if (lower === 'd') {
+        if (cur) a.toggleFavorite(cur.row, false);
+        return handled();
+      }
       if (lower === 'c' && !e.shiftKey) {
         if (cur) a.copyAddress(cur.row);
         return handled();
@@ -400,6 +450,14 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
     }
     if (action === 'toggle-all') {
       a.toggleAll();
+      return;
+    }
+    if (action === 'star') {
+      a.toggleFavorite(row, true);
+      return;
+    }
+    if (action === 'clear-recent') {
+      a.clearRecent();
       return;
     }
     if (action === 'new-here' && row.kind === 'placeholder') {
@@ -467,7 +525,10 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
 
   const activeDomId = activeIndex >= 0 ? domId(rows[activeIndex].key) : undefined;
 
+  const crumbChain = crumbPath ? folderChain(crumbPath) : [];
+
   return (
+    <>
     <div
       ref={scrollRef}
       role="tree"
@@ -513,14 +574,44 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
               dropTarget={dragView.targetKey === row.key}
               dropBlock={dragView.block !== null && inDropBlock(row, dragView.block)}
               springing={dragView.springKey === row.key}
+              dropLine={dragView.line && dragView.line.key === row.key ? dragView.line.side : null}
             />
           );
         })}
       </div>
       {drag.view.payload && typeof document !== 'undefined' && createPortal(<DragGhost drag={drag.view} lang={i18n.language} t={t} ghostRef={drag.ghostRef} />, document.body)}
     </div>
+    {crumbChain.length > 0 && (
+      // Pointer-only shortcut (the tree's ← reaches the parent): hidden from screen readers
+      <div
+        aria-hidden
+        className="absolute left-1.5 right-4 top-0 h-[22px] z-[2] flex items-center min-w-0 px-2 gap-0.5 bg-dark-850 border-b border-line text-[11.5px] text-ink-faint whitespace-nowrap overflow-hidden select-none"
+        onWheel={(e) => {
+          const el = scrollRef.current;
+          if (el) el.scrollTop += e.deltaY;
+        }}
+      >
+        {crumbChain.map((path, i) => (
+          <React.Fragment key={path}>
+            {i > 0 && <ChevronRight aria-hidden className="w-3 h-3 shrink-0 opacity-70" />}
+            <button
+              type="button"
+              tabIndex={-1}
+              title={path}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => actionsRef.current.revealCrumb(path)}
+              className={cx('min-w-0 truncate hover:text-ink hover:underline underline-offset-2', i === crumbChain.length - 1 ? 'shrink-0 max-w-[70%]' : 'shrink')}
+            >
+              {baseName(path)}
+            </button>
+          </React.Fragment>
+        ))}
+      </div>
+    )}
+    </>
   );
 });
+
 
 /** The card that follows the pointer during a drag: the first item's icon and name (or "3 items"), "+ Copy" with ⌥/Alt. */
 const DragGhost: React.FC<{

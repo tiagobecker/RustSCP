@@ -9,6 +9,7 @@ import {
   AlertCircle,
   KeyRound,
   Loader2,
+  Star,
   X,
 } from 'lucide-react';
 import { ConnectionConfig, Protocol } from '../types.ts';
@@ -703,6 +704,8 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   const isLocal = protocol === 'local';
   const isBuiltInLocal = selectedSiteId === 'local';
   const normalizedGroup = isBuiltInLocal ? '' : normalizeGroup(group);
+  // The open saved site's Star in the header (favorites live in the tree's layout)
+  const favoriteSite = !isNew && siteTree.layout.favorites.some((f) => f.kind === 'site' && f.id === selectedSiteId);
 
   const protocolOptions: Array<{ value: Protocol; label: string; title?: string }> = [
     { value: 'sftp', label: 'SFTP' },
@@ -796,6 +799,18 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
                   className="w-full h-9 bg-transparent text-[17px] font-semibold text-ink placeholder:text-ink-faint outline-none rounded-md -ml-1 px-1 hover:bg-dark-650/40 focus:bg-dark-650/40 transition-colors"
                 />
               </div>
+              {!isNew && (
+                <button
+                  type="button"
+                  onClick={() => sidebarApiRef.current?.toggleFavorite(`s:${selectedSiteId}`)}
+                  className={`ui-icon-btn ui-icon-btn-sm self-start ${favoriteSite ? 'text-ink-muted' : ''}`}
+                  aria-label={favoriteSite ? t('siteTree.removeFavorite', 'Remove from favorites') : t('siteTree.addFavorite', 'Add to favorites')}
+                  title={favoriteSite ? t('siteTree.removeFavorite', 'Remove from favorites') : t('siteTree.addFavorite', 'Add to favorites')}
+                  aria-pressed={favoriteSite}
+                >
+                  <Star className="w-4 h-4" fill={favoriteSite ? 'currentColor' : 'none'} />
+                </button>
+              )}
               {!isNew && (
                 <button
                   type="button"

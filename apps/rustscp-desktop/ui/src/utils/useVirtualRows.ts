@@ -37,6 +37,8 @@ export interface VirtualRows {
   firstVisible: number;
   /** Rows that fit in the viewport (PageUp / PageDown) */
   pageSize: number;
+  /** The scroller's scrollTop as last measured (drives an overlay that depends on the scroll position) */
+  viewportTop: number;
 }
 
 /** Viewport height assumed before the first measurement */
@@ -125,5 +127,7 @@ export function useVirtualRows(opts: VirtualRowsOptions): VirtualRows {
   const isPinnedOutside = pinIndex !== undefined && pinIndex >= 0 && pinIndex < count && (pinIndex < range.first || pinIndex >= range.last);
   const pageSize = Math.max(1, Math.floor((height - topInset) / rowHeight));
 
-  return { scrollRef, onScroll, range, totalHeight, isPinnedOutside, scrollToIndex, firstVisible, pageSize };
+  const viewportTop = Math.max(0, Math.min(viewport.top, totalHeight - height));
+
+  return { scrollRef, onScroll, range, totalHeight, isPinnedOutside, scrollToIndex, firstVisible, pageSize, viewportTop };
 }

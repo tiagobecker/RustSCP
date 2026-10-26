@@ -437,7 +437,7 @@
     "duplicateFolder": "Duplicar pasta",
     "addFavorite": "Adicionar aos favoritos",
     "addFavoritesN_one": "Adicionar 1 aos favoritos",
-    "addFavoritesN_other": "Adicionar {{count}} aos favoritos",
+    "addFavoritesN_other": "Adicionar {{formatted}} aos favoritos",
     "removeFavorite": "Remover dos favoritos",
     "label": "Etiqueta",
     "labelNone": "Nenhuma",
@@ -664,6 +664,18 @@
     "a11yFolderCreatedWith_one": "Pasta “{{name}}” criada com 1 item",
     "a11yFolderCreatedWith_other": "Pasta “{{name}}” criada com {{formatted}} itens",
     "a11yDragCopyOver": "Sobre {{name}}. Solte para copiar.",
-    "a11yDragNotHere": "Não é possível soltar aqui"
+    "a11yDragNotHere": "Não é possível soltar aqui",
+    "removeFavoritesN_one": "Remover 1 dos favoritos",
+    "removeFavoritesN_other": "Remover {{formatted}} dos favoritos",
+    "favAdded_one": "Adicionado aos favoritos",
+    "favAdded_other": "{{formatted}} itens adicionados aos favoritos",
+    "favRemoved_one": "Removido dos favoritos",
+    "favRemoved_other": "{{formatted}} itens removidos dos favoritos",
+    "favReordered": "Favoritos reordenados",
+    "errTooManyFavorites": "Você pode ter até {{max}} favoritos.",
+    "a11yFavMoved": "Movido para a posição {{pos}} de {{total}}",
+    "a11yDragFavorite": "Sobre Favoritos. Solte para adicionar.",
+    "a11yRecentRemoved": "Removido dos recentes",
+    "a11yRecentCleared": "Recentes limpos"
   }
 }

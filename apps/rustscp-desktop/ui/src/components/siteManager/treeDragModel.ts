@@ -62,12 +62,16 @@ export function dragPayload(model: TreeModel, itemKeys: Iterable<string>): DragP
 
 /** Where a drop lands. */
 export interface DropSpot {
-  /** Folder the items go into ('' = top level) */
+  /** Folder the items go into ('' = top level); unused for a drop on Favorites */
   folder: string;
   /** Row that shows the highlight: the folder row, or the "All connections" header for the top level */
-  highlightKey: string;
+  highlightKey: string | null;
   /** Folder whose rows get the block tint (null for the top level) */
   block: string | null;
+  /** A drop on the Favorites section: the items are added (or moved) to this position of the list */
+  favoriteIndex?: number;
+  /** Favorites: the 2px insertion line, above or below this row */
+  line?: { key: string; side: 'before' | 'after' } | null;
 }
 
 const TOP_SPOT: DropSpot = { folder: '', highlightKey: 'sec:all', block: null };
@@ -76,7 +80,7 @@ const TOP_SPOT: DropSpot = { folder: '', highlightKey: 'sec:all', block: null };
  * The drop spot for the row under the pointer (`null` row: the empty space under the rows).
  * A folder row takes the items, a site row sends them to its folder, the "All connections"
  * header and the empty space to the top level. The draft, the inline new-folder row, the
- * address row and the Favorites / Recent sections (WP7) are not drop targets.
+ * address row and Recent rows are not drop targets; Favorites rows go through `favoriteDropSpot`.
  */
 export function dropSpotForRow(row: TreeRow | null | undefined): DropSpot | null {
   if (!row) return TOP_SPOT;
@@ -93,6 +97,42 @@ export function dropSpotForRow(row: TreeRow | null | undefined): DropSpot | null
     default:
       return null;
   }
+}
+
+/**
+ * A drop on the Favorites section (spec §11): its header puts the items first, a favorite row
+ * before or after itself (by the pointer's half; an expanded favorite folder takes "before" only,
+ * as its contents follow it), the empty section's drop zone at the start. Rows inside an expanded
+ * favorite folder are not targets.
+ */
+export function favoriteDropSpot(rows: readonly TreeRow[], index: number, fraction: number): DropSpot | null {
+  const row = rows[index];
+  if (!row || row.section !== 'fav') return null;
+  const base = { folder: '', highlightKey: null, block: null };
+  if (row.kind === 'favDrop') return { ...base, highlightKey: row.key, favoriteIndex: 0, line: null };
+  if (row.kind === 'section') {
+    const next = rows[index + 1];
+    if (row.expanded && next && next.section === 'fav' && next.depth === 0 && (next.kind === 'site' || next.kind === 'folder')) {
+      return { ...base, favoriteIndex: 0, line: { key: next.key, side: 'before' } };
+    }
+    // A collapsed section takes the items at the end
+    return { ...base, highlightKey: row.key, favoriteIndex: row.count, line: null };
+  }
+  if (row.depth !== 0 || (row.kind !== 'site' && row.kind !== 'folder')) return null;
+  const at = row.posinset - 1;
+  const before = fraction < 0.5 || (row.kind === 'folder' && row.expanded);
+  return { ...base, favoriteIndex: before ? at : at + 1, line: { key: row.key, side: before ? 'before' : 'after' } };
+}
+
+/**
+ * The drop spot at row `index` of the list (past the last row: the top level), with `fraction`
+ * the pointer's place inside that row (0 = top edge, 1 = bottom edge).
+ */
+export function dropSpotAt(rows: readonly TreeRow[], index: number, fraction: number): DropSpot | null {
+  const row = rows[index];
+  if (!row) return TOP_SPOT;
+  if (row.section === 'fav') return favoriteDropSpot(rows, index, fraction);
+  return dropSpotForRow(row);
 }
 
 /** `ok`, or why a drop is refused: a folder into itself (or a folder inside it), or every item is already there. */

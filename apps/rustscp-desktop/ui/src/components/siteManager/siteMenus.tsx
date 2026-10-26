@@ -3,35 +3,44 @@
  * buttons). Pure: they turn the item and the available actions into `ContextMenuEntry[]`.
  *
  * Menus (spec §5): A one site, B Local, C folder, D several items, E empty area / "All connections"
- * header, the footer's import & export entries and the search field's filter menu. Items of later
- * work packages (favorites, labels, export, sort…) are added by those packages.
+ * header, F a favorite row, G a recent row, H the Favorites / Recent headers, the header's View
+ * options, the footer's import & export entries and the search field's filter menu. Items of later
+ * work packages (labels, export, Connect N…) are added by those packages.
  */
 import React from 'react';
 import type { TFunction } from 'i18next';
 import {
   ArrowDownUp,
+  ArrowDownWideNarrow,
   ChevronsDownUp,
   ChevronsUpDown,
   ClipboardPaste,
   Copy,
   CopyPlus,
+  EyeOff,
   FileKey2,
   FolderInput,
   FolderPlus,
   FunnelX,
+  History,
   Lightbulb,
   ListChecks,
+  ListX,
+  LocateFixed,
   Plug,
   Plus,
+  Rows3,
   Share2,
   SquarePen,
+  Star,
+  StarOff,
   TextCursorInput,
   Trash2,
 } from 'lucide-react';
 import type { ContextMenuEntry } from '../ui/ContextMenu.tsx';
 import { formatShortcut } from '../ui/contextMenuUtils.ts';
 import type { ConnectionConfig } from '../../types.ts';
-import type { FolderNode } from './types.ts';
+import type { Density, FolderNode, SortKey, ViewPrefs } from './types.ts';
 
 export interface MenuActions {
   connect: (site: ConnectionConfig) => void;
@@ -65,6 +74,18 @@ export interface MenuActions {
   openVault: (tab?: 'winscp') => void;
   /** Present when the app can open a shared `.rustscp` file */
   openShared?: () => void;
+  /** Adds these items to the favorites, or removes them when all of them are favorites */
+  toggleFavorites: (keys: string[]) => void;
+  /** Selects the item where it lives in "All connections" (folders opened, scrolled to) */
+  showInFolder: (key: string) => void;
+  /** Takes one site off Recent */
+  removeRecent: (id: string) => void;
+  /** Empties Recent */
+  clearRecent: () => void;
+  /** Hides the Favorites or Recent section (View options shows it again) */
+  hideSection: (section: 'fav' | 'rec') => void;
+  /** Changes view options (sort, folders on top, row size, sections…) */
+  setView: (patch: Partial<ViewPrefs>) => void;
 }
 
 export interface MenuContext {
@@ -98,6 +119,25 @@ export const shortcutLabels = (mac: boolean) => ({
   newFolderWith: mac ? formatShortcut('Ctrl+Mod+N', true) : formatShortcut('Ctrl+Alt+N', false),
   cut: formatShortcut('Mod+X', mac),
   paste: formatShortcut('Mod+V', mac),
+  favorite: formatShortcut('Mod+D', mac),
+});
+
+/** Add to favorites / Remove from favorites (⌘D) for one item. */
+const favoriteEntry = (ctx: MenuContext, key: string, favorite: boolean): ContextMenuEntry => ({
+  kind: 'item',
+  id: 'favorite',
+  label: favorite ? ctx.t('siteTree.removeFavorite', 'Remove from favorites') : ctx.t('siteTree.addFavorite', 'Add to favorites'),
+  icon: icon(favorite ? StarOff : Star),
+  shortcut: shortcutLabels(ctx.mac).favorite,
+  onSelect: () => ctx.actions.toggleFavorites([key]),
+});
+
+const showInFolderEntry = (ctx: MenuContext, key: string): ContextMenuEntry => ({
+  kind: 'item',
+  id: 'show-in-folder',
+  label: ctx.t('siteTree.showInFolder', 'Show in folder'),
+  icon: icon(LocateFixed),
+  onSelect: () => ctx.actions.showInFolder(key),
 });
 
 /** "Paste" while items are cut (⌘X), moving them into `folder`. */
@@ -108,7 +148,7 @@ const pasteEntry = (ctx: MenuContext, folder: string): ContextMenuEntry[] => {
 };
 
 /** A. One saved site (not Local). */
-export function siteMenu(site: ConnectionConfig, ctx: MenuContext): ContextMenuEntry[] {
+export function siteMenu(site: ConnectionConfig, ctx: MenuContext, opts: { favorite: boolean } = { favorite: false }): ContextMenuEntry[] {
   const { t, actions: a } = ctx;
   const k = shortcutLabels(ctx.mac);
   const entries: ContextMenuEntry[] = [
@@ -116,6 +156,7 @@ export function siteMenu(site: ConnectionConfig, ctx: MenuContext): ContextMenuE
     { kind: 'item', id: 'edit', label: t('siteTree.editDetails', 'Edit details'), icon: icon(SquarePen), shortcut: k.edit, onSelect: () => a.editDetails(site) },
     { kind: 'item', id: 'rename', label: t('siteTree.rename', 'Rename'), icon: icon(TextCursorInput), shortcut: k.rename, onSelect: () => a.renameSite(site) },
     { kind: 'item', id: 'duplicate', label: t('siteTree.duplicate', 'Duplicate'), icon: icon(CopyPlus), shortcut: k.duplicate, onSelect: () => a.duplicate(site) },
+    favoriteEntry(ctx, `s:${site.id}`, opts.favorite),
     SEP,
     { kind: 'item', id: 'move', label: t('siteTree.moveTo', 'Move to…'), icon: icon(FolderInput), shortcut: k.moveTo, onSelect: () => a.moveItems([`s:${site.id}`]) },
     {
@@ -141,18 +182,19 @@ export function siteMenu(site: ConnectionConfig, ctx: MenuContext): ContextMenuE
 }
 
 /** B. The built-in Local site: no move, duplicate, share, export or delete. */
-export function localMenu(site: ConnectionConfig, ctx: MenuContext): ContextMenuEntry[] {
+export function localMenu(site: ConnectionConfig, ctx: MenuContext, opts: { favorite: boolean } = { favorite: false }): ContextMenuEntry[] {
   const { t, actions: a } = ctx;
   const k = shortcutLabels(ctx.mac);
   return [
     { kind: 'item', id: 'connect', label: t('loginDialog.connect', 'Connect'), icon: icon(Plug), shortcut: k.connect, bold: true, onSelect: () => a.connect(site) },
     { kind: 'item', id: 'edit', label: t('siteTree.editDetails', 'Edit details'), icon: icon(SquarePen), shortcut: k.edit, onSelect: () => a.editDetails(site) },
     { kind: 'item', id: 'rename', label: t('siteTree.rename', 'Rename'), icon: icon(TextCursorInput), shortcut: k.rename, onSelect: () => a.renameSite(site) },
+    favoriteEntry(ctx, `s:${site.id}`, opts.favorite),
   ];
 }
 
 /** C. A folder. */
-export function folderMenu(node: FolderNode, ctx: MenuContext): ContextMenuEntry[] {
+export function folderMenu(node: FolderNode, ctx: MenuContext, opts: { favorite: boolean } = { favorite: false }): ContextMenuEntry[] {
   const { t, actions: a } = ctx;
   const k = shortcutLabels(ctx.mac);
   const hasSubfolders = node.folders.length > 0;
@@ -162,6 +204,7 @@ export function folderMenu(node: FolderNode, ctx: MenuContext): ContextMenuEntry
     ...pasteEntry(ctx, node.path),
     SEP,
     { kind: 'item', id: 'rename', label: t('siteTree.rename', 'Rename'), icon: icon(TextCursorInput), shortcut: k.rename, onSelect: () => a.renameFolder(node.path) },
+    favoriteEntry(ctx, `f:${node.path}`, opts.favorite),
     SEP,
     {
       kind: 'item',
@@ -206,6 +249,10 @@ export interface MultiSummary {
   folders: number;
   /** Some selected site has an address to copy */
   hasAddress: boolean;
+  /** Items that can be favorites (sites, Local included, and folders) */
+  favoriteCount: number;
+  /** Every one of them is a favorite already (the entry removes them) */
+  allFavorite: boolean;
   /** Formats a count for the UI language */
   format: (n: number) => string;
 }
@@ -215,7 +262,21 @@ export function multiMenu(sum: MultiSummary, ctx: MenuContext): ContextMenuEntry
   const { t, actions: a } = ctx;
   const k = shortcutLabels(ctx.mac);
   const count = sum.sites + sum.folders;
+  const fav = sum.favoriteCount;
+  const favFormatted = sum.format(fav);
   return [
+    {
+      kind: 'item',
+      id: 'favorite',
+      label: sum.allFavorite
+        ? t('siteTree.removeFavoritesN', { count: fav, formatted: favFormatted, defaultValue_one: 'Remove 1 from favorites', defaultValue_other: 'Remove {{formatted}} from favorites' })
+        : t('siteTree.addFavoritesN', { count: fav, formatted: favFormatted, defaultValue_one: 'Add 1 to favorites', defaultValue_other: 'Add {{formatted}} to favorites' }),
+      icon: icon(sum.allFavorite ? StarOff : Star),
+      shortcut: k.favorite,
+      disabled: fav === 0,
+      onSelect: () => a.toggleFavorites(sum.keys),
+    },
+    SEP,
     {
       kind: 'item',
       id: 'move',
@@ -330,59 +391,156 @@ export function importExportEntries(ctx: MenuContext): ContextMenuEntry[] {
   return entries;
 }
 
+/** What the view-options entries show. */
+export interface ViewMenuState {
+  prefs: ViewPrefs;
+  /** The row size in use (the stored choice, or the default for the library's size) */
+  density: Density;
+}
+
+const SORTS: ReadonlyArray<{ key: SortKey; i18n: string; label: string }> = [
+  { key: 'name', i18n: 'siteTree.sortName', label: 'Name' },
+  { key: 'address', i18n: 'siteTree.sortAddress', label: 'Server address' },
+  { key: 'protocol', i18n: 'siteTree.sortProtocol', label: 'Protocol' },
+  { key: 'last', i18n: 'siteTree.sortLastConnected', label: 'Last connected' },
+];
+
+/** Sort by ▸, Keep folders on top, Row size ▸ (the header's View options and menu E). */
+function arrangeEntries(ctx: MenuContext, view: ViewMenuState, keepOpen: boolean): ContextMenuEntry[] {
+  const { t, actions: a } = ctx;
+  const { prefs, density } = view;
+  return [
+    {
+      kind: 'submenu',
+      id: 'sort',
+      label: t('siteTree.sortBy', 'Sort by'),
+      icon: icon(ArrowDownWideNarrow),
+      entries: SORTS.map((o) => ({ kind: 'radio', id: `sort-${o.key}`, label: t(o.i18n, o.label), checked: prefs.sort === o.key, onSelect: () => a.setView({ sort: o.key }) })),
+    },
+    { kind: 'check', id: 'folders-on-top', label: t('siteTree.foldersOnTop', 'Keep folders on top'), checked: prefs.foldersOnTop, keepOpen, onToggle: () => a.setView({ foldersOnTop: !prefs.foldersOnTop }) },
+    {
+      kind: 'submenu',
+      id: 'row-size',
+      label: t('siteTree.rowSize', 'Row size'),
+      icon: icon(Rows3),
+      entries: [
+        { kind: 'radio', id: 'density-compact', label: t('siteTree.compact', 'Compact'), checked: density === 'compact', onSelect: () => a.setView({ density: 'compact' }) },
+        { kind: 'radio', id: 'density-comfortable', label: t('siteTree.comfortable', 'Comfortable'), checked: density === 'comfortable', onSelect: () => a.setView({ density: 'comfortable' }) },
+      ],
+    },
+  ];
+}
+
+const expandEntries = (ctx: MenuContext, state: { hasFolders: boolean; anyExpanded: boolean; anyCollapsed: boolean }): ContextMenuEntry[] => [
+  {
+    kind: 'item',
+    id: 'expand-all',
+    label: ctx.t('loginDialog.expandFolders', 'Expand all folders'),
+    icon: icon(ChevronsUpDown),
+    disabled: !state.hasFolders || !state.anyCollapsed,
+    onSelect: () => ctx.actions.setAllExpanded(true),
+  },
+  {
+    kind: 'item',
+    id: 'collapse-all',
+    label: ctx.t('loginDialog.collapseFolders', 'Collapse all folders'),
+    icon: icon(ChevronsDownUp),
+    disabled: !state.hasFolders || !state.anyExpanded,
+    onSelect: () => ctx.actions.setAllExpanded(false),
+  },
+];
+
 /** E. Empty area of the tree, or the "All connections" header. */
-export function emptyAreaMenu(ctx: MenuContext, state: { hasFolders: boolean; anyExpanded: boolean; anyCollapsed: boolean }): ContextMenuEntry[] {
+export function emptyAreaMenu(ctx: MenuContext, state: { hasFolders: boolean; anyExpanded: boolean; anyCollapsed: boolean }, view: ViewMenuState): ContextMenuEntry[] {
   const { t, actions: a } = ctx;
   const k = shortcutLabels(ctx.mac);
   const entries: ContextMenuEntry[] = [
     { kind: 'item', id: 'new-connection', label: t('loginDialog.newConnection', 'New connection'), icon: icon(Plus), shortcut: k.newConnection, onSelect: () => a.newConnection('') },
     { kind: 'item', id: 'new-folder', label: t('siteTree.newFolder', 'New folder'), icon: icon(FolderPlus), shortcut: k.newFolder, onSelect: () => a.newFolder('') },
     ...pasteEntry(ctx, ''),
+    SEP,
+    ...arrangeEntries(ctx, view, false),
   ];
-  if (state.hasFolders) {
-    entries.push(
-      SEP,
-      {
-        kind: 'item',
-        id: 'expand-all',
-        label: t('loginDialog.expandFolders', 'Expand all folders'),
-        icon: icon(ChevronsUpDown),
-        disabled: !state.anyCollapsed,
-        onSelect: () => a.setAllExpanded(true),
-      },
-      {
-        kind: 'item',
-        id: 'collapse-all',
-        label: t('loginDialog.collapseFolders', 'Collapse all folders'),
-        icon: icon(ChevronsDownUp),
-        disabled: !state.anyExpanded,
-        onSelect: () => a.setAllExpanded(false),
-      }
-    );
-  }
+  if (state.hasFolders) entries.push(SEP, ...expandEntries(ctx, state));
   entries.push(SEP, ...importExportEntries(ctx));
   return entries;
 }
 
-/** View options (header). Sorting, row size and sections arrive with WP7. */
-export function viewOptionsMenu(ctx: MenuContext, state: { hasFolders: boolean; anyExpanded: boolean; anyCollapsed: boolean }): ContextMenuEntry[] {
+/**
+ * View options (the header's SlidersHorizontal): sort, folders on top, row size, server address
+ * (compact rows), the Favorites and Recent sections, search results as a list, expand/collapse all.
+ * Its checkboxes keep the menu open, so the owner rebuilds the entries on every render.
+ */
+export function viewOptionsMenu(ctx: MenuContext, state: { hasFolders: boolean; anyExpanded: boolean; anyCollapsed: boolean }, view: ViewMenuState): ContextMenuEntry[] {
   const { t, actions: a } = ctx;
-  return [
-    {
-      kind: 'item',
-      id: 'expand-all',
-      label: t('loginDialog.expandFolders', 'Expand all folders'),
-      icon: icon(ChevronsUpDown),
-      disabled: !state.hasFolders || !state.anyCollapsed,
-      onSelect: () => a.setAllExpanded(true),
-    },
-    {
-      kind: 'item',
-      id: 'collapse-all',
-      label: t('loginDialog.collapseFolders', 'Collapse all folders'),
-      icon: icon(ChevronsDownUp),
-      disabled: !state.hasFolders || !state.anyExpanded,
-      onSelect: () => a.setAllExpanded(false),
-    },
+  const { prefs } = view;
+  const entries: ContextMenuEntry[] = [...arrangeEntries(ctx, view, true)];
+  // The address has its own line in comfortable rows; compact rows may leave it out
+  if (view.density === 'compact') {
+    entries.push({ kind: 'check', id: 'show-address', label: t('siteTree.showAddress', 'Show server address'), checked: prefs.showAddress, keepOpen: true, onToggle: () => a.setView({ showAddress: !prefs.showAddress }) });
+  }
+  entries.push(
+    SEP,
+    { kind: 'check', id: 'show-favorites', label: t('siteTree.showFavorites', 'Show favorites'), checked: prefs.showFavorites, keepOpen: true, onToggle: () => a.setView({ showFavorites: !prefs.showFavorites }) },
+    { kind: 'check', id: 'show-recent', label: t('siteTree.showRecent', 'Show recent'), checked: prefs.showRecent, keepOpen: true, onToggle: () => a.setView({ showRecent: !prefs.showRecent }) },
+    { kind: 'check', id: 'results-as-list', label: t('siteTree.resultsAsList', 'Show search results as a list'), checked: prefs.resultsAsList, keepOpen: true, onToggle: () => a.setView({ resultsAsList: !prefs.resultsAsList }) },
+    SEP,
+    ...expandEntries(ctx, state)
+  );
+  return entries;
+}
+
+/** The row an F menu belongs to: a favorite site or a favorite folder. */
+export type FavoriteMenuItem = { kind: 'site'; site: ConnectionConfig; local: boolean } | { kind: 'folder'; node: FolderNode };
+
+/** F. A row of the Favorites section. */
+export function favoriteMenu(item: FavoriteMenuItem, ctx: MenuContext): ContextMenuEntry[] {
+  const { t, actions: a } = ctx;
+  const k = shortcutLabels(ctx.mac);
+  if (item.kind === 'folder') {
+    const path = item.node.path;
+    return [
+      showInFolderEntry(ctx, `f:${path}`),
+      { kind: 'item', id: 'new-connection', label: t('siteTree.newConnectionHere', 'New connection here'), icon: icon(Plus), shortcut: k.newConnection, onSelect: () => a.newConnection(path) },
+      favoriteEntry(ctx, `f:${path}`, true),
+    ];
+  }
+  const { site, local } = item;
+  const entries: ContextMenuEntry[] = [
+    { kind: 'item', id: 'connect', label: t('loginDialog.connect', 'Connect'), icon: icon(Plug), shortcut: k.connect, bold: true, onSelect: () => a.connect(site) },
+    { kind: 'item', id: 'edit', label: t('siteTree.editDetails', 'Edit details'), icon: icon(SquarePen), shortcut: k.edit, onSelect: () => a.editDetails(site) },
+    showInFolderEntry(ctx, `s:${site.id}`),
+    favoriteEntry(ctx, `s:${site.id}`, true),
   ];
+  // Local is never shared or deleted
+  if (local) return entries;
+  const tail: ContextMenuEntry[] = [];
+  if (a.share) {
+    const share = a.share;
+    tail.push({ kind: 'item', id: 'share', label: t('loginDialog.shareSite', 'Share connection…'), icon: icon(Share2), onSelect: () => share(site) });
+  }
+  tail.push({ kind: 'item', id: 'delete', label: t('siteTree.delete', 'Delete'), icon: icon(Trash2), shortcut: k.delete, danger: true, onSelect: () => a.deleteItems([`s:${site.id}`]) });
+  return [...entries, SEP, ...tail];
+}
+
+/** G. A row of the Recent section. */
+export function recentMenu(site: ConnectionConfig, ctx: MenuContext, opts: { favorite: boolean }): ContextMenuEntry[] {
+  const { t, actions: a } = ctx;
+  const k = shortcutLabels(ctx.mac);
+  return [
+    { kind: 'item', id: 'connect', label: t('loginDialog.connect', 'Connect'), icon: icon(Plug), shortcut: k.connect, bold: true, onSelect: () => a.connect(site) },
+    showInFolderEntry(ctx, `s:${site.id}`),
+    favoriteEntry(ctx, `s:${site.id}`, opts.favorite),
+    SEP,
+    { kind: 'item', id: 'remove-recent', label: t('siteTree.removeFromRecent', 'Remove from recent'), icon: icon(ListX), onSelect: () => a.removeRecent(site.id) },
+    { kind: 'item', id: 'clear-recent', label: t('siteTree.clearRecent', 'Clear recent'), icon: icon(History), onSelect: () => a.clearRecent() },
+  ];
+}
+
+/** H. The Favorites or Recent header: hide the section (View options brings it back); Recent can also be cleared. */
+export function sectionMenu(section: 'fav' | 'rec', ctx: MenuContext): ContextMenuEntry[] {
+  const { t, actions: a } = ctx;
+  const entries: ContextMenuEntry[] = [{ kind: 'item', id: 'hide-section', label: t('siteTree.hideSection', 'Hide section'), icon: icon(EyeOff), onSelect: () => a.hideSection(section) }];
+  if (section === 'rec') entries.push({ kind: 'item', id: 'clear-recent', label: t('siteTree.clearRecent', 'Clear recent'), icon: icon(History), onSelect: () => a.clearRecent() });
+  return entries;
 }

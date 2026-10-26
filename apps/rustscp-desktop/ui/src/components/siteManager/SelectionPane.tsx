@@ -1,6 +1,6 @@
 import React, { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Folder, FolderInput, Trash2 } from 'lucide-react';
+import { Folder, FolderInput, Star, StarOff, Trash2 } from 'lucide-react';
 import type { ConnectionConfig } from '../../types.ts';
 import { Button } from '../ui/controls.tsx';
 import { ProtocolGlyph } from './SiteTreeRow.tsx';
@@ -14,6 +14,9 @@ interface Props {
   items: SelectedItem[];
   onMove: () => void;
   onDelete: () => void;
+  /** Every selected item is a favorite already (the button removes them) */
+  allFavorite: boolean;
+  onFavorite: () => void;
   /** Reduces the selection to the focused row */
   onClose: () => void;
 }
@@ -22,7 +25,7 @@ interface Props {
 const LISTED = 8;
 
 /** The right pane while 2 or more items are selected: what they are, and what can be done to all of them. */
-export const SelectionPane: React.FC<Props> = ({ items, onMove, onDelete, onClose }) => {
+export const SelectionPane: React.FC<Props> = ({ items, onMove, onDelete, allFavorite, onFavorite, onClose }) => {
   const { t, i18n } = useTranslation();
   const lang = i18n.language;
   const nf = (n: number) => formatCount(lang, n);
@@ -77,6 +80,15 @@ export const SelectionPane: React.FC<Props> = ({ items, onMove, onDelete, onClos
         <div className="mt-6 flex flex-col gap-2 w-64 max-w-full">
           <Button className="justify-start" icon={<FolderInput className="w-3.5 h-3.5 text-ink-muted" />} onClick={onMove} disabled={movable === 0}>
             {t('siteTree.moveTo', 'Move to…')}
+          </Button>
+          <Button
+            className="justify-start"
+            icon={allFavorite ? <StarOff className="w-3.5 h-3.5 text-ink-muted" /> : <Star className="w-3.5 h-3.5 text-ink-muted" />}
+            onClick={onFavorite}
+          >
+            {allFavorite
+              ? t('siteTree.removeFavoritesN', { count: items.length, formatted: nf(items.length), defaultValue_one: 'Remove 1 from favorites', defaultValue_other: 'Remove {{formatted}} from favorites' })
+              : t('siteTree.addFavoritesN', { count: items.length, formatted: nf(items.length), defaultValue_one: 'Add 1 to favorites', defaultValue_other: 'Add {{formatted}} to favorites' })}
           </Button>
           <Button className="justify-start !text-red-600 dark:!text-red-400" icon={<Trash2 className="w-3.5 h-3.5" />} onClick={onDelete} disabled={movable === 0}>
             {t('siteTree.deleteN', { count: movable, formatted: nf(movable), defaultValue_one: 'Delete 1 item', defaultValue_other: 'Delete {{formatted}} items' })}

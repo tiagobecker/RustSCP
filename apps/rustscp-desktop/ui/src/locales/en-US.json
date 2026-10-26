@@ -437,7 +437,7 @@
     "duplicateFolder": "Duplicate folder",
     "addFavorite": "Add to favorites",
     "addFavoritesN_one": "Add 1 to favorites",
-    "addFavoritesN_other": "Add {{count}} to favorites",
+    "addFavoritesN_other": "Add {{formatted}} to favorites",
     "removeFavorite": "Remove from favorites",
     "label": "Label",
     "labelNone": "None",
@@ -664,6 +664,18 @@
     "a11yFolderCreatedWith_one": "Folder “{{name}}” created with 1 item",
     "a11yFolderCreatedWith_other": "Folder “{{name}}” created with {{formatted}} items",
     "a11yDragCopyOver": "Over {{name}}. Release to copy.",
-    "a11yDragNotHere": "Can't drop here"
+    "a11yDragNotHere": "Can't drop here",
+    "removeFavoritesN_one": "Remove 1 from favorites",
+    "removeFavoritesN_other": "Remove {{formatted}} from favorites",
+    "favAdded_one": "Added to favorites",
+    "favAdded_other": "Added {{formatted}} items to favorites",
+    "favRemoved_one": "Removed from favorites",
+    "favRemoved_other": "Removed {{formatted}} items from favorites",
+    "favReordered": "Favorites reordered",
+    "errTooManyFavorites": "You can keep up to {{max}} favorites.",
+    "a11yFavMoved": "Moved to position {{pos}} of {{total}}",
+    "a11yDragFavorite": "Over Favorites. Release to add.",
+    "a11yRecentRemoved": "Removed from recent",
+    "a11yRecentCleared": "Recent cleared"
   }
 }

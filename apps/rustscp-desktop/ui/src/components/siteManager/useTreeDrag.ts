@@ -10,6 +10,8 @@
  * - Near the top or bottom edge the list scrolls, faster closer to the edge (up to 16px a frame).
  * - ⌥/Alt held at the drop copies instead of moving. Escape cancels.
  * - Invalid targets get no highlight and a not-allowed cursor.
+ * - Over the Favorites section a 2px line shows where the items join the favorites (or move to,
+ *   when they are favorites already); an empty Favorites section shows a drop zone meanwhile.
  *
  * The owner (SiteSidebar, through SiteTree) decides what a drag carries and runs the drop.
  */
@@ -17,7 +19,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { MutableRefObject, RefObject } from 'react';
 import { isMacPlatform } from '../fileListUtils.ts';
 import { SPRING_DELAY_MS } from '../../utils/tabDragManager.ts';
-import { checkDrop, dropSpotForRow } from './treeDragModel.ts';
+import { checkDrop, dropSpotAt } from './treeDragModel.ts';
 import type { DragPayload, DropSpot } from './treeDragModel.ts';
 import type { TreeRow } from './types.ts';
 
@@ -43,6 +45,12 @@ export interface TreeDragHost {
   hover: (spot: DropSpot | null, valid: boolean, copy: boolean) => void;
   /** A valid drop: move (or copy) the items into `folder`; `springOpened` lists folders spring-loading opened */
   drop: (payload: DragPayload, folder: string, copy: boolean, springOpened: string[]) => void;
+  /** A drag started (true) or ended (false): an empty Favorites section shows its drop zone meanwhile */
+  active: (on: boolean) => void;
+  /** Whether a drop on Favorites at `index` would change the list */
+  canFavorite: (payload: DragPayload, index: number) => boolean;
+  /** A valid drop on Favorites: the items join (or move to) position `index` */
+  dropFavorite: (payload: DragPayload, index: number) => void;
 }
 
 /** What the rows show while a drag runs. */
@@ -55,9 +63,11 @@ export interface TreeDragView {
   block: string | null;
   /** Folder row whose spring bar is filling */
   springKey: string | null;
+  /** Favorites: the insertion line, above or below this row */
+  line: { key: string; side: 'before' | 'after' } | null;
 }
 
-const IDLE: TreeDragView = { payload: null, copy: false, targetKey: null, block: null, springKey: null };
+const IDLE: TreeDragView = { payload: null, copy: false, targetKey: null, block: null, springKey: null, line: null };
 
 interface DragState {
   pointerId: number;
@@ -120,7 +130,17 @@ export function useTreeDrag(opts: {
 
   const publish = (next: TreeDragView) => {
     const v = viewRef.current;
-    if (v.payload === next.payload && v.copy === next.copy && v.targetKey === next.targetKey && v.block === next.block && v.springKey === next.springKey) return;
+    if (
+      v.payload === next.payload &&
+      v.copy === next.copy &&
+      v.targetKey === next.targetKey &&
+      v.block === next.block &&
+      v.springKey === next.springKey &&
+      v.line?.key === next.line?.key &&
+      v.line?.side === next.line?.side
+    ) {
+      return;
+    }
     viewRef.current = next;
     setView(next);
   };
@@ -129,14 +149,30 @@ export function useTreeDrag(opts: {
     if (ghostEl.current) ghostEl.current.style.transform = `translate(${Math.round(st.x + GHOST_DX)}px, ${Math.round(st.y + GHOST_DY)}px)`;
   };
 
-  /** The row under a point: `inside` false when the point is outside the list; row null below the last row. */
-  const hitTest = (x: number, y: number): { inside: boolean; row: TreeRow | null } => {
+  /**
+   * The row under a point: `inside` false when the point is outside the list; row null below the
+   * last row; `fraction` is the point's place inside the row (0 = top edge).
+   */
+  const hitTest = (x: number, y: number): { inside: boolean; row: TreeRow | null; index: number; fraction: number } => {
     const el = scrollRef.current;
-    if (!el) return { inside: false, row: null };
+    if (!el) return { inside: false, row: null, index: -1, fraction: 0 };
     const r = el.getBoundingClientRect();
-    if (x < r.left || x > r.right || y < r.top || y > r.bottom) return { inside: false, row: null };
-    const i = Math.floor((y - r.top + el.scrollTop) / rowHeightRef.current);
-    return { inside: true, row: rowsRef.current[i] ?? null };
+    if (x < r.left || x > r.right || y < r.top || y > r.bottom) return { inside: false, row: null, index: -1, fraction: 0 };
+    const h = rowHeightRef.current;
+    const pos = y - r.top + el.scrollTop;
+    const i = Math.floor(pos / h);
+    return { inside: true, row: rowsRef.current[i] ?? null, index: i, fraction: (pos - i * h) / h };
+  };
+
+  /** The drop spot at a point, and whether the payload may drop there. */
+  const spotAt = (st: DragState, x: number, y: number): { hit: ReturnType<typeof hitTest>; spot: DropSpot | null; valid: boolean } => {
+    const hit = hitTest(x, y);
+    const spot = hit.inside ? dropSpotAt(rowsRef.current, hit.index, hit.fraction) : null;
+    let valid = false;
+    if (spot && st.payload) {
+      valid = spot.favoriteIndex !== undefined ? hostRef.current.canFavorite(st.payload, spot.favoriteIndex) : checkDrop(st.payload, spot.folder, st.alt) === 'ok';
+    }
+    return { hit, spot, valid };
   };
 
   const clearSpring = (st: DragState) => {
@@ -150,13 +186,14 @@ export function useTreeDrag(opts: {
     const st = stRef.current;
     if (!st || !st.active || !st.payload) return;
     placeGhost(st);
-    const hit = hitTest(st.x, st.y);
-    const spot = hit.inside ? dropSpotForRow(hit.row) : null;
-    const valid = !!spot && checkDrop(st.payload, spot.folder, st.alt) === 'ok';
+    const { hit, spot, valid } = spotAt(st, st.x, st.y);
+    const favorite = spot?.favoriteIndex !== undefined;
+    // ⌥/Alt means nothing over Favorites (a favorite is never a copy)
+    const copy = st.alt && !favorite;
 
     // Spring-loading: only a collapsed folder row that would take the drop, and only once per folder
     const row = hit.row;
-    const springPath = valid && row?.kind === 'folder' && !row.expanded && !st.springOpened.includes(row.path) ? row.path : null;
+    const springPath = valid && !favorite && row?.kind === 'folder' && !row.expanded && !st.springOpened.includes(row.path) ? row.path : null;
     if (springPath !== st.springPath) {
       clearSpring(st);
       if (springPath !== null) {
@@ -173,18 +210,23 @@ export function useTreeDrag(opts: {
       }
     }
 
-    setCursor(valid ? (st.alt ? 'copy' : 'move') : 'none');
-    const changed = st.valid !== valid || st.spot?.highlightKey !== spot?.highlightKey || st.spot?.folder !== spot?.folder;
-    const copyChanged = viewRef.current.copy !== st.alt;
+    setCursor(valid ? (copy ? 'copy' : 'move') : 'none');
+    const changed =
+      st.valid !== valid ||
+      st.spot?.highlightKey !== spot?.highlightKey ||
+      st.spot?.folder !== spot?.folder ||
+      st.spot?.favoriteIndex !== spot?.favoriteIndex;
+    const copyChanged = viewRef.current.copy !== copy;
     st.spot = spot;
     st.valid = valid;
-    if (changed || copyChanged) hostRef.current.hover(spot, valid, st.alt);
+    if (changed || copyChanged) hostRef.current.hover(spot, valid, copy);
     publish({
       payload: st.payload,
-      copy: st.alt,
+      copy,
       targetKey: valid && spot ? spot.highlightKey : null,
       block: valid && spot ? spot.block : null,
       springKey: st.springPath !== null ? `f:${st.springPath}` : null,
+      line: valid && spot?.line ? spot.line : null,
     });
   };
 
@@ -238,6 +280,7 @@ export function useTreeDrag(opts: {
     setCursor(null);
     publish(IDLE);
     hostRef.current.hover(null, false, false);
+    hostRef.current.active(false);
     return { wasActive: true, springOpened: st.springOpened };
   };
 
@@ -259,6 +302,7 @@ export function useTreeDrag(opts: {
       /* capture is best effort: the window listeners still see the pointer */
     }
     st.raf = requestAnimationFrame(tick);
+    hostRef.current.active(true);
     return true;
   };
 
@@ -301,18 +345,19 @@ export function useTreeDrag(opts: {
       st.x = e.clientX;
       st.y = e.clientY;
       st.alt = e.altKey;
-      const hit = hitTest(st.x, st.y);
-      const spot = hit.inside ? dropSpotForRow(hit.row) : null;
+      const { spot, valid } = spotAt(st, st.x, st.y);
       const copy = st.alt;
       const payload = st.payload;
-      const valid = !!spot && checkDrop(payload, spot.folder, copy) === 'ok';
       const { springOpened } = end();
       // The click that follows this pointerup must not select or open anything
       suppressClick.current = true;
       window.setTimeout(() => {
         suppressClick.current = false;
       }, 0);
-      if (valid && spot) hostRef.current.drop(payload, spot.folder, copy, springOpened);
+      if (valid && spot && spot.favoriteIndex !== undefined) {
+        if (springOpened.length) hostRef.current.setExpanded(springOpened, false);
+        hostRef.current.dropFavorite(payload, spot.favoriteIndex);
+      } else if (valid && spot) hostRef.current.drop(payload, spot.folder, copy, springOpened);
       else if (springOpened.length) hostRef.current.setExpanded(springOpened, false);
     },
     abort: () => {

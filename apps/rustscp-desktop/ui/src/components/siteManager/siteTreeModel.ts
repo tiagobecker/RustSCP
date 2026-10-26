@@ -1130,6 +1130,11 @@ export function flattenRows(model: TreeModel, state: FlattenState): FlatRows {
     for (let i = localFirst; i < kids.length; i++) emitChild(kids[i]);
   };
 
+  // While a drag runs, an empty (but shown) Favorites section offers a drop zone at the top
+  if (!showFav && state.favDropZone && state.showFavorites !== false) {
+    rows.push({ kind: 'favDrop', key: 'favdrop', section: 'fav', depth: 0, level: 1, setsize: topSize, posinset: 0 });
+  }
+
   if (showFav) {
     const expanded = !collapsedSections.has('fav');
     rows.push({ kind: 'section', key: 'sec:fav', section: 'fav', sectionId: 'fav', depth: 0, level: 1, setsize: topSize, posinset: ++topPos, expanded, count: model.favorites.length });

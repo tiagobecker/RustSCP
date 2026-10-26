@@ -9,6 +9,9 @@
  *   Copies wait for the backend (it holds the secrets).
  * - Undo keeps the last 20 tokens (⌘Z and the toasts' Undo).
  * - Collapsed folders are written 800 ms after the last change and when the dialog closes.
+ * - The first time a large library opens, its nested folders start collapsed (§13).
+ * - Recent changes (a connection, "Remove from recent", "Clear recent") show at once and go to the
+ *   backend as view patches (not undoable).
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -25,7 +28,8 @@ import {
   siteInvoke,
   undoSiteTreeOps,
 } from './siteApi.ts';
-import { LOCAL_ID, MAX_COLLAPSED, applyOpsLocally, coerceLayout, defaultLayout, normalizeGroup, opsAreOptimistic } from './siteTreeModel.ts';
+import { applyRecentsPatch, largeLibraryFirstRun, legacyMigrationPatch, recordRecent } from './sectionsModel.ts';
+import { LOCAL_ID, MAX_COLLAPSED, MAX_RECENTS, applyOpsLocally, coerceLayout, defaultLayout, opsAreOptimistic } from './siteTreeModel.ts';
 import type { SiteLayout, SiteTreeErrorCode, SiteTreeOp, SiteTreeResult, SiteTreeViewPatch } from './types.ts';
 
 const UNDO_STACK_MAX = 20;
@@ -76,6 +80,8 @@ export interface SiteTreeController {
   forgetUndo: () => void;
   /** Records a successful connection from the dialog (errors ignored) */
   recordConnected: (id: string) => void;
+  /** Recent housekeeping ("Remove from recent", "Clear recent"): shown at once, then sent (errors ignored) */
+  updateView: (patch: SiteTreeViewPatch) => void;
   /** Translated text of a backend or local tree error */
   errorText: (err: unknown, params?: Record<string, string>) => string;
 }
@@ -99,30 +105,8 @@ const readStorage = (key: string): string | null => {
 };
 
 /** The one-time move of localStorage state into the layout (§19). */
-const migrationPatch = (sites: readonly ConnectionConfig[]): SiteTreeViewPatch => {
-  const patch: SiteTreeViewPatch = { migrated_local_storage: true };
-  try {
-    const raw: unknown = JSON.parse(readStorage(LEGACY_COLLAPSED_KEY) || '[]');
-    if (Array.isArray(raw)) {
-      const paths = raw.filter((p): p is string => typeof p === 'string' && p.length > 0 && p.length <= 1024).map((p) => normalizeGroup(p)).filter(Boolean);
-      if (paths.length) patch.collapsed = [...new Set(paths)].slice(0, MAX_COLLAPSED);
-    }
-  } catch {
-    /* unreadable: nothing to carry over */
-  }
-  try {
-    const raw: unknown = JSON.parse(readStorage(LAST_PATHS_KEY) || '{}');
-    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
-      const saved = new Set(sites.filter((s) => s.id !== LOCAL_ID).map((s) => s.id));
-      // Newest entries are last in that map: reverse for newest first
-      const ids = Object.keys(raw as Record<string, unknown>).reverse().filter((k) => saved.has(k));
-      if (ids.length) patch.seed_recents = ids;
-    }
-  } catch {
-    /* unreadable: Recent just starts empty */
-  }
-  return patch;
-};
+const migrationPatch = (sites: readonly ConnectionConfig[]): SiteTreeViewPatch =>
+  legacyMigrationPatch(readStorage(LEGACY_COLLAPSED_KEY), readStorage(LAST_PATHS_KEY), sites);
 
 export function useSiteTree({ isOpen, savedSites, onSitesUpdated }: Props): SiteTreeController {
   const { t } = useTranslation();
@@ -415,7 +399,8 @@ export function useSiteTree({ isOpen, savedSites, onSitesUpdated }: Props): Site
 
   /* ------------------------------- loading -------------------------------- */
 
-  const load = useCallback(async () => {
+  /** Loads the layout; `opening` (the dialog just opened) also runs the large-library first run. */
+  const load = useCallback(async (opening: boolean) => {
     const gen = ++loadGen.current;
     try {
       let resp = await getSiteLayout();
@@ -436,7 +421,19 @@ export function useSiteTree({ isOpen, savedSites, onSitesUpdated }: Props): Site
         resp = await getSiteLayout();
         if (gen !== loadGen.current) return;
       }
-      const l = coerceLayout(resp.layout);
+      let l = coerceLayout(resp.layout);
+      // A large library opens with its nested folders collapsed, once. Not after an import's
+      // reload: "View connections" expands what was imported.
+      const firstRun = opening && !resp.read_only ? largeLibraryFirstRun(l, sitesRef.current.filter((x) => x.id !== LOCAL_ID).length) : null;
+      if (firstRun) {
+        const patch: SiteTreeViewPatch = { large_library_collapsed: true };
+        l = { ...l, large_library_collapsed: true };
+        if (firstRun.collapsed) {
+          patch.collapsed = firstRun.collapsed;
+          l = { ...l, collapsed: firstRun.collapsed };
+        }
+        void enqueue(() => setSiteTreeView(patch).catch(() => undefined));
+      }
       setLayout(l);
       applyCollapsed(new Set(l.collapsed));
     } catch (err) {
@@ -445,11 +442,11 @@ export function useSiteTree({ isOpen, savedSites, onSitesUpdated }: Props): Site
     } finally {
       if (gen === loadGen.current) setLoaded(true);
     }
-  }, [errorText, setLayout, applyCollapsed]);
+  }, [errorText, setLayout, applyCollapsed, enqueue]);
 
   useEffect(() => {
     if (isOpen) {
-      void load();
+      void load(true);
       return;
     }
     flushView();
@@ -458,7 +455,7 @@ export function useSiteTree({ isOpen, savedSites, onSitesUpdated }: Props): Site
   // Leaving the app's page with the dialog open: send the last collapsed state
   useEffect(() => () => flushView(), [flushView]);
 
-  const reload = useCallback(() => enqueue(load), [enqueue, load]);
+  const reload = useCallback(() => enqueue(() => load(false)), [enqueue, load]);
 
   const forgetUndo = useCallback(() => {
     for (const id of undoToasts.current.values()) notify.dismiss(id);
@@ -468,14 +465,28 @@ export function useSiteTree({ isOpen, savedSites, onSitesUpdated }: Props): Site
     void forgetSiteTreeUndo().catch(() => undefined);
   }, []);
 
-  const recordConnected = useCallback((id: string) => {
-    if (!id || id === LOCAL_ID) return;
-    void recordSiteConnected(id).catch(() => undefined);
-  }, []);
+  const recordConnected = useCallback(
+    (id: string) => {
+      if (!id || id === LOCAL_ID) return;
+      // Shown at once (the dialog usually closes; it reloads the layout when it opens again)
+      setLayout(recordRecent(layoutRef.current, id, Math.floor(Date.now() / 1000), MAX_RECENTS));
+      void recordSiteConnected(id).catch(() => undefined);
+    },
+    [setLayout]
+  );
+
+  const updateView = useCallback(
+    (patch: SiteTreeViewPatch) => {
+      const next = applyRecentsPatch(layoutRef.current, patch);
+      if (next !== layoutRef.current) setLayout(next);
+      void enqueue(() => setSiteTreeView(patch).catch(() => undefined));
+    },
+    [setLayout, enqueue]
+  );
 
   const canUndo = undoDepth > 0;
   return useMemo(
-    () => ({ loaded, layout, readOnly, collapsed, setCollapsed, run, undo, canUndo, toastWithUndo, reload, forgetUndo, recordConnected, errorText }),
-    [loaded, layout, readOnly, collapsed, setCollapsed, run, undo, canUndo, toastWithUndo, reload, forgetUndo, recordConnected, errorText]
+    () => ({ loaded, layout, readOnly, collapsed, setCollapsed, run, undo, canUndo, toastWithUndo, reload, forgetUndo, recordConnected, updateView, errorText }),
+    [loaded, layout, readOnly, collapsed, setCollapsed, run, undo, canUndo, toastWithUndo, reload, forgetUndo, recordConnected, updateView, errorText]
   );
 }

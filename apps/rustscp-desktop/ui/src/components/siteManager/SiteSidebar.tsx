@@ -21,10 +21,26 @@ import { FilterPills, SearchTips, SiteSearchBar } from './SiteSearchBar.tsx';
 import { SiteTree } from './SiteTree.tsx';
 import type { SiteTreeHandle, TreeActions } from './SiteTree.tsx';
 import type { RowEditState } from './SiteTreeRow.tsx';
-import { emptyAreaMenu, filterMenu, folderMenu, importExportEntries, localMenu, multiMenu, shortcutLabels, siteMenu, viewOptionsMenu } from './siteMenus.tsx';
-import type { MenuActions, MenuContext } from './siteMenus.tsx';
+import {
+  emptyAreaMenu,
+  favoriteMenu,
+  filterMenu,
+  folderMenu,
+  importExportEntries,
+  localMenu,
+  multiMenu,
+  recentMenu,
+  sectionMenu,
+  shortcutLabels,
+  siteMenu,
+  viewOptionsMenu,
+} from './siteMenus.tsx';
+import type { MenuActions, MenuContext, ViewMenuState } from './siteMenus.tsx';
+import { allFavorites, checkFavoriteDrop, favoriteKey, favoriteRefOf, insertFavorites, moveFavorite, sameFavorites, setFavorites } from './sectionsModel.ts';
 import { activeValues, addressFromQuery, clearQualifiers, highlightTerms, matchContext, parseQuery, removeToken, searchTree, toggleQualifier } from './siteQuery.ts';
 import {
+  LOCAL_ID,
+  MAX_FAVORITES,
   MAX_SITE_NAME_LEN,
   VIEW_PREFS_KEY,
   baseName,
@@ -58,7 +74,7 @@ import {
 import type { FolderNameProblem, MovePlan } from './siteTreeModel.ts';
 import { checkDrop, commonParent, dragPayload, planCopies } from './treeDragModel.ts';
 import type { CopyNames, DragPayload, DropSpot } from './treeDragModel.ts';
-import type { FolderNode, SectionId, SiteTreeOp, TreeRow } from './types.ts';
+import type { FavoriteRef, FolderNode, SectionId, SiteTreeOp, TreeRow, ViewPrefs } from './types.ts';
 import type { SiteTreeController } from './useSiteTree.ts';
 import { canonicalKey, isItemRow, paneFor, rangeKeys, selectedItems, useTreeSelection } from './useTreeSelection.ts';
 
@@ -70,6 +86,8 @@ export interface SiteSidebarApi {
   revealImported: (folders: string[]) => void;
   /** The form header's ⋯: the item's menu anchored to the button */
   openItemMenu: (itemKey: string, rect: DOMRect) => void;
+  /** The form header's Star: adds the item to the favorites or removes it */
+  toggleFavorite: (itemKey: string) => void;
 }
 
 export interface SiteSidebarProps {
@@ -112,6 +130,15 @@ export type PaneMode = 'form' | 'folder' | 'selection';
 
 const EMPTY_SET: ReadonlySet<string> = new Set();
 const EMPTY_TERMS: readonly string[] = [];
+
+/**
+ * View state kept for this run of the app, across openings of the dialog (never stored: folder
+ * paths are names): favorite folders expanded in place, and collapsed sections.
+ */
+const session: { favoriteExpanded: ReadonlySet<string>; collapsedSections: ReadonlySet<SectionId> } = {
+  favoriteExpanded: new Set(),
+  collapsedSections: new Set(),
+};
 
 /** An ⌥/Alt drop that copies more connections than this asks first */
 const COPY_ASK_ABOVE = 50;
@@ -156,8 +183,11 @@ interface NewFolderState {
 
 interface MenuState {
   at: MenuAnchor;
-  /** 'filter': the filter menu, rebuilt on every render so its checkboxes follow the text */
-  entries: ContextMenuEntry[] | 'filter';
+  /**
+   * 'filter' (the filter menu) and 'view' (View options) are rebuilt on every render, so their
+   * checkboxes, which keep the menu open, follow the state
+   */
+  entries: ContextMenuEntry[] | 'filter' | 'view';
   label: string;
   focusFirst: boolean;
 }
@@ -213,8 +243,34 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   const [query, setQueryState] = useState('');
   const deferredQuery = useDeferredValue(query);
   const [searchCollapsed, setSearchCollapsed] = useState<ReadonlySet<string>>(EMPTY_SET);
-  const [collapsedSections, setCollapsedSections] = useState<ReadonlySet<SectionId>>(() => new Set());
-  const [prefs] = useState(() => parseViewPrefs(readStorage(VIEW_PREFS_KEY)));
+  const [collapsedSections, setCollapsedSectionsState] = useState<ReadonlySet<SectionId>>(() => session.collapsedSections);
+  const setCollapsedSections = useCallback((fn: (prev: ReadonlySet<SectionId>) => ReadonlySet<SectionId>) => {
+    setCollapsedSectionsState((prev) => {
+      const next = fn(prev);
+      session.collapsedSections = next;
+      return next;
+    });
+  }, []);
+  const [favoriteExpanded, setFavoriteExpandedState] = useState<ReadonlySet<string>>(() => session.favoriteExpanded);
+  const setFavoriteExpanded = useCallback((fn: (prev: ReadonlySet<string>) => ReadonlySet<string>) => {
+    setFavoriteExpandedState((prev) => {
+      const next = fn(prev);
+      session.favoriteExpanded = next;
+      return next;
+    });
+  }, []);
+  const [prefs, setPrefs] = useState<ViewPrefs>(() => parseViewPrefs(readStorage(VIEW_PREFS_KEY)));
+  const prefsRef = useRef(prefs);
+  prefsRef.current = prefs;
+  /** View options: kept in localStorage as JSON (sort, sizes, switches; never names) */
+  const setView = useCallback((patch: Partial<ViewPrefs>) => {
+    const next = { ...prefsRef.current, ...patch };
+    prefsRef.current = next;
+    setPrefs(next);
+    writeStorage(VIEW_PREFS_KEY, JSON.stringify(next));
+  }, []);
+  /** A drag is running (an empty Favorites section shows its drop zone) */
+  const [dragging, setDragging] = useState(false);
   const selection = useTreeSelection(formKey);
   const [rename, setRename] = useState<RenameState | null>(null);
   const [newFolder, setNewFolder] = useState<NewFolderState | null>(null);
@@ -271,7 +327,10 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   /** The text as typed (pills and the filter menu follow it at once) */
   const parsedNow = useMemo(() => parseQuery(query), [query]);
   const searching = !parsed.isEmpty;
-  const search = useMemo(() => (searching ? searchTree(model, parsed, matchContext(model)) : null), [model, parsed, searching]);
+  const search = useMemo(
+    () => (searching ? searchTree(model, parsed, matchContext(model), { asList: prefs.resultsAsList }) : null),
+    [model, parsed, searching, prefs.resultsAsList]
+  );
   const address = useMemo(() => (searching ? addressFromQuery(parsed) : null), [parsed, searching]);
   const draft = useMemo(() => (draftFolder !== null ? { folder: draftFolder, name: draftName } : null), [draftFolder, draftName]);
   const newFolderParent = newFolder?.parent ?? null;
@@ -280,21 +339,27 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
       flattenRows(model, {
         collapsed: tree.collapsed,
         collapsedSections,
-        // Favorites and Recent arrive with WP7
-        showFavorites: false,
-        showRecent: false,
+        showFavorites: prefs.showFavorites,
+        showRecent: prefs.showRecent,
+        favoriteExpanded,
         search,
         searchCollapsed,
         draft,
         newFolder: newFolderParent !== null ? { parent: newFolderParent, name: '' } : null,
         address,
+        favDropZone: dragging,
       }),
-    [model, tree.collapsed, collapsedSections, search, searchCollapsed, draft, newFolderParent, address]
+    [model, tree.collapsed, collapsedSections, prefs.showFavorites, prefs.showRecent, favoriteExpanded, search, searchCollapsed, draft, newFolderParent, address, dragging]
   );
   const { rows, indexByKey } = flat;
   const nameTerms = useMemo(() => (searching ? highlightTerms(parsed, 'name') : EMPTY_TERMS), [parsed, searching]);
   const addressTerms = useMemo(() => (searching ? highlightTerms(parsed, 'address') : EMPTY_TERMS), [parsed, searching]);
-  const matchCount = searching ? (rows.find((r) => r.kind === 'section')?.count ?? 0) : 0;
+  // Matching saved connections (Local not counted), in folders or as a list
+  const matchCount = useMemo(() => {
+    let n = 0;
+    if (search) for (const id of search.siteIds) if (id !== LOCAL_ID) n++;
+    return n;
+  }, [search]);
   const noResults = searching && !!search && search.siteIds.size === 0 && search.folderPaths.size === 0;
 
   const folderPaths = useMemo(() => [...model.folders.keys()].filter(Boolean), [model]);
@@ -342,14 +407,17 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
 
   /* ------------------------- selection follows form ------------------------ */
 
-  // A layout effect, so the highlight never trails the form by a frame
+  // A layout effect, so the highlight never trails the form by a frame. A site opened from its
+  // Favorites or Recent row stays selected there (the list does not jump to "All connections").
   useLayoutEffect(() => {
     if (suppressFollow.current) {
       suppressFollow.current = false;
       return;
     }
-    selection.selectOnly(formKey);
-    treeRef.current?.scrollToKey(formKey);
+    const active = selection.stateRef.current.active;
+    const key = active && active !== formKey && canonicalKey(active) === formKey && indexByKey.has(active) ? active : formKey;
+    selection.selectOnly(key);
+    treeRef.current?.scrollToKey(key);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [formKey, formEpoch]);
 
@@ -357,6 +425,14 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   // row, else the nearest folder shown. Checked against the latest selection, so a selection made
   // in the same update (after a delete) wins.
   useEffect(() => {
+    // A selected Favorites or Recent row that went away (unfavorited, cleared, section hidden):
+    // the item stays selected on its own row in All connections
+    const s = selection.stateRef.current;
+    if (s.keys.size === 1) {
+      const [only] = s.keys;
+      const item = canonicalKey(only);
+      if (item !== only && !indexByKey.has(only) && indexByKey.has(item)) selection.selectOnly(item);
+    }
     selection.ensureActive(
       (key) => indexByKey.has(key),
       (key) => {
@@ -1137,6 +1213,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     if (!spot) return;
     const name = spot.folder ? baseName(spot.folder) : t('siteTree.topLevel', 'Top level');
     if (!valid) announce(t('siteTree.a11yDragNotHere', "Can't drop here"));
+    else if (spot.favoriteIndex !== undefined) announce(t('siteTree.a11yDragFavorite', 'Over Favorites. Release to add.'));
     else if (copy) announce(t('siteTree.a11yDragCopyOver', { name, defaultValue: 'Over {{name}}. Release to copy.' }));
     else announce(t('siteTree.a11yDragOver', { name, defaultValue: 'Over {{name}}. Release to move.' }));
   };
@@ -1151,6 +1228,89 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     if (copy) void runCopies(payload.keys, folder);
     else runMove(payload.keys, folder, false);
   };
+
+  /* --------------------------- favorites and recent --------------------------- */
+
+  const favoriteText = (on: boolean, n: number) =>
+    on
+      ? t('siteTree.favAdded', { count: n, formatted: formatCount(lang, n), defaultValue_one: 'Added to favorites', defaultValue_other: 'Added {{formatted}} items to favorites' })
+      : t('siteTree.favRemoved', { count: n, formatted: formatCount(lang, n), defaultValue_one: 'Removed from favorites', defaultValue_other: 'Removed {{formatted}} items from favorites' });
+
+  /** Saves a new favorites list (one undoable op); refuses a list over the limit. */
+  const writeFavorites = (next: FavoriteRef[], done?: () => void) => {
+    if (sameFavorites(next, model.favorites)) return;
+    if (next.length > MAX_FAVORITES) {
+      notify.error(t('siteTree.errTooManyFavorites', { max: MAX_FAVORITES, defaultValue: 'You can keep up to {{max}} favorites.' }));
+      return;
+    }
+    void tree.run([{ op: 'set_favorites', items: next }]).then((res) => {
+      if (res) done?.();
+    });
+  };
+
+  /** ⌘D, the Star buttons, the menus: adds the items to the favorites, or removes them when all of them are favorites. */
+  const toggleFavorites = (keys: string[]) => {
+    const items = [...new Set(keys.map(canonicalKey))].filter((k) => favoriteRefOf(k) !== null);
+    if (items.length === 0) return;
+    const on = !allFavorites(model, items);
+    const next = setFavorites(model.favorites, items, on);
+    const changed = Math.abs(next.length - model.favorites.length);
+    writeFavorites(next, () => announce(favoriteText(on, changed)));
+  };
+
+  /** ⌥⌘↑ / ⌥⌘↓ on a favorite: one place up or down (it stays selected). */
+  const reorderFavorite = (row: TreeRow, delta: number) => {
+    if (row.section !== 'fav' || row.depth !== 0 || !isItemRow(row)) return;
+    const key = canonicalKey(row.key);
+    const next = moveFavorite(model.favorites, key, delta);
+    if (!next) return;
+    selection.selectOnly(row.key);
+    scrollWhenShown(row.key, false);
+    const pos = next.findIndex((f) => favoriteKey(f) === key) + 1;
+    writeFavorites(next, () => announce(t('siteTree.a11yFavMoved', { pos, total: next.length, defaultValue: 'Moved to position {{pos}} of {{total}}' })));
+  };
+
+  /** A drop on Favorites: the items join (or move to) position `index`; they end up selected there. */
+  const dropFavorites = (payload: DragPayload, index: number) => {
+    const before = model.favorites;
+    const next = insertFavorites(before, payload.keys, index);
+    const added = next.length - before.length;
+    if (collapsedSections.has('fav')) setCollapsedSections((prev) => new Set([...prev].filter((s) => s !== 'fav')));
+    const keys = payload.keys.map((k) => `fav:${k}`);
+    selection.selectKeys(keys, keys[0], keys[0]);
+    scrollWhenShown(keys[0], false);
+    writeFavorites(next, () => announce(added > 0 ? favoriteText(true, added) : t('siteTree.favReordered', 'Favorites reordered')));
+  };
+
+  /** "Remove from recent" (a view change: not undoable, like the backend's recents). */
+  const removeRecent = (id: string) => {
+    tree.updateView({ forget_recents: [id] });
+    announce(t('siteTree.a11yRecentRemoved', 'Removed from recent'));
+  };
+
+  const clearRecent = () => {
+    tree.updateView({ clear_recents: true });
+    announce(t('siteTree.a11yRecentCleared', 'Recent cleared'));
+  };
+
+  /** "Show in folder": the item's own row in All connections, revealed, selected and focused. */
+  const showInFolder = (itemKey: string) => {
+    const ref = parseItemKey(itemKey);
+    if (!ref) return;
+    if (searching) setQuery('');
+    if (collapsedSections.has('all')) setCollapsedSections((prev) => new Set([...prev].filter((s) => s !== 'all')));
+    if (ref.kind === 'site') expandChain(model.siteFolder.get(ref.id) ?? '');
+    else expandChain(ref.path, false);
+    selection.selectOnly(itemKey);
+    if (ref.kind === 'site' && itemKey !== formKey && !formDirtyRef.current) {
+      const site = model.sitesById.get(ref.id);
+      if (site) onSelectSite(site);
+    }
+    treeRef.current?.scrollToKey(itemKey, 'center');
+    treeRef.current?.focus();
+  };
+
+  const hideSection = (section: 'fav' | 'rec') => setView(section === 'fav' ? { showFavorites: false } : { showRecent: false });
 
   /* --------------------------------- menus --------------------------------- */
 
@@ -1176,18 +1336,33 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     setAllExpanded,
     openVault: (tab) => onOpenVault(tab),
     openShared: onOpenSharedConnection,
+    toggleFavorites,
+    showInFolder,
+    removeRecent,
+    clearRecent,
+    hideSection,
+    setView,
   };
   const menuCtx: MenuContext = { t, actions: menuActions, mac };
   const expandState = { hasFolders: folderPaths.length > 0, anyExpanded, anyCollapsed };
+  const viewState: ViewMenuState = { prefs, density };
 
-  const openMenu = (at: MenuAnchor, entries: ContextMenuEntry[], label: string, focusFirst: boolean) => setMenu({ at, entries, label, focusFirst });
+  const openMenu = (at: MenuAnchor, entries: ContextMenuEntry[] | 'view', label: string, focusFirst: boolean) => setMenu({ at, entries, label, focusFirst });
+
+  /** Menu A or B for a site, with its favorite state. */
+  const siteEntries = (site: ConnectionConfig) => {
+    const favorite = model.favoriteSites.has(site.id);
+    return isLocalSite(site) ? localMenu(site, menuCtx, { favorite }) : siteMenu(site, menuCtx, { favorite });
+  };
 
   /** Menu D for the items of a multi-selection. */
   const openMultiMenu = (keys: string[], at: MenuAnchor, focusFirst: boolean) => {
     let sites = 0;
     let folders = 0;
     let hasAddress = false;
+    let favoriteCount = 0;
     for (const k of keys) {
+      if (favoriteRefOf(k)) favoriteCount++;
       const ref = parseItemKey(k);
       if (ref?.kind === 'folder') folders++;
       else if (ref?.kind === 'site') {
@@ -1197,7 +1372,12 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
         if (!hasAddress && copyAddress(site)) hasAddress = true;
       }
     }
-    openMenu(at, multiMenu({ keys, sites, folders, hasAddress, format: (n) => formatCount(lang, n) }, menuCtx), selectedText(keys.length), focusFirst);
+    openMenu(
+      at,
+      multiMenu({ keys, sites, folders, hasAddress, favoriteCount, allFavorite: allFavorites(model, keys), format: (n) => formatCount(lang, n) }, menuCtx),
+      selectedText(keys.length),
+      focusFirst
+    );
   };
 
   const menuForRow = (row: TreeRow | null, at: MenuAnchor, focusFirst: boolean) => {
@@ -1211,10 +1391,18 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
         return;
       }
     }
-    if (!row || row.kind === 'section') {
-      openMenu(at, emptyAreaMenu(menuCtx, expandState), t('siteTree.sectionAll', 'All connections'), focusFirst);
+    if (row?.kind === 'section' && row.sectionId !== 'all') {
+      // H: the Favorites or Recent header
+      const name = row.sectionId === 'fav' ? t('siteTree.sectionFavorites', 'Favorites') : t('siteTree.sectionRecent', 'Recent');
+      openMenu(at, sectionMenu(row.sectionId, menuCtx), name, focusFirst);
       return;
     }
+    if (!row || row.kind === 'section') {
+      openMenu(at, emptyAreaMenu(menuCtx, expandState, viewState), t('siteTree.sectionAll', 'All connections'), focusFirst);
+      return;
+    }
+    // F applies to the favorites themselves; rows inside an expanded favorite folder get A / C
+    const favoriteRow = row.section === 'fav' && row.depth === 0;
     if (row.kind === 'site') {
       // Right-click on an unselected row selects it first
       if (!selection.stateRef.current.keys.has(row.key)) {
@@ -1224,7 +1412,11 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
           onSelectSite(row.site);
         }
       }
-      openMenu(at, isLocalSite(row.site) ? localMenu(row.site, menuCtx) : siteMenu(row.site, menuCtx), row.site.name, focusFirst);
+      let entries: ContextMenuEntry[];
+      if (favoriteRow) entries = favoriteMenu({ kind: 'site', site: row.site, local: isLocalSite(row.site) }, menuCtx);
+      else if (row.section === 'rec') entries = recentMenu(row.site, menuCtx, { favorite: model.favoriteSites.has(row.site.id) });
+      else entries = siteEntries(row.site);
+      openMenu(at, entries, row.site.name, focusFirst);
       return;
     }
     if (row.kind === 'folder' || row.kind === 'placeholder') {
@@ -1232,7 +1424,9 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
       const node = model.folders.get(path);
       if (!node) return;
       if (row.kind === 'folder' && !selection.stateRef.current.keys.has(row.key)) selection.selectOnly(row.key);
-      openMenu(at, folderMenu(node, menuCtx), node.name, focusFirst);
+      const entries =
+        row.kind === 'folder' && favoriteRow ? favoriteMenu({ kind: 'folder', node }, menuCtx) : folderMenu(node, menuCtx, { favorite: model.favoriteFolders.has(path) });
+      openMenu(at, entries, node.name, focusFirst);
     }
     // The draft and the inline new-folder row have no menu
   };
@@ -1285,6 +1479,20 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     }
     if (row.kind !== 'folder') return;
     const open = expand ?? !row.expanded;
+    if (row.section === 'fav' && row.depth === 0) {
+      // A favorite folder expands in place (its subfolders keep their own state)
+      if (open !== row.expanded) {
+        setFavoriteExpanded((prev) => {
+          const next = new Set(prev);
+          if (open) next.add(row.path);
+          else next.delete(row.path);
+          return next;
+        });
+      }
+      if (subtree) setExpanded(row.path, open, true);
+      else if (open !== row.expanded) announce(open ? t('siteTree.a11yExpanded', 'Folder expanded') : t('siteTree.a11yCollapsed', 'Folder collapsed'));
+      return;
+    }
     if (open === row.expanded && !subtree) return;
     setExpanded(row.path, open, subtree);
   };
@@ -1374,6 +1582,18 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     dragExpand,
     dragHover,
     drop: dropItems,
+    dragActive: setDragging,
+    canFavorite: (payload, index) => checkFavoriteDrop(model.favorites, payload.keys, index) === 'ok',
+    dropFavorite: dropFavorites,
+    toggleFavorite: (row, onlyRow) => toggleFavorites(onlyRow ? (isItemRow(row) ? [canonicalKey(row.key)] : []) : itemsFor(row)),
+    reorderFavorite,
+    clearRecent,
+    revealCrumb: (path) => {
+      const key = folderKey(path);
+      selection.selectOnly(key);
+      treeRef.current?.scrollToKey(key, 'start');
+      treeRef.current?.focus();
+    },
   };
 
   /* ------------------------------ escape layer ------------------------------ */
@@ -1455,8 +1675,9 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
       }
       const ref = parseItemKey(itemKey);
       const site = ref?.kind === 'site' ? model.sitesById.get(ref.id) : undefined;
-      if (site) openMenu(at, isLocalSite(site) ? localMenu(site, menuCtx) : siteMenu(site, menuCtx), site.name, false);
+      if (site) openMenu(at, siteEntries(site), site.name, false);
     },
+    toggleFavorite: (itemKey) => toggleFavorites([itemKey]),
   };
   useEffect(
     () => () => {
@@ -1638,7 +1859,16 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     }
     if (items.length > 1) {
       paneMode = 'selection';
-      paneContent = <SelectionPane items={items} onMove={() => openMove(pane.items)} onDelete={() => deleteItems(pane.items)} onClose={reduceSelection} />;
+      paneContent = (
+        <SelectionPane
+          items={items}
+          onMove={() => openMove(pane.items)}
+          onDelete={() => deleteItems(pane.items)}
+          allFavorite={allFavorites(model, pane.items)}
+          onFavorite={() => toggleFavorites(pane.items)}
+          onClose={reduceSelection}
+        />
+      );
     }
   }
   useLayoutEffect(() => {
@@ -1739,9 +1969,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
           title={t('siteTree.viewOptions', 'View options')}
           aria-label={t('siteTree.viewOptions', 'View options')}
           aria-haspopup="menu"
-          onClick={(e) =>
-            openMenu({ rect: e.currentTarget.getBoundingClientRect(), placement: 'below' }, viewOptionsMenu(menuCtx, expandState), t('siteTree.viewOptions', 'View options'), e.detail === 0)
-          }
+          onClick={(e) => openMenu({ rect: e.currentTarget.getBoundingClientRect(), placement: 'below' }, 'view', t('siteTree.viewOptions', 'View options'), e.detail === 0)}
         >
           <SlidersHorizontal className="w-4 h-4" />
         </button>
@@ -1841,9 +2069,9 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
       {menu && (
         <ContextMenu
           at={menu.at}
-          entries={menu.entries === 'filter' ? filterEntries() : menu.entries}
-          // pt-BR filter labels run long ("Usadas nos últimos 30 dias" plus a count)
-          width={menu.entries === 'filter' ? 268 : undefined}
+          entries={menu.entries === 'filter' ? filterEntries() : menu.entries === 'view' ? viewOptionsMenu(menuCtx, expandState, viewState) : menu.entries}
+          // pt-BR labels run long ("Usadas nos últimos 30 dias" plus a count, "Mostrar resultados da busca em lista")
+          width={menu.entries === 'filter' ? 268 : menu.entries === 'view' ? 284 : undefined}
           ariaLabel={menu.label}
           focusFirst={menu.focusFirst}
           onClose={() => setMenu(null)}

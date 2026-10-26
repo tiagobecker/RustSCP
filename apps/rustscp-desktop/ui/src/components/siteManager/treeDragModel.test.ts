@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import type { ConnectionConfig } from '../../types.ts';
 import type { TreeRow } from './types.ts';
 import { applyOpsLocally, buildTree, defaultLayout, flattenRows, planMove } from './siteTreeModel.ts';
-import { checkDrop, commonParent, dragPayload, dropSpotForRow, inDropBlock, planCopies } from './treeDragModel.ts';
+import { checkDrop, commonParent, dragPayload, dropSpotAt, dropSpotForRow, favoriteDropSpot, inDropBlock, planCopies } from './treeDragModel.ts';
 
 const site = (id: string, group: string | null = null, over: Partial<ConnectionConfig> = {}): ConnectionConfig => ({
   id,
@@ -93,6 +93,68 @@ describe('drop spots', () => {
     assert.equal(inDropBlock(rowByKey(rows, 's:web-01'), 'Clients/Acme'), true);
     assert.equal(inDropBlock(rowByKey(rows, 's:stg'), 'Clients/Acme'), false);
     assert.equal(inDropBlock(rowByKey(rows, 's:solo'), null), false);
+  });
+});
+
+describe('drops on Favorites', () => {
+  const favLayout = () => ({
+    ...defaultLayout(),
+    favorites: [{ kind: 'site' as const, id: 'solo' }, { kind: 'folder' as const, path: 'Clients/Acme' }, { kind: 'site' as const, id: 'stg' }],
+  });
+  const favRows = (opts: { expanded?: string[]; collapsedFav?: boolean } = {}) =>
+    flattenRows(buildTree(library(), favLayout()), {
+      collapsed: new Set(),
+      favoriteExpanded: new Set(opts.expanded ?? []),
+      collapsedSections: new Set(opts.collapsedFav ? (['fav'] as const) : []),
+    }).rows;
+  const at = (rows: TreeRow[], key: string) => rows.findIndex((r) => r.key === key);
+
+  it('a favorite row takes items before or after itself, by the pointer half', () => {
+    const rows = favRows();
+    const i = at(rows, 'fav:f:Clients/Acme');
+    assert.deepEqual(favoriteDropSpot(rows, i, 0.2), { folder: '', highlightKey: null, block: null, favoriteIndex: 1, line: { key: 'fav:f:Clients/Acme', side: 'before' } });
+    assert.deepEqual(favoriteDropSpot(rows, i, 0.8), { folder: '', highlightKey: null, block: null, favoriteIndex: 2, line: { key: 'fav:f:Clients/Acme', side: 'after' } });
+    // The same through dropSpotAt, which also keeps the All section's spots
+    assert.equal(dropSpotAt(rows, at(rows, 'fav:s:stg'), 0.9)?.favoriteIndex, 3);
+    assert.deepEqual(dropSpotAt(rows, at(rows, 'f:Clients/Acme'), 0.5), { folder: 'Clients/Acme', highlightKey: 'f:Clients/Acme', block: 'Clients/Acme' });
+    assert.deepEqual(dropSpotAt(rows, rows.length, 0), { folder: '', highlightKey: 'sec:all', block: null });
+  });
+
+  it('the header puts items first; a collapsed section takes them at the end', () => {
+    const rows = favRows();
+    assert.deepEqual(favoriteDropSpot(rows, at(rows, 'sec:fav'), 0.5)?.line, { key: 'fav:s:solo', side: 'before' });
+    assert.equal(favoriteDropSpot(rows, at(rows, 'sec:fav'), 0.5)?.favoriteIndex, 0);
+    const collapsed = favRows({ collapsedFav: true });
+    assert.deepEqual(favoriteDropSpot(collapsed, at(collapsed, 'sec:fav'), 0.5), { folder: '', highlightKey: 'sec:fav', block: null, favoriteIndex: 3, line: null });
+  });
+
+  it('an expanded favorite folder only takes "before"; its contents are not targets', () => {
+    const rows = favRows({ expanded: ['Clients/Acme'] });
+    const i = at(rows, 'fav:f:Clients/Acme');
+    assert.equal(favoriteDropSpot(rows, i, 0.9)?.line?.side, 'before');
+    const nested = rows.findIndex((r) => r.section === 'fav' && r.depth === 1);
+    assert.ok(nested > 0);
+    assert.equal(favoriteDropSpot(rows, nested, 0.5), null);
+  });
+
+  it('Recent rows are not targets', () => {
+    const layout = { ...defaultLayout(), recents: [{ id: 'web-01', at: 5, count: 1 }] };
+    const rows = flattenRows(buildTree(library(), layout), { collapsed: new Set() }).rows;
+    assert.equal(dropSpotAt(rows, at(rows, 'rec:web-01'), 0.5), null);
+  });
+
+  it('an empty Favorites section shows a drop zone only while a drag runs', () => {
+    const model = buildTree(library(), defaultLayout());
+    const idle = flattenRows(model, { collapsed: new Set() }).rows;
+    assert.equal(idle.some((r) => r.kind === 'favDrop'), false);
+    const dragging = flattenRows(model, { collapsed: new Set(), favDropZone: true }).rows;
+    assert.equal(dragging[0].kind, 'favDrop');
+    assert.deepEqual(dropSpotAt(dragging, 0, 0.5), { folder: '', highlightKey: 'favdrop', block: null, favoriteIndex: 0, line: null });
+    // Hidden by the user: no zone
+    assert.equal(flattenRows(model, { collapsed: new Set(), favDropZone: true, showFavorites: false }).rows[0].kind, 'section');
+    // Favorites exist: no zone (the section itself takes the drop)
+    const withFav = flattenRows(buildTree(library(), favLayout()), { collapsed: new Set(), favDropZone: true }).rows;
+    assert.equal(withFav.some((r) => r.kind === 'favDrop'), false);
   });
 });
 

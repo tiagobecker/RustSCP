@@ -302,7 +302,12 @@ export interface AddressRow extends RowBase {
   address: string;
 }
 
-export type TreeRow = SectionRow | FolderRow | SiteRow | PlaceholderRow | DraftRow | NewFolderRow | AddressRow;
+/** "Drop here to add to favorites": shown at the top while a drag runs and Favorites is empty. */
+export interface FavDropRow extends RowBase {
+  kind: 'favDrop';
+}
+
+export type TreeRow = SectionRow | FolderRow | SiteRow | PlaceholderRow | DraftRow | NewFolderRow | AddressRow | FavDropRow;
 export type TreeRowKind = TreeRow['kind'];
 
 /** What a search matched, as `flattenRows` consumes it. */
@@ -334,6 +339,8 @@ export interface FlattenState {
   newFolder?: { parent: string; name: string } | null;
   /** Address row text (only while searching) */
   address?: string | null;
+  /** A drag is running: an empty Favorites section shows its drop zone (browsing only) */
+  favDropZone?: boolean;
 }
 
 export interface FlatRows {
