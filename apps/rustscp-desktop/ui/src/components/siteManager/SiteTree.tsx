@@ -17,6 +17,14 @@ export interface TreeActions {
   activate: (row: TreeRow, how: 'click' | 'space') => void;
   /** ↑/↓/Home/End/Page: focus moves, and the selection with it unless the form has unsaved edits */
   move: (row: TreeRow) => void;
+  /** ⌘-click (Ctrl-click): adds the row to the selection or takes it out */
+  toggleSelect: (row: TreeRow) => void;
+  /** Shift-click, Shift+↑/↓/Home/End/Page: selects from the anchor to this row (one section) */
+  extendSelect: (row: TreeRow) => void;
+  /** ⌘A: every item row of the row's section */
+  selectAll: (row: TreeRow) => void;
+  /** ⇧⌘M: Move to… for the selection (or the row) */
+  moveTo: (row: TreeRow) => void;
   /** Enter / ⌘↓ / double-click: connect a site, toggle a folder or section, focus the draft's Host */
   open: (row: TreeRow) => void;
   toggle: (row: TreeRow, subtree: boolean, expand?: boolean) => void;
@@ -142,6 +150,14 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
     actionsRef.current.move(row);
   };
 
+  /** Shift+navigation: the range from the anchor grows or shrinks to row `i`. */
+  const extendTo = (i: number) => {
+    const row = rowAt(i);
+    if (!row) return;
+    scrollToIndex(i, 'nearest');
+    actionsRef.current.extendSelect(row);
+  };
+
   const menuAtRow = (row: TreeRow) => {
     const n = ids.current.get(row.key);
     const el = n === undefined ? null : document.getElementById(`stree-${n}`);
@@ -171,20 +187,28 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
     switch (key) {
       case 'ArrowDown':
       case 'ArrowUp': {
-        if (e.shiftKey || e.altKey || mod) return;
-        goTo(moveIndex(rows.length, cur && activeIndex >= 0 ? cur.index : -1, key === 'ArrowDown' ? 1 : -1));
+        if (e.altKey || mod) return;
+        const to = moveIndex(rows.length, cur && activeIndex >= 0 ? cur.index : -1, key === 'ArrowDown' ? 1 : -1);
+        if (e.shiftKey) extendTo(to);
+        else goTo(to);
         return handled();
       }
       case 'Home':
-      case 'End':
-        if (e.shiftKey) return;
-        goTo(key === 'Home' ? 0 : rows.length - 1);
+      case 'End': {
+        if (e.altKey || mod) return;
+        const to = key === 'Home' ? 0 : rows.length - 1;
+        if (e.shiftKey) extendTo(to);
+        else goTo(to);
         return handled();
+      }
       case 'PageUp':
-      case 'PageDown':
-        if (e.shiftKey) return;
-        goTo(moveIndex(rows.length, cur?.index ?? -1, (key === 'PageDown' ? 1 : -1) * pageSize));
+      case 'PageDown': {
+        if (e.altKey || mod) return;
+        const to = moveIndex(rows.length, cur?.index ?? -1, (key === 'PageDown' ? 1 : -1) * pageSize);
+        if (e.shiftKey) extendTo(to);
+        else goTo(to);
         return handled();
+      }
       case 'ArrowRight': {
         if (!cur || mod) return;
         const { row, index } = cur;
@@ -272,6 +296,14 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
         a.focusSearch();
         return handled();
       }
+      if (lower === 'a' && !e.shiftKey) {
+        if (cur) a.selectAll(cur.row);
+        return handled();
+      }
+      if (lower === 'm' && e.shiftKey) {
+        if (cur) a.moveTo(cur.row);
+        return handled();
+      }
       return;
     }
     if (isPrintable(e)) {
@@ -289,6 +321,8 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
     return row && row.key === el.dataset.rowKey ? { row, el } : null;
   };
   const isInInput = (e: React.SyntheticEvent) => !!(e.target as HTMLElement).closest('input');
+  /** Row of the first click of a possible double-click (a click can change the rows under the pointer) */
+  const firstClickKey = useRef<string | null>(null);
 
   const onMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
     if (isInInput(e)) return;
@@ -302,6 +336,7 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
   const onClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (isInInput(e)) return;
     const hit = rowFromEvent(e);
+    if (e.detail <= 1) firstClickKey.current = hit?.row.key ?? null;
     if (!hit) return;
     const { row } = hit;
     const a = actionsRef.current;
@@ -324,6 +359,14 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
       a.toggle(row, e.altKey);
       return;
     }
+    // ⌘-click / Ctrl-click and Shift-click build a selection; folders do not fold then
+    const toggleMod = mac ? e.metaKey : e.ctrlKey;
+    if ((toggleMod || e.shiftKey) && (row.kind === 'site' || row.kind === 'folder')) {
+      if (e.detail > 1) return;
+      if (e.shiftKey) a.extendSelect(row);
+      else a.toggleSelect(row);
+      return;
+    }
     if (row.kind === 'folder' || row.kind === 'section') {
       // The second click of a double-click does nothing
       if (e.detail > 1) return;
@@ -337,8 +380,12 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
 
   const onDoubleClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (isInInput(e) || (e.target as HTMLElement).closest('[data-action]')) return;
+    // A fast second ⌘-click or Shift-click edits the selection; it never connects
+    if (e.shiftKey || (mac ? e.metaKey : e.ctrlKey)) return;
     const hit = rowFromEvent(e);
-    if (hit && (hit.row.kind === 'site' || hit.row.kind === 'address')) actionsRef.current.open(hit.row);
+    // Both clicks must land on the same row: the first one may have opened the form or moved the list
+    if (!hit || hit.row.key !== firstClickKey.current) return;
+    if (hit.row.kind === 'site') actionsRef.current.open(hit.row);
   };
 
   const onContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -373,6 +420,7 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
       ref={scrollRef}
       role="tree"
       aria-label={ariaLabel}
+      aria-multiselectable="true"
       aria-describedby={describedById}
       aria-activedescendant={activeDomId}
       tabIndex={0}
@@ -402,6 +450,7 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
               selected={selection.keys.has(row.key)}
               active={i === activeIndex}
               strongGuide={strong}
+              showActions={selection.keys.has(row.key) && (selection.keys.size === 1 || i === activeIndex)}
               nameTerms={nameTerms}
               addressTerms={addressTerms}
               anyExpanded={anyExpanded}

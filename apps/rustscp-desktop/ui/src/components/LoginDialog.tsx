@@ -20,11 +20,12 @@ import { Button, Disclosure, Field, Segmented, TextInput } from './ui/controls.t
 import { plainTextInputProps } from '../utils/inputHardening.ts';
 import { STORED_SECRET, isStoredSecret } from '../utils/secrets.ts';
 import { isMacPlatform } from './fileListUtils.ts';
+import { MoveToDialog } from './siteManager/MoveToDialog.tsx';
 import { SiteSidebar } from './siteManager/SiteSidebar.tsx';
-import type { SiteSidebarApi } from './siteManager/SiteSidebar.tsx';
+import type { PaneMode, SiteSidebarApi } from './siteManager/SiteSidebar.tsx';
 import { UnsavedChangesDialog } from './siteManager/UnsavedChangesDialog.tsx';
 import { parseAddressInput } from './siteManager/siteQuery.ts';
-import { folderChain, naturalCompare, normalizeGroup } from './siteManager/siteTreeModel.ts';
+import { folderChain, naturalCompare, needsPassword, normalizeGroup } from './siteManager/siteTreeModel.ts';
 import { useSiteTree } from './siteManager/useSiteTree.ts';
 
 interface LoginDialogProps {
@@ -260,6 +261,16 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   const formOriginRef = useRef<{ id: string; name: string; group: string } | null>(null);
   // resetForm is declared below the early return; effects reach it through this ref
   const resetFormRef = useRef<() => void>(() => {});
+  const passwordRef = useRef<HTMLInputElement>(null);
+  // The right pane follows the tree's selection: the form, a folder overview or the selection panel
+  const [paneMode, setPaneMode] = useState<PaneMode>('form');
+  const [paneHost, setPaneHost] = useState<HTMLDivElement | null>(null);
+  // Bumps on every new-connection start, so the tree selects the draft row again
+  const [formEpoch, setFormEpoch] = useState(0);
+  // A saved site opened from the tree without a saved password: its Password field shows a hint
+  const [passwordGateId, setPasswordGateId] = useState<string | null>(null);
+  // "Change…" in a new connection's header: Move to… in pick mode
+  const [pickingFolder, setPickingFolder] = useState(false);
 
   const siteTree = useSiteTree({ isOpen, savedSites, onSitesUpdated });
 
@@ -422,8 +433,35 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   const handleNewSite = (folder?: string) => {
     resetForm();
     if (folder) setGroup(normalizeGroup(folder));
+    setFormEpoch((n) => n + 1);
     setTimeout(() => hostRef.current?.focus(), 30);
   };
+
+  /** "New connection to root@10.0.0.5…" (the search's address row): the form, filled in; never connects. */
+  const newConnectionTo = (address: string) =>
+    guardDirty(() => {
+      handleNewSite();
+      const text = address.trim();
+      const parsed = parseAddressInput(text);
+      if (parsed?.httpEndpoint) {
+        // An S3 endpoint keeps its URL form
+        setProtocol('s3');
+        setPort(String(DEFAULT_PORTS.s3));
+        setHost(text);
+      } else if (parsed) {
+        if (parsed.protocol) {
+          setProtocol(parsed.protocol);
+          setPort(String(DEFAULT_PORTS[parsed.protocol] ?? 22));
+        }
+        setHost(parsed.host);
+        if (parsed.user) setUsername(parsed.user);
+        if (parsed.port) setPort(parsed.port);
+        if (parsed.path && parsed.path !== '/') setRemoteRoot(parsed.path);
+      } else {
+        setHost(text);
+      }
+      setIsDirty(true);
+    });
 
   /** Accepts pasted `user@host:port`, `sftp://user@host:2222/path` or `s3://endpoint` and splits it into fields. */
   const splitHostInput = (raw: string) => {
@@ -560,16 +598,28 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
     else guardDirty(() => handleSelectSite(site));
   };
 
-  /** Enter / double-click / Connect on a tree site. The open site connects with the form's values. */
+  /** Password gate: the site is shown with its Password field focused instead of an attempt that would fail. */
+  const gatePassword = (id: string) => {
+    setPasswordGateId(id);
+    setTimeout(() => passwordRef.current?.focus(), 40);
+  };
+
+  /**
+   * Enter / double-click / Connect on a tree site. The open site connects with the form's values.
+   * A site with no saved password opens with its Password field focused instead (the footer's
+   * Connect still tries without one).
+   */
   const connectSiteFromTree = (site: ConnectionConfig) => {
     if (site.id === selectedSiteId) {
-      if (isDirty) handleConnect();
+      if (needsPassword(isDirty ? buildConfig() : site)) gatePassword(site.id);
+      else if (isDirty) handleConnect();
       else runConnect(site);
       return;
     }
     guardDirty(() => {
       handleSelectSite(site);
-      runConnect(site);
+      if (needsPassword(site)) gatePassword(site.id);
+      else runConnect(site);
     });
   };
 
@@ -587,20 +637,8 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
     });
   };
 
-  /** "Change…" in the header: opens the Advanced section and puts the caret in the Folder field. */
-  const changeFolder = () => {
-    const form = formScrollRef.current;
-    if (!form) return;
-    const focusFolder = () => form.querySelector<HTMLInputElement>('input[role="combobox"]')?.focus();
-    if (form.querySelector('input[role="combobox"]')) {
-      focusFolder();
-      return;
-    }
-    const advanced = t('loginDialog.advancedTab');
-    const toggle = Array.from(form.querySelectorAll<HTMLButtonElement>('button[aria-expanded="false"]')).find((b) => b.textContent?.trim() === advanced);
-    toggle?.click();
-    setTimeout(focusFolder, 40);
-  };
+  /** "Change…" in a new connection's header: Move to… in pick mode sets the folder it will be saved in. */
+  const changeFolder = () => setPickingFolder(true);
 
   // ⌘Z anywhere in the dialog outside text fields undoes the last tree change
   const onDialogKeyDown = (e: React.KeyboardEvent) => {
@@ -659,6 +697,8 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   };
 
   const isNew = selectedSiteId === 'new';
+  // A running attempt keeps the form (its progress and Cancel) in view
+  const showForm = paneMode === 'form' || isConnecting;
   const isS3 = protocol === 's3';
   const isLocal = protocol === 'local';
   const isBuiltInLocal = selectedSiteId === 'local';
@@ -683,10 +723,13 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
           formKey={isNew ? 'draft' : `s:${selectedSiteId}`}
           draftFolder={isNew ? normalizeGroup(group) : null}
           draftName={isNew ? siteName.trim() : ''}
+          formEpoch={formEpoch}
           formDirty={isDirty}
           onSelectSite={selectSiteFromTree}
           onConnectSite={connectSiteFromTree}
           onNewConnection={(folder) => guardDirty(() => handleNewSite(folder))}
+          onNewConnectionTo={newConnectionTo}
+          onCloseDialog={() => guardDirty(handleClose)}
           onEditSite={editSiteFromTree}
           onFocusDraft={() => setTimeout(() => (hostRef.current ?? siteNameRef.current)?.focus(), 0)}
           onShareSite={onShareSite}
@@ -697,10 +740,12 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
           onOpenSharedConnection={onOpenSharedConnection}
           escapeLayers={escapeLayersRef}
           apiRef={sidebarApiRef}
+          paneHost={paneHost}
+          onPaneModeChange={setPaneMode}
         />
 
-        {/* Connection form */}
-        <div className="flex-1 min-w-0 flex flex-col">
+        {/* Connection form (a folder overview or the selection panel takes its place while one is selected) */}
+        <div className={`flex-1 min-w-0 flex-col ${showForm ? 'flex' : 'hidden'}`}>
           <div ref={formScrollRef} className="flex-1 overflow-y-auto px-7 pt-5 pb-6" onKeyDown={onFormKeyDown} data-form-scroll>
             <div className="flex items-center justify-between gap-1 mb-5">
               <div className="min-w-0 flex-1">
@@ -865,11 +910,19 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
                     </Field>
 
                     {(!isSsh(protocol) || authMode === 'password') && (
-                      <Field label={isS3 ? 'Secret Access Key' : t('loginDialog.password')}>
+                      <Field
+                        label={isS3 ? 'Secret Access Key' : t('loginDialog.password')}
+                        hint={
+                          passwordGateId !== null && passwordGateId === selectedSiteId && !password && !passwordStored
+                            ? t('siteTree.needsPassword', 'No password saved. Type it to connect, or press Connect to try without one.')
+                            : undefined
+                        }
+                      >
                         {(id) => (
                           <div className="relative">
                             <TextInput
                               id={id}
+                              ref={passwordRef}
                               mono
                               type={showPassword ? 'text' : 'password'}
                               value={password}
@@ -1073,7 +1126,25 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
             )}
           </div>
         </div>
+        <div ref={setPaneHost} className={`flex-1 min-w-0 flex-col ${showForm ? 'hidden' : 'flex'}`} />
       </div>
+
+      {pickingFolder && (
+        <MoveToDialog
+          mode="pick"
+          title={t('siteTree.chooseFolderTitle', 'Save in folder')}
+          folders={knownFolders}
+          current={normalizeGroup(group)}
+          onChoose={(path) => {
+            setPickingFolder(false);
+            if (path !== normalizeGroup(group)) {
+              setGroup(path);
+              setIsDirty(true);
+            }
+          }}
+          onCancel={() => setPickingFolder(false)}
+        />
+      )}
 
       {isVaultModalOpen && (
         <VaultModal

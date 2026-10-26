@@ -26,6 +26,8 @@ export type DeleteRequest =
       subfolders: number;
       /** Where "Keep connections" moves the contents (null: the top level) */
       parent: string | null;
+      /** The folders sit in different places: their contents each go one level up */
+      mixedParents?: boolean;
     }
   | { kind: 'merge'; name: string; parent: string | null; sites: number };
 
@@ -105,9 +107,11 @@ export const DeleteItemsDialog: React.FC<Props> = ({ request, onChoose, onCancel
       });
     }
     body = <p className="text-[13px] text-ink leading-relaxed">{`${holds}.`}</p>;
-    const hint = request.parent
-      ? t('siteTree.keepHint', { parent: request.parent, defaultValue: 'Keep connections moves them to “{{parent}}”.' })
-      : t('siteTree.keepHintTop', 'Keep connections moves them to the top level.');
+    const hint = request.mixedParents
+      ? t('siteTree.keepHintUp', 'Keep connections moves them one level up.')
+      : request.parent
+        ? t('siteTree.keepHint', { parent: request.parent, defaultValue: 'Keep connections moves them to “{{parent}}”.' })
+        : t('siteTree.keepHintTop', 'Keep connections moves them to the top level.');
     footer = (
       <div className="w-full flex flex-col items-end gap-2">
         <div className="flex items-center gap-2">

@@ -1,5 +1,6 @@
 import React, { useCallback, useDeferredValue, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { MutableRefObject } from 'react';
+import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import { ArrowDownUp, ChevronDown, FileKey2, FolderInput, FolderPlus, Plus, SlidersHorizontal } from 'lucide-react';
 import type { ConnectionConfig } from '../../types.ts';
@@ -12,20 +13,26 @@ import { Button } from '../ui/controls.tsx';
 import { notify } from '../ui/toast.tsx';
 import { DeleteItemsDialog } from './DeleteItemsDialog.tsx';
 import type { DeleteChoice, DeleteRequest } from './DeleteItemsDialog.tsx';
-import { SiteSearchBar } from './SiteSearchBar.tsx';
+import { FolderPane } from './FolderPane.tsx';
+import { MoveToDialog } from './MoveToDialog.tsx';
+import { SelectionPane } from './SelectionPane.tsx';
+import type { SelectedItem } from './SelectionPane.tsx';
+import { FilterPills, SearchTips, SiteSearchBar } from './SiteSearchBar.tsx';
 import { SiteTree } from './SiteTree.tsx';
 import type { SiteTreeHandle, TreeActions } from './SiteTree.tsx';
 import type { RowEditState } from './SiteTreeRow.tsx';
-import { emptyAreaMenu, folderMenu, importExportEntries, localMenu, shortcutLabels, siteMenu, viewOptionsMenu } from './siteMenus.tsx';
+import { emptyAreaMenu, filterMenu, folderMenu, importExportEntries, localMenu, multiMenu, shortcutLabels, siteMenu, viewOptionsMenu } from './siteMenus.tsx';
 import type { MenuActions, MenuContext } from './siteMenus.tsx';
-import { highlightTerms, matchContext, parseQuery, searchTree } from './siteQuery.ts';
+import { activeValues, addressFromQuery, clearQualifiers, highlightTerms, matchContext, parseQuery, removeToken, searchTree, toggleQualifier } from './siteQuery.ts';
 import {
   MAX_SITE_NAME_LEN,
   VIEW_PREFS_KEY,
+  baseName,
   buildTree,
   charLength,
   childFolderNames,
   copyAddress,
+  duplicateItems,
   effectiveDensity,
   flattenRows,
   folderChain,
@@ -40,14 +47,18 @@ import {
   parseItemKey,
   parseViewPrefs,
   pickFreeName,
+  planMove,
+  protocolBreakdown,
+  resolveItems,
   rowFolderPath,
   rowHeightFor,
   siteKey,
+  sitesInside,
 } from './siteTreeModel.ts';
-import type { FolderNameProblem } from './siteTreeModel.ts';
+import type { FolderNameProblem, MovePlan } from './siteTreeModel.ts';
 import type { FolderNode, SectionId, SiteTreeOp, TreeRow } from './types.ts';
 import type { SiteTreeController } from './useSiteTree.ts';
-import { canonicalKey, useTreeSelection } from './useTreeSelection.ts';
+import { canonicalKey, isItemRow, paneFor, rangeKeys, selectedItems, useTreeSelection } from './useTreeSelection.ts';
 
 /** What LoginDialog can ask of the sidebar (the form header, imports). */
 export interface SiteSidebarApi {
@@ -68,11 +79,17 @@ export interface SiteSidebarProps {
   draftFolder: string | null;
   /** The new connection's typed name ('' when none) */
   draftName: string;
+  /** Bumps whenever the form starts a new connection, so the draft row is selected again */
+  formEpoch: number;
   formDirty: boolean;
   /** Loads a site into the form, through the unsaved-changes check unless `force` */
   onSelectSite: (site: ConnectionConfig, opts?: { force?: boolean }) => void;
   onConnectSite: (site: ConnectionConfig) => void;
   onNewConnection: (folder: string) => void;
+  /** The address row: opens the new-connection form filled in from `address` (never connects) */
+  onNewConnectionTo: (address: string) => void;
+  /** Closes the Connect dialog (the folder overview's Close) */
+  onCloseDialog: () => void;
   /** Loads the site (if needed) and focuses its first field */
   onEditSite: (site: ConnectionConfig) => void;
   onFocusDraft: () => void;
@@ -82,7 +99,14 @@ export interface SiteSidebarProps {
   /** LoginDialog's escape registry; the sidebar adds one handler (rename, search) */
   escapeLayers: MutableRefObject<Array<() => boolean>>;
   apiRef: MutableRefObject<SiteSidebarApi | null>;
+  /** The right pane's slot for the folder overview and the selection panel */
+  paneHost: HTMLElement | null;
+  /** What the right pane shows; LoginDialog hides the form unless it is 'form' */
+  onPaneModeChange: (mode: PaneMode) => void;
 }
+
+/** The right pane follows the selection (spec §4); a form with unsaved edits always stays. */
+export type PaneMode = 'form' | 'folder' | 'selection';
 
 const EMPTY_SET: ReadonlySet<string> = new Set();
 const EMPTY_TERMS: readonly string[] = [];
@@ -127,9 +151,18 @@ interface NewFolderState {
 
 interface MenuState {
   at: MenuAnchor;
-  entries: ContextMenuEntry[];
+  /** 'filter': the filter menu, rebuilt on every render so its checkboxes follow the text */
+  entries: ContextMenuEntry[] | 'filter';
   label: string;
   focusFirst: boolean;
+}
+
+interface MoveRequest {
+  /** Canonical item keys */
+  keys: string[];
+  title: string;
+  current: string | null;
+  moving: string[];
 }
 
 /**
@@ -143,10 +176,13 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   formKey,
   draftFolder,
   draftName,
+  formEpoch,
   formDirty,
   onSelectSite,
   onConnectSite,
   onNewConnection,
+  onNewConnectionTo,
+  onCloseDialog,
   onEditSite,
   onFocusDraft,
   onShareSite,
@@ -154,6 +190,8 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   onOpenSharedConnection,
   escapeLayers,
   apiRef,
+  paneHost,
+  onPaneModeChange,
 }) => {
   const { t, i18n } = useTranslation();
   const lang = i18n.language;
@@ -177,6 +215,10 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   const [newFolder, setNewFolder] = useState<NewFolderState | null>(null);
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [deleteReq, setDeleteReq] = useState<{ request: DeleteRequest; run: (choice: DeleteChoice) => void } | null>(null);
+  const [moveReq, setMoveReq] = useState<MoveRequest | null>(null);
+  const [showTips, setShowTips] = useState(false);
+  /** The folder overview's escape layer (reverts an edited name) */
+  const paneEscapeRef = useRef<(() => boolean) | null>(null);
   const [width, setWidth] = useState(() => {
     const n = Number(readStorage(WIDTH_KEY));
     return Number.isFinite(n) && n >= WIDTH_MIN && n <= WIDTH_MAX ? n : WIDTH_DEFAULT;
@@ -213,8 +255,11 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   const density = effectiveDensity(prefs, model.totalSites);
   const rowHeight = rowHeightFor(density);
   const parsed = useMemo(() => parseQuery(deferredQuery), [deferredQuery]);
+  /** The text as typed (pills and the filter menu follow it at once) */
+  const parsedNow = useMemo(() => parseQuery(query), [query]);
   const searching = !parsed.isEmpty;
   const search = useMemo(() => (searching ? searchTree(model, parsed, matchContext(model)) : null), [model, parsed, searching]);
+  const address = useMemo(() => (searching ? addressFromQuery(parsed) : null), [parsed, searching]);
   const draft = useMemo(() => (draftFolder !== null ? { folder: draftFolder, name: draftName } : null), [draftFolder, draftName]);
   const newFolderParent = newFolder?.parent ?? null;
   const flat = useMemo(
@@ -229,8 +274,9 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
         searchCollapsed,
         draft,
         newFolder: newFolderParent !== null ? { parent: newFolderParent, name: '' } : null,
+        address,
       }),
-    [model, tree.collapsed, collapsedSections, search, searchCollapsed, draft, newFolderParent]
+    [model, tree.collapsed, collapsedSections, search, searchCollapsed, draft, newFolderParent, address]
   );
   const { rows, indexByKey } = flat;
   const nameTerms = useMemo(() => (searching ? highlightTerms(parsed, 'name') : EMPTY_TERMS), [parsed, searching]);
@@ -292,7 +338,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     selection.selectOnly(formKey);
     treeRef.current?.scrollToKey(formKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [formKey]);
+  }, [formKey, formEpoch]);
 
   // The active row vanished (its folder collapsed, it was deleted): fall back to a shown selected
   // row, else the nearest folder shown. Checked against the latest selection, so a selection made
@@ -455,7 +501,8 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
       else if (charLength(value) > MAX_SITE_NAME_LEN) error = t('siteTree.errNameTooLong', 'Names can be at most 255 characters long.');
     } else {
       const problem = folderNameProblem(value, parentOf(r.target), folderPaths, r.target);
-      if (problem) error = folderProblemText(problem, value);
+      // A name a sibling already has asks to merge (after the field closes)
+      if (problem && problem.code !== 'exists') error = folderProblemText(problem, value);
     }
     if (error) {
       // Leaving the field with an invalid name reverts it
@@ -469,14 +516,50 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
         if (res) announce(t('siteTree.a11yRenamed', { name: value, defaultValue: 'Renamed to “{{name}}”' }));
       });
     } else {
-      const newPath = joinPath(parentOf(r.target), value);
-      // The renamed folder stays selected under its new path
-      if (selection.stateRef.current.keys.has(folderKey(r.target))) selection.selectOnly(folderKey(newPath));
-      else if (selection.stateRef.current.active === folderKey(r.target)) selection.setActive(folderKey(newPath));
-      void tree.run([{ op: 'rename_folder', path: r.target, name: value }], { errorParams: { name: value } }).then((res) => {
-        if (res) announce(t('siteTree.a11yRenamed', { name: value, defaultValue: 'Renamed to “{{name}}”' }));
-      });
+      requestFolderRename(r.target, value);
     }
+  };
+
+  /** The selection (or keyboard focus) on folder `from` follows it to `to`. */
+  const followFolder = (from: string, to: string) => {
+    const s = selection.stateRef.current;
+    if (s.keys.has(folderKey(from))) selection.selectOnly(folderKey(to));
+    else if (s.active === folderKey(from)) selection.setActive(folderKey(to));
+  };
+
+  /**
+   * Renames a folder (inline rename and the folder overview). A name a sibling already has opens
+   * the Merge prompt. Returns the error to show, or null when the rename went ahead or the prompt opened.
+   */
+  const requestFolderRename = (path: string, raw: string): string | null => {
+    const node = model.folders.get(path);
+    const value = raw.trim();
+    if (!node || !value || value === node.name) return null;
+    const parent = parentOf(path);
+    const problem = folderNameProblem(value, parent, folderPaths, path);
+    const renamed = (name = value) => announce(t('siteTree.a11yRenamed', { name, defaultValue: 'Renamed to “{{name}}”' }));
+    if (problem?.code === 'exists') {
+      const existing = problem.existing;
+      setDeleteReq({
+        request: { kind: 'merge', name: baseName(existing), parent: parent ? parent.split('/').join(' / ') : null, sites: node.count },
+        run: (choice) => {
+          setDeleteReq(null);
+          if (choice !== 'merge') return;
+          followFolder(path, existing);
+          void tree.run([{ op: 'rename_folder', path, name: value, merge: true }], { errorParams: { name: value } }).then((res) => {
+            if (res) renamed(baseName(existing));
+          });
+        },
+      });
+      return null;
+    }
+    if (problem) return folderProblemText(problem, value);
+    // The renamed folder stays selected under its new path
+    followFolder(path, joinPath(parent, value));
+    void tree.run([{ op: 'rename_folder', path, name: value }], { errorParams: { name: value } }).then((res) => {
+      if (res) renamed();
+    });
+    return null;
   };
 
   /* ------------------------------- new folder ------------------------------ */
@@ -550,31 +633,50 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
 
   /* ------------------------ duplicate, copy, delete ------------------------ */
 
-  const duplicateSite = async (site: ConnectionConfig) => {
-    if (isLocalSite(site)) return;
-    const folder = model.siteFolder.get(site.id) ?? '';
-    const siblings = (model.folders.get(folder)?.sites ?? []).map((s) => s.name);
-    const name = pickFreeName(t('siteTree.copyName', { name: site.name, defaultValue: '{{name}} copy' }), siblings, (n) =>
-      t('siteTree.copyNameN', { name: site.name, n, defaultValue: '{{name}} copy {{n}}' })
+  /** Duplicates sites in their folders ("web-01 copy"); the copies end up selected. */
+  const duplicateSites = async (sites: readonly ConnectionConfig[]) => {
+    const items = duplicateItems(
+      model,
+      sites,
+      (name) => t('siteTree.copyName', { name, defaultValue: '{{name}} copy' }),
+      (name, n) => t('siteTree.copyNameN', { name, n, defaultValue: '{{name}} copy {{n}}' })
     );
-    const res = await tree.run([{ op: 'copy_sites', items: [{ id: site.id, name, group: folder || null }] }]);
-    const created = res?.created[0];
-    const copy = created ? res?.sites.find((s) => s.id === created.id) : undefined;
-    if (!copy) return;
-    announce(t('siteTree.duplicated', { count: 1, formatted: '1', defaultValue_one: 'Duplicated 1 connection', defaultValue_other: 'Duplicated {{formatted}} connections' }));
-    // The copy is selected (and shown in the form unless it has unsaved edits)
-    if (formDirtyRef.current) selection.selectOnly(siteKey(copy.id));
-    else onSelectSite(copy);
-    treeRef.current?.scrollToKey(siteKey(copy.id));
+    if (items.length === 0) return;
+    const res = await tree.run([{ op: 'copy_sites', items }]);
+    if (!res) return;
+    const copies = res.created.map((c) => res.sites.find((s) => s.id === c.id)).filter((s): s is ConnectionConfig => !!s);
+    if (copies.length === 0) return;
+    announce(
+      t('siteTree.duplicated', {
+        count: copies.length,
+        formatted: formatCount(lang, copies.length),
+        defaultValue_one: 'Duplicated 1 connection',
+        defaultValue_other: 'Duplicated {{formatted}} connections',
+      })
+    );
+    if (copies.length === 1) {
+      // The copy is selected (and shown in the form unless it has unsaved edits)
+      if (formDirtyRef.current) selection.selectOnly(siteKey(copies[0].id));
+      else onSelectSite(copies[0]);
+    } else {
+      selection.selectKeys(copies.map((c) => siteKey(c.id)));
+    }
+    treeRef.current?.scrollToKey(siteKey(copies[0].id));
   };
 
-  const copySiteAddress = async (site: ConnectionConfig) => {
-    const text = copyAddress(site);
-    if (!text) return;
-    const ok = await copyText(text);
+  /** Copies addresses as text, one per line (never secrets). */
+  const copySiteAddresses = async (sites: readonly ConnectionConfig[]) => {
+    const lines = sites.map(copyAddress).filter(Boolean);
+    if (lines.length === 0) return;
+    const ok = await copyText(lines.join('\n'));
     if (ok) {
-      const msg = t('siteTree.copiedAddresses', { count: 1, formatted: '1', defaultValue_one: 'Copied address', defaultValue_other: 'Copied {{formatted}} addresses' });
-      notify.success(msg, text);
+      const msg = t('siteTree.copiedAddresses', {
+        count: lines.length,
+        formatted: formatCount(lang, lines.length),
+        defaultValue_one: 'Copied address',
+        defaultValue_other: 'Copied {{formatted}} addresses',
+      });
+      notify.success(msg, lines.length === 1 ? lines[0] : undefined);
       announce(msg);
     } else {
       notify.error(t('siteTree.couldNotCopy', "Couldn't copy to the clipboard"));
@@ -657,6 +759,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     const withContents = top.filter((f) => f.count > 0 || f.folderCount > 0);
     if (withContents.length > 0) {
       const single = total === 1 ? top[0] : null;
+      const parents = new Set(top.map((f) => parentOf(f.path)));
       const parent = parentOf(top[0].path);
       setDeleteReq({
         request: {
@@ -666,6 +769,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
           sites: top.reduce((n, f) => n + f.count, 0),
           subfolders: top.reduce((n, f) => n + f.folderCount, 0),
           parent: parent ? parent.split('/').join(' / ') : null,
+          mixedParents: parents.size > 1,
         },
         run: (choice) => void execute(choice),
       });
@@ -676,16 +780,170 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     }
   };
 
+  /* ------------------------------ multi-selection ------------------------------ */
+
+  const selectedText = (n: number) =>
+    t('siteTree.statusSelected', { count: n, formatted: formatCount(lang, n), defaultValue_one: '1 selected', defaultValue_other: '{{formatted}} selected' });
+
+  /**
+   * The items a keyboard action covers: a multi-selection as a whole (even when the focused row is
+   * outside it, as after ⌘A while searching or a ⌘-click that took the row out), else the focused row.
+   */
+  const itemsFor = (row: TreeRow | null | undefined): string[] => {
+    const items = selectedItems(selection.stateRef.current.keys);
+    if (items.length > 1) return items;
+    if (!row || !isItemRow(row)) return [];
+    return [canonicalKey(row.key)];
+  };
+
+  /** Sets a multi-selection; when it comes down to one site, that site loads (if the form has no unsaved edits). */
+  const applySelection = (keys: string[], active: string | null, anchor: string | null) => {
+    selection.selectKeys(keys, active, anchor);
+    const items = selectedItems(keys);
+    if (items.length === 1 && items[0].startsWith('s:') && items[0] !== formKey && !formDirtyRef.current) {
+      const site = model.sitesById.get(items[0].slice(2));
+      if (site) onSelectSite(site);
+    }
+  };
+
+  /** ⌘-click: adds or removes one item (non-item rows such as the draft drop out). */
+  const toggleSelect = (row: TreeRow) => {
+    if (!isItemRow(row)) return;
+    const base = [...selection.stateRef.current.keys].filter((k) => /^[sf]:/.test(canonicalKey(k)));
+    const next = base.includes(row.key) ? base.filter((k) => k !== row.key) : [...base, row.key];
+    applySelection(next, row.key, row.key);
+  };
+
+  /** Shift-click and Shift+arrows: the anchor…row range of one section. */
+  const extendSelect = (row: TreeRow) => {
+    const s = selection.stateRef.current;
+    const from = s.anchor !== null ? indexByKey.get(s.anchor) ?? -1 : -1;
+    const to = indexByKey.get(row.key) ?? -1;
+    if (to < 0) return;
+    const keys = from >= 0 ? rangeKeys(rows, from, to) : isItemRow(row) ? [row.key] : [];
+    applySelection(keys, row.key, from >= 0 ? s.anchor : row.key);
+  };
+
+  /** ⌘A: every site and folder of the section (while searching, the matching sites only). */
+  const selectAll = (row: TreeRow) => {
+    const keys = rows.filter((r) => r.section === row.section && (r.kind === 'site' || (r.kind === 'folder' && !searching))).map((r) => r.key);
+    if (keys.length === 0) return;
+    applySelection(keys, row.key, keys[0]);
+    announce(selectedText(selectedItems(keys).length));
+  };
+
+  /** "Select connections inside": every site in the folder (all levels), shown expanded. */
+  const selectInside = (path: string) => {
+    let ids = sitesInside(model, path).map((s) => s.id);
+    if (search) ids = ids.filter((id) => search.siteIds.has(id));
+    if (ids.length === 0) return;
+    const paths = [path, ...foldersInside(model, path)];
+    updateCollapsed((prev) => {
+      if (!paths.some((p) => prev.has(p))) return prev;
+      const next = new Set(prev);
+      paths.forEach((p) => next.delete(p));
+      return next;
+    });
+    const keys = ids.map(siteKey);
+    applySelection(keys, keys[0], keys[0]);
+    // The folder row comes into view, with its (now expanded) contents under it
+    treeRef.current?.scrollToKey(folderKey(path), 'start');
+    announce(selectedText(keys.length));
+  };
+
+  /** The selection panel's Close (and Escape with several selected): back to the focused row alone. */
+  const reduceSelection = () => {
+    const s = selection.stateRef.current;
+    const row = rowOf(s.active);
+    // With unsaved edits the form stays as it is; only the selection shrinks
+    if (row && isItemRow(row) && !formDirtyRef.current) activate(row, 'key');
+    else selection.selectOnly(row && isItemRow(row) ? row.key : formKey);
+  };
+
+  /* ---------------------------------- move ---------------------------------- */
+
+  /** Opens Move to… for these items (Local is left out; sites inside a moved folder go with it). */
+  const openMove = (keys: string[]) => {
+    const { looseSites, folders } = resolveItems(model, keys);
+    const count = looseSites.length + folders.length;
+    if (count === 0) return;
+    const parents = new Set<string>([...looseSites.map((s) => model.siteFolder.get(s.id) ?? ''), ...folders.map((f) => parentOf(f.path))]);
+    const name = count === 1 ? looseSites[0]?.name ?? folders[0].name : null;
+    setMoveReq({
+      keys,
+      title:
+        name !== null
+          ? t('siteTree.moveTitleOne', { name, defaultValue: 'Move “{{name}}” to…' })
+          : t('siteTree.moveTitle', { count, formatted: formatCount(lang, count), defaultValue_one: 'Move 1 item to…', defaultValue_other: 'Move {{formatted}} items to…' }),
+      current: parents.size === 1 ? [...parents][0] : null,
+      moving: folders.map((f) => f.path),
+    });
+  };
+
+  const movedTitle = (plan: MovePlan, target: string): string => {
+    const count = plan.sites.length + plan.folders.length;
+    const formatted = formatCount(lang, count);
+    const folder = target.split('/').join(' / ');
+    if (count === 1) {
+      const name = plan.sites[0]?.name ?? baseName(plan.folders[0].from);
+      return target
+        ? t('siteTree.movedOne', { name, folder, defaultValue: 'Moved “{{name}}” to “{{folder}}”' })
+        : t('siteTree.movedOneTop', { name, defaultValue: 'Moved “{{name}}” to the top level' });
+    }
+    if (!target) return t('siteTree.movedTop', { count, formatted, defaultValue_one: 'Moved 1 item to the top level', defaultValue_other: 'Moved {{formatted}} items to the top level' });
+    if (plan.folders.length === 0) {
+      return t('siteTree.moved', { count, formatted, folder, defaultValue_one: 'Moved 1 connection to “{{folder}}”', defaultValue_other: 'Moved {{formatted}} connections to “{{folder}}”' });
+    }
+    return t('siteTree.movedItems', { count, formatted, folder, defaultValue_one: 'Moved 1 item to “{{folder}}”', defaultValue_other: 'Moved {{formatted}} items to “{{folder}}”' });
+  };
+
+  /** One undoable batch; a folder name taken in the target asks to merge first. */
+  const runMove = (keys: string[], target: string, merge: boolean) => {
+    const plan = planMove(model, keys, target, { merge, createTarget: true });
+    const failed = (text: string) => notify.error(t('siteTree.opFailed', "Couldn't update connections"), text);
+    if (plan.intoSelf) return failed(t('siteTree.errIntoSelf', "A folder can't go inside itself."));
+    if (plan.tooLong) return failed(t('siteTree.errPathTooLong', 'This path would be longer than 255 characters.'));
+    if (plan.clashes.length > 0 && !merge) {
+      const sites = plan.clashes.reduce((n, c) => n + (model.folders.get(c.path)?.count ?? 0), 0);
+      setDeleteReq({
+        request: { kind: 'merge', name: baseName(plan.clashes[0].existing), parent: target ? target.split('/').join(' / ') : null, sites },
+        run: (choice) => {
+          setDeleteReq(null);
+          if (choice === 'merge') runMove(keys, target, true);
+        },
+      });
+      return;
+    }
+    if (plan.ops.length === 0) return;
+    // The moved items stay selected at their new place, which opens
+    const moved = [...plan.sites.map((s) => siteKey(s.id)), ...plan.folders.map((f) => folderKey(f.to))];
+    expandChain(target);
+    if (moved.length > 0) {
+      selection.selectKeys(moved, moved[0], moved[0]);
+      treeRef.current?.scrollToKey(moved[0]);
+    }
+    void tree.run(plan.ops).then((res) => {
+      if (!res?.undo_token) return;
+      const title = movedTitle(plan, target);
+      tree.toastWithUndo({ title, token: res.undo_token });
+      announce(title);
+    });
+  };
+
   /* --------------------------------- menus --------------------------------- */
 
   const menuActions: MenuActions = {
     connect: (site) => onConnectSite(site),
     editDetails: (site) => onEditSite(site),
     renameSite: (site) => startRenameByKey(siteKey(site.id)),
-    duplicate: (site) => void duplicateSite(site),
+    duplicate: (site) => void duplicateSites([site]),
     share: onShareSite ? (site) => onShareSite(site) : undefined,
-    copyAddress: (site) => void copySiteAddress(site),
+    copyAddress: (site) => void copySiteAddresses([site]),
     deleteItems,
+    moveItems: openMove,
+    duplicateItems: (keys) => void duplicateSites(resolveItems(model, keys).sites),
+    copyAddresses: (keys) => void copySiteAddresses(resolveItems(model, keys).sites),
+    selectInside,
     newConnection: (folder) => onNewConnection(folder),
     newFolder: (parent) => startNewFolder(parent),
     renameFolder: (path) => startRenameByKey(folderKey(path)),
@@ -699,7 +957,35 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
 
   const openMenu = (at: MenuAnchor, entries: ContextMenuEntry[], label: string, focusFirst: boolean) => setMenu({ at, entries, label, focusFirst });
 
+  /** Menu D for the items of a multi-selection. */
+  const openMultiMenu = (keys: string[], at: MenuAnchor, focusFirst: boolean) => {
+    let sites = 0;
+    let folders = 0;
+    let hasAddress = false;
+    for (const k of keys) {
+      const ref = parseItemKey(k);
+      if (ref?.kind === 'folder') folders++;
+      else if (ref?.kind === 'site') {
+        const site = model.sitesById.get(ref.id);
+        if (!site || isLocalSite(site)) continue;
+        sites++;
+        if (!hasAddress && copyAddress(site)) hasAddress = true;
+      }
+    }
+    openMenu(at, multiMenu({ keys, sites, folders, hasAddress, format: (n) => formatCount(lang, n) }, menuCtx), selectedText(keys.length), focusFirst);
+  };
+
   const menuForRow = (row: TreeRow | null, at: MenuAnchor, focusFirst: boolean) => {
+    // Right-click inside a multi-selection keeps it; Shift+F10 / the ContextMenu key (focusFirst)
+    // always opens the selection's menu
+    if (row && (isItemRow(row) || focusFirst)) {
+      const s = selection.stateRef.current;
+      const items = s.keys.has(row.key) || focusFirst ? selectedItems(s.keys) : [];
+      if (items.length > 1) {
+        openMultiMenu(items, at, focusFirst);
+        return;
+      }
+    }
     if (!row || row.kind === 'section') {
       openMenu(at, emptyAreaMenu(menuCtx, expandState), t('siteTree.sectionAll', 'All connections'), focusFirst);
       return;
@@ -742,12 +1028,22 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
         if (how === 'click') onFocusDraft();
         return;
       case 'newFolder':
+        selection.setActive(row.key);
+        return;
       case 'address':
         selection.setActive(row.key);
+        // Arrowing over it only moves focus; a click or Space opens the form
+        if (how !== 'key') newConnectionTo(row.address);
         return;
       default:
         selection.selectOnly(row.key);
     }
+  };
+
+  /** The address row: a new connection filled in from the search text (the search clears, so the draft shows). */
+  const newConnectionTo = (text: string) => {
+    setQuery('');
+    onNewConnectionTo(text);
   };
 
   const toggleRow = (row: TreeRow, subtree: boolean, expand?: boolean) => {
@@ -789,10 +1085,19 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
       if (formDirtyRef.current) selection.setActive(row.key);
       else activate(row, 'key');
     },
+    toggleSelect,
+    extendSelect,
+    selectAll,
+    moveTo: (row) => openMove(itemsFor(row)),
     open: (row) => {
       switch (row.kind) {
         case 'site':
+          // Connecting several at once comes later (Connect N): Enter connects the focused one
+          if (selectedItems(selection.stateRef.current.keys).length > 1) selection.selectOnly(row.key);
           onConnectSite(row.site);
+          return;
+        case 'address':
+          newConnectionTo(row.address);
           return;
         case 'folder':
         case 'section':
@@ -832,14 +1137,12 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     newConnection: (row) => onNewConnection(folderOfRow(row)),
     newFolder: (row) => startNewFolder(folderOfRow(row)),
     duplicate: (row) => {
-      if (row.kind === 'site') void duplicateSite(row.site);
+      // Sites only: a selection holding a folder is not duplicated (folders come with WP6)
+      const items = resolveItems(model, itemsFor(row));
+      if (items.folders.length === 0) void duplicateSites(items.sites);
     },
-    copyAddress: (row) => {
-      if (row.kind === 'site') void copySiteAddress(row.site);
-    },
-    remove: (row) => {
-      if (row.kind === 'site' || row.kind === 'folder') deleteItems([row.itemKey]);
-    },
+    copyAddress: (row) => void copySiteAddresses(resolveItems(model, itemsFor(row)).sites),
+    remove: (row) => deleteItems(itemsFor(row)),
     focusSearch,
   };
 
@@ -849,6 +1152,11 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   escapeRef.current = () => {
     if (rename || newFolder) {
       closeEdit();
+      return true;
+    }
+    if (paneEscapeRef.current?.()) return true;
+    if (showTips) {
+      setShowTips(false);
       return true;
     }
     const activeEl = document.activeElement;
@@ -862,8 +1170,8 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
       setQuery('');
       return true;
     }
-    if (inSidebar && selection.keys.size > 1) {
-      selection.selectOnly(selection.active);
+    if (inSidebar && selectedItems(selection.keys).length > 1) {
+      reduceSelection();
       return true;
     }
     return false;
@@ -937,7 +1245,12 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
 
   const onSearchEnter = (connect: boolean) => {
     const row = firstSiteRow();
-    if (!row) return;
+    if (!row) {
+      // Nothing matches but the text is an address: open the filled-in form (never connect)
+      const addr = rows.find((r): r is Extract<TreeRow, { kind: 'address' }> => r.kind === 'address');
+      if (addr) newConnectionTo(addr.address);
+      return;
+    }
     if (connect) {
       onConnectSite(row.site);
       return;
@@ -1010,8 +1323,87 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   const footerMenu = (btn: HTMLElement) => openMenu({ rect: btn.getBoundingClientRect(), placement: 'above' }, importExportEntries(menuCtx), t('siteTree.importExportMenu', 'Import & export'), false);
   const overlayTop = rows.length * rowHeight + 8;
 
+  const selectedCount = useMemo(() => selectedItems(selection.keys).length, [selection.keys]);
+
+  /* ------------------------------ filter menu ------------------------------ */
+
+  const protocolOptions = useMemo(
+    () => protocolBreakdown(model.sitesById.values()).map((p) => ({ value: p.protocol, label: p.tag, count: formatCount(lang, p.count) })),
+    [model, lang]
+  );
+  const openFilters = (rect: DOMRect, viaKeyboard: boolean) =>
+    setMenu({ at: { rect, placement: 'below' }, entries: 'filter', label: t('siteTree.filters', 'Filters'), focusFirst: viaKeyboard });
+  const filterEntries = (): ContextMenuEntry[] =>
+    filterMenu(menuCtx, {
+      is: activeValues(parsedNow, 'is'),
+      protocols: activeValues(parsedNow, 'p'),
+      auth: activeValues(parsedNow, 'auth'),
+      protocolOptions,
+      hasFavorites: model.favorites.length > 0,
+      hasRecents: model.recents.length > 0,
+      hasQualifiers: parsedNow.hasQualifiers,
+      toggle: (key, value, on) => setQuery(toggleQualifier(query, key, value, on)),
+      openTips: () => setShowTips(true),
+      clear: () => setQuery(clearQualifiers(query)),
+    });
+
+  /* ------------------------------- right pane ------------------------------- */
+
+  const pane = useMemo(() => (formDirty ? ({ kind: 'form' } as const) : paneFor(selection.keys)), [formDirty, selection.keys]);
+  let paneMode: PaneMode = 'form';
+  let paneContent: React.ReactNode = null;
+  if (pane.kind === 'root' || pane.kind === 'folder') {
+    const node = pane.kind === 'folder' ? model.folders.get(pane.path) ?? null : null;
+    if (pane.kind === 'root' || node) {
+      paneMode = 'folder';
+      paneContent = (
+        <FolderPane
+          node={node}
+          model={model}
+          onRename={requestFolderRename}
+          onMove={() => node && openMove([folderKey(node.path)])}
+          onDelete={() => node && deleteItems([folderKey(node.path)])}
+          onNewFolder={() => startNewFolder(node?.path ?? '')}
+          onNewConnection={() => onNewConnection(node?.path ?? '')}
+          onReveal={(path) => {
+            if (path) apiRef.current?.revealFolder(path, { select: true, focus: true });
+            else {
+              selection.selectOnly('sec:all');
+              treeRef.current?.scrollToKey('sec:all');
+              treeRef.current?.focus();
+            }
+          }}
+          onClose={onCloseDialog}
+          escapeRef={paneEscapeRef}
+        />
+      );
+    }
+  } else if (pane.kind === 'selection') {
+    const ordered = [...pane.items].sort((a, b) => (indexByKey.get(a) ?? Infinity) - (indexByKey.get(b) ?? Infinity));
+    const items: SelectedItem[] = [];
+    for (const k of ordered) {
+      const ref = parseItemKey(k);
+      if (ref?.kind === 'site') {
+        const site = model.sitesById.get(ref.id);
+        if (site) items.push({ kind: 'site', site });
+      } else if (ref?.kind === 'folder') {
+        const node = model.folders.get(ref.path);
+        if (node) items.push({ kind: 'folder', node });
+      }
+    }
+    if (items.length > 1) {
+      paneMode = 'selection';
+      paneContent = <SelectionPane items={items} onMove={() => openMove(pane.items)} onDelete={() => deleteItems(pane.items)} onClose={reduceSelection} />;
+    }
+  }
+  useLayoutEffect(() => {
+    onPaneModeChange(paneMode);
+  }, [paneMode, onPaneModeChange]);
+
   let status: React.ReactNode;
-  if (searching) {
+  if (selectedCount > 1) {
+    status = selectedText(selectedCount);
+  } else if (searching) {
     status = (
       <>
         {t('siteTree.statusMatches', { matches: formatCount(lang, matchCount), total: formatCount(lang, total), defaultValue: '{{matches}} of {{total}}' })}
@@ -1052,7 +1444,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
       onKeyDown={onAsideKeyDown}
     >
       {/* Search comes first in the tab order, though it sits under the header */}
-      <div className="order-2">
+      <div className="order-2 flex flex-col">
         <SiteSearchBar
           value={query}
           onChange={setQuery}
@@ -1061,7 +1453,17 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
           autoFocus={total > 0}
           onArrowDown={onSearchArrowDown}
           onEnter={onSearchEnter}
+          filtersActive={parsedNow.hasQualifiers}
+          onOpenFilters={openFilters}
         />
+        <FilterPills
+          parsed={parsedNow}
+          onRemove={(index) => {
+            setQuery(removeToken(query, index));
+            searchRef.current?.focus();
+          }}
+        />
+        {showTips && <SearchTips onClose={() => setShowTips(false)} />}
       </div>
 
       <div className="order-1 h-12 shrink-0 px-3 pt-3 pb-2 flex items-center gap-1">
@@ -1190,8 +1592,33 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
         {live}
       </div>
 
-      {menu && <ContextMenu at={menu.at} entries={menu.entries} ariaLabel={menu.label} focusFirst={menu.focusFirst} onClose={() => setMenu(null)} />}
+      {menu && (
+        <ContextMenu
+          at={menu.at}
+          entries={menu.entries === 'filter' ? filterEntries() : menu.entries}
+          // pt-BR filter labels run long ("Usadas nos últimos 30 dias" plus a count)
+          width={menu.entries === 'filter' ? 268 : undefined}
+          ariaLabel={menu.label}
+          focusFirst={menu.focusFirst}
+          onClose={() => setMenu(null)}
+        />
+      )}
       {deleteReq && <DeleteItemsDialog request={deleteReq.request} onChoose={deleteReq.run} onCancel={() => setDeleteReq(null)} />}
+      {moveReq && (
+        <MoveToDialog
+          mode="move"
+          title={moveReq.title}
+          folders={folderPaths}
+          current={moveReq.current}
+          moving={moveReq.moving}
+          onChoose={(target) => {
+            setMoveReq(null);
+            runMove(moveReq.keys, target, false);
+          }}
+          onCancel={() => setMoveReq(null)}
+        />
+      )}
+      {paneHost && paneContent && createPortal(paneContent, paneHost)}
     </aside>
   );
 };

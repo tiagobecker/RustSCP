@@ -10,7 +10,7 @@ export type { MenuAnchor } from './contextMenuUtils.ts';
 
 export type ContextMenuEntry =
   | { kind: 'item'; id: string; label: string; icon?: React.ReactNode; shortcut?: string; disabled?: boolean; danger?: boolean; bold?: boolean; title?: string; onSelect: () => void }
-  | { kind: 'check'; id: string; label: string; icon?: React.ReactNode; checked: boolean | 'mixed'; keepOpen?: boolean; onToggle: () => void }
+  | { kind: 'check'; id: string; label: string; icon?: React.ReactNode; checked: boolean | 'mixed'; keepOpen?: boolean; detail?: string; onToggle: () => void }
   | { kind: 'radio'; id: string; label: string; checked: boolean; onSelect: () => void }
   | { kind: 'submenu'; id: string; label: string; icon?: React.ReactNode; entries: ContextMenuEntry[] }
   | { kind: 'label'; label: string }
@@ -382,6 +382,11 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({ at, entries, ariaLabel
           <span data-cm-text="" className="flex-1 min-w-0 truncate">
             {entry.label}
           </span>
+          {entry.kind === 'check' && entry.detail && (
+            <span className="shrink-0 text-[11.5px] tabular-nums text-ink-faint">
+              {entry.detail}
+            </span>
+          )}
           {shortcut && (
             <span className="ui-kbd shrink-0" aria-hidden>
               {shortcut}

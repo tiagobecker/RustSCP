@@ -69,3 +69,33 @@ describe('tree selection helpers', () => {
     assert.deepEqual(rangeKeys(rows, 9, 0), []);
   });
 });
+
+describe('multi-selection helpers', () => {
+  it('derives the right pane from the selection', async () => {
+    const { paneFor, selectedItems } = await import('./useTreeSelection.ts');
+    assert.deepEqual(paneFor([]), { kind: 'form' });
+    assert.deepEqual(paneFor(['draft']), { kind: 'form' });
+    assert.deepEqual(paneFor(['s:a']), { kind: 'form' });
+    assert.deepEqual(paneFor(['f:Prod']), { kind: 'folder', path: 'Prod' });
+    assert.deepEqual(paneFor(['sec:all']), { kind: 'root' });
+    assert.deepEqual(paneFor(['s:a', 'fav:s:a']), { kind: 'form' });
+    assert.deepEqual(paneFor(['s:a', 'f:Prod', 'draft']), { kind: 'selection', items: ['s:a', 'f:Prod'] });
+    assert.deepEqual(selectedItems(['rec:a', 's:a', 'sec:all', 'f:X', 'addr']), ['s:a', 'f:X']);
+  });
+
+  it('ranges hold sites and folders only', () => {
+    const model = buildTree([local, site('a', 'Prod'), site('b', 'Empty/Inner'), site('c', null)], { ...defaultLayoutForTest(), folders: ['Void'] });
+    const rows = flattenRows(model, { collapsed: new Set(), draft: { folder: '', name: '' } }).rows;
+    const keys = rows.map((r) => r.key);
+    assert.ok(keys.includes('draft'));
+    assert.ok(keys.includes('ph:Void'));
+    const range = rangeKeys(rows, keys.indexOf('s:local'), rows.length - 1);
+    assert.ok(!range.includes('draft'));
+    assert.ok(!range.includes('ph:Void'));
+    assert.ok(range.includes('f:Void') && range.includes('s:c'));
+  });
+});
+
+function defaultLayoutForTest() {
+  return { version: 1, folders: [], favorites: [], recents: [], labels: [], site_labels: {}, folder_labels: {}, collapsed: [], migrated_local_storage: false, large_library_collapsed: false };
+}

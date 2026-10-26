@@ -1,6 +1,7 @@
 import React, { memo, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
+  ArrowRight,
   ChevronRight,
   ChevronsDownUp,
   ChevronsUpDown,
@@ -95,6 +96,8 @@ export interface SiteTreeRowProps {
   active: boolean;
   /** Ancestor level whose guide is drawn strong (the selected row's parent), or -1 */
   strongGuide: number;
+  /** The ⋯ button shows without hover: the selected row (only the focused one in a multi-selection) */
+  showActions: boolean;
   nameTerms: readonly string[];
   addressTerms: readonly string[];
   /** For the "All connections" header: whether any folder is expanded (its collapse/expand-all button) */
@@ -162,6 +165,7 @@ export const SiteTreeRow = memo(function SiteTreeRow({
   selected,
   active,
   strongGuide,
+  showActions,
   nameTerms,
   addressTerms,
   anyExpanded,
@@ -200,7 +204,7 @@ export const SiteTreeRow = memo(function SiteTreeRow({
       title={t('siteTree.moreActions', 'More actions')}
       className={cx(
         'w-[22px] h-[22px] shrink-0 items-center justify-center rounded-md text-ink-muted hover:text-ink hover:bg-dark-600/60',
-        selected || edit ? 'flex' : 'hidden group-hover:flex'
+        showActions || edit ? 'flex' : 'hidden group-hover:flex'
       )}
     >
       <Ellipsis className="w-3.5 h-3.5" />
@@ -275,7 +279,7 @@ export const SiteTreeRow = memo(function SiteTreeRow({
               <Highlight text={row.name} terms={nameTerms} />
             </span>
             {row.count > 0 && (
-              <span className={cx('ml-2 shrink-0 text-[11px] tabular-nums text-ink-faint', selected ? 'hidden' : 'group-hover:hidden')}>{formatted}</span>
+              <span className={cx('ml-2 shrink-0 text-[11px] tabular-nums text-ink-faint', showActions ? 'hidden' : 'group-hover:hidden')}>{formatted}</span>
             )}
             <span className="ml-1 flex">{moreButton}</span>
           </>
@@ -410,8 +414,8 @@ export const SiteTreeRow = memo(function SiteTreeRow({
       style={style}
     >
       <span className="w-4 h-4 shrink-0" aria-hidden />
-      <Plus aria-hidden className="w-4 h-4 shrink-0 text-ink-faint" />
-      <span className="ml-2 flex-1 min-w-0 truncate text-[13px] text-ink">
+      <ArrowRight aria-hidden className={cx('w-4 h-4 shrink-0', selected || active ? 'text-rust-500' : 'text-ink-faint')} />
+      <span className="ml-2 flex-1 min-w-0 truncate text-[13px] text-ink" title={row.address}>
         {t('siteTree.newConnectionTo', { address: row.address, defaultValue: 'New connection to {{address}}…' })}
       </span>
     </div>

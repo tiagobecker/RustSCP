@@ -87,15 +87,36 @@ export const sectionBounds = (rows: readonly TreeRow[], i: number): [number, num
   return [start, end];
 };
 
-/** Row keys from `from` to `to` (inclusive, either order), clipped to `from`'s section; headers left out. */
+/** Rows that stand for an item (a site or a folder): what multi-selection holds. */
+export const isItemRow = (row: TreeRow | undefined): boolean => !!row && (row.kind === 'site' || row.kind === 'folder');
+
+/**
+ * Row keys from `from` to `to` (inclusive, either order), clipped to `from`'s section. Only sites
+ * and folders: headers, the draft, placeholders and the address row are left out.
+ */
 export const rangeKeys = (rows: readonly TreeRow[], from: number, to: number): string[] => {
   if (from < 0 || to < 0 || from >= rows.length || to >= rows.length) return [];
   const [start, end] = sectionBounds(rows, from);
   const a = Math.max(start, Math.min(from, to));
   const b = Math.min(end - 1, Math.max(from, to));
   const out: string[] = [];
-  for (let i = a; i <= b; i++) if (rows[i].kind !== 'section') out.push(rows[i].key);
+  for (let i = a; i <= b; i++) if (isItemRow(rows[i])) out.push(rows[i].key);
   return out;
+};
+
+/** Canonical item keys (`s:<id>`, `f:<path>`) of a selection, without duplicates. */
+export const selectedItems = (rowKeys: Iterable<string>): string[] => canonicalItems(rowKeys).filter((k) => k.startsWith('s:') || k.startsWith('f:'));
+
+/** What the right pane shows for a selection (spec §4). A form with unsaved edits wins before this is asked. */
+export type PaneTarget = { kind: 'form' } | { kind: 'root' } | { kind: 'folder'; path: string } | { kind: 'selection'; items: string[] };
+
+export const paneFor = (rowKeys: Iterable<string>): PaneTarget => {
+  const keys = [...rowKeys];
+  const items = selectedItems(keys);
+  if (items.length >= 2) return { kind: 'selection', items };
+  if (items.length === 1) return items[0].startsWith('f:') ? { kind: 'folder', path: items[0].slice(2) } : { kind: 'form' };
+  if (keys.includes('sec:all')) return { kind: 'root' };
+  return { kind: 'form' };
 };
 
 /** Rows that can hold the selection (everything but the address row and the inline new-folder row). */
@@ -123,8 +144,8 @@ export interface TreeSelection extends SelectionState {
   toggle: (rowKey: string) => void;
   /** Selects the anchor…row range within one section (Shift-click / Shift+arrows, WP5b) */
   selectRange: (rows: readonly TreeRow[], toKey: string, indexByKey: ReadonlyMap<string, number>) => void;
-  /** Replaces the selection with these row keys */
-  selectKeys: (rowKeys: readonly string[], active?: string | null) => void;
+  /** Replaces the selection with these row keys (`anchor` defaults to the first) */
+  selectKeys: (rowKeys: readonly string[], active?: string | null, anchor?: string | null) => void;
   isSelected: (rowKey: string) => boolean;
 }
 
@@ -192,11 +213,11 @@ export function useTreeSelection(initialKey: string | null = null): TreeSelectio
   );
 
   const selectKeys = useCallback(
-    (rowKeys: readonly string[], active?: string | null) =>
+    (rowKeys: readonly string[], active?: string | null, anchor?: string | null) =>
       commit((s) => ({
-        keys: new Set(rowKeys),
+        keys: rowKeys.length ? new Set(rowKeys) : EMPTY,
         version: s.version + 1,
-        anchor: rowKeys[0] ?? null,
+        anchor: anchor === undefined ? rowKeys[0] ?? null : anchor,
         active: active === undefined ? rowKeys[0] ?? s.active : active,
       })),
     [commit]

@@ -8,6 +8,7 @@
  */
 import type { ConnectionConfig, Protocol } from '../../types.ts';
 import type {
+  CopyItem,
   CreatedSite,
   Density,
   FavoriteRef,
@@ -770,6 +771,149 @@ export const inFavoriteFolder = (model: TreeModel, siteId: string): boolean => {
   if (model.favoriteFolders.size === 0) return false;
   const g = model.siteFolder.get(siteId);
   return !!g && folderChain(g).some((p) => model.favoriteFolders.has(p));
+};
+
+/* -------------------------------------------------------------------------- */
+/* Selections                                                                  */
+/* -------------------------------------------------------------------------- */
+
+export interface ResolvedItems {
+  /** Saved sites among the items (never Local), in item order */
+  sites: ConnectionConfig[];
+  /** Selected folders, without those inside another selected folder */
+  folders: FolderNode[];
+  /** `sites` minus the ones inside a selected folder (those go with their folder) */
+  looseSites: ConnectionConfig[];
+  /** Local was among the items (actions skip it) */
+  local: boolean;
+}
+
+/** Canonical item keys (`s:<id>`, `f:<path>`) → the sites and folders they name. Unknown keys are ignored. */
+export const resolveItems = (model: TreeModel, itemKeys: Iterable<string>): ResolvedItems => {
+  const sites: ConnectionConfig[] = [];
+  const nodes: FolderNode[] = [];
+  const seen = new Set<string>();
+  let local = false;
+  for (const key of itemKeys) {
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const ref = parseItemKey(key);
+    if (ref?.kind === 'site') {
+      const site = model.sitesById.get(ref.id);
+      if (!site) continue;
+      if (isLocalSite(site)) local = true;
+      else sites.push(site);
+    } else if (ref?.kind === 'folder') {
+      const node = model.folders.get(ref.path);
+      if (node && node.path) nodes.push(node);
+    }
+  }
+  const folders = nodes.filter((f) => !nodes.some((o) => o.path !== f.path && isInside(f.path, o.path)));
+  const looseSites = sites.filter((s) => {
+    const g = model.siteFolder.get(s.id) ?? '';
+    return !g || !folders.some((f) => isInside(g, f.path));
+  });
+  return { sites, folders, looseSites, local };
+};
+
+/** Saved sites per protocol tag, most first ("28 SFTP · 4 FTPS"); Local is never counted. */
+export const protocolBreakdown = (sites: Iterable<ConnectionConfig>): Array<{ protocol: string; tag: string; count: number }> =>
+  [...protocolCounts(sites)]
+    .map(([protocol, count]) => ({ protocol, tag: protocolTag(protocol), count }))
+    .sort((a, b) => b.count - a.count || protocolRank(a.protocol) - protocolRank(b.protocol));
+
+export interface FolderMove {
+  from: string;
+  /** Path after the move (the existing folder when it merges) */
+  to: string;
+  merges: boolean;
+}
+
+export interface MovePlan {
+  /** One batch: `create_folder` for a new target, `move_sites`, then one `move_folder` per folder */
+  ops: SiteTreeOp[];
+  /** Sites that change folder (those inside moved folders go with them and are not listed) */
+  sites: ConnectionConfig[];
+  /** Folders that change parent */
+  folders: FolderMove[];
+  /** Moved folders whose name is taken in the target, ignoring case (Merge joins them) */
+  clashes: Array<{ path: string; existing: string }>;
+  /** A folder would go inside itself */
+  intoSelf: boolean;
+  /** A resulting path would pass 255 characters */
+  tooLong: boolean;
+}
+
+/**
+ * Plans "Move to…" (and drops): items already in `target` are left out, sites inside a moved folder
+ * go with it, a folder whose name exists in the target (or among the folders moved with it) is a
+ * clash that needs `merge`. `createTarget` adds `create_folder` when the target does not exist yet
+ * (a folder made in the Move dialog), so the whole move is one undoable batch.
+ */
+export function planMove(
+  model: TreeModel,
+  itemKeys: Iterable<string>,
+  rawTarget: string,
+  opts: { merge?: boolean; createTarget?: boolean } = {}
+): MovePlan {
+  const target = normalizeGroup(rawTarget);
+  const { looseSites, folders } = resolveItems(model, itemKeys);
+  const sites = looseSites.filter((s) => (model.siteFolder.get(s.id) ?? '') !== target);
+  const moving = folders.filter((f) => parentOf(f.path) !== target);
+  const intoSelf = moving.some((f) => isInside(target, f.path));
+
+  // Names already used in the target, plus the folders landing there as the plan goes
+  const taken = new Map<string, string>();
+  for (const child of model.folders.get(target)?.folders ?? []) taken.set(child.name.toLowerCase(), child.path);
+  const clashes: MovePlan['clashes'] = [];
+  const moves: FolderMove[] = [];
+  let tooLong = charLength(target) > MAX_FOLDER_PATH_LEN;
+  for (const f of moving) {
+    const lower = f.name.toLowerCase();
+    const existing = taken.get(lower);
+    const to = existing ?? joinPath(target, f.name);
+    if (existing !== undefined) clashes.push({ path: f.path, existing });
+    else taken.set(lower, to);
+    let deepest = 0;
+    for (const p of foldersInside(model, f.path)) deepest = Math.max(deepest, charLength(p) - charLength(f.path));
+    if (charLength(to) + deepest > MAX_FOLDER_PATH_LEN) tooLong = true;
+    moves.push({ from: f.path, to, merges: existing !== undefined });
+  }
+
+  const ops: SiteTreeOp[] = [];
+  if (opts.createTarget && target && !model.folders.has(target) && (sites.length > 0 || moves.length > 0)) ops.push({ op: 'create_folder', path: target });
+  if (sites.length) ops.push({ op: 'move_sites', ids: sites.map((s) => s.id), to: target || null });
+  for (const m of moves) {
+    ops.push(opts.merge ? { op: 'move_folder', path: m.from, to: target || null, merge: true } : { op: 'move_folder', path: m.from, to: target || null });
+  }
+  return { ops, sites, folders: moves, clashes, intoSelf, tooLong };
+}
+
+/**
+ * Copies for Duplicate: each keeps its folder and gets the first free name there
+ * ("web-01 copy", "web-01 copy 2"…), counting the names given earlier in the same batch.
+ */
+export const duplicateItems = (
+  model: TreeModel,
+  sites: readonly ConnectionConfig[],
+  firstName: (name: string) => string,
+  nthName: (name: string, n: number) => string
+): CopyItem[] => {
+  const takenByFolder = new Map<string, string[]>();
+  const out: CopyItem[] = [];
+  for (const s of sites) {
+    if (isLocalSite(s)) continue;
+    const folder = model.siteFolder.get(s.id) ?? '';
+    let taken = takenByFolder.get(folder);
+    if (!taken) {
+      taken = (model.folders.get(folder)?.sites ?? []).map((x) => x.name);
+      takenByFolder.set(folder, taken);
+    }
+    const name = pickFreeName(firstName(s.name), taken, (n) => nthName(s.name, n));
+    taken.push(name);
+    out.push({ id: s.id, name, group: folder || null });
+  }
+  return out;
 };
 
 /* -------------------------------------------------------------------------- */

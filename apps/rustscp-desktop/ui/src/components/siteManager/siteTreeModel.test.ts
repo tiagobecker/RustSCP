@@ -11,6 +11,7 @@ import {
   coerceLayout,
   copyAddress,
   defaultLayout,
+  duplicateItems,
   duplicateKey,
   effectiveDensity,
   flattenRows,
@@ -24,7 +25,10 @@ import {
   parentOf,
   parseViewPrefs,
   pickFreeName,
+  planMove,
+  protocolBreakdown,
   reconcileLayout,
+  resolveItems,
   recentAge,
   rowFolderPath,
   siteAddress,
@@ -561,5 +565,100 @@ describe('helpers', () => {
     assert.deepEqual(recentAge(at(2 * 3600), now), { unit: 'h', count: 2 });
     assert.deepEqual(recentAge(at(3 * 86_400), now), { unit: 'd', count: 3 });
     assert.equal(recentAge(at(30 * 86_400), now).unit, 'date');
+  });
+
+  it('resolveItems drops Local and what sits inside a selected folder', () => {
+    const model = buildTree(library(), null);
+    const r = resolveItems(model, ['s:local', 's:web-01', 's:solo', 'f:Clients', 'f:Clients/Acme', 'f:Nope', 's:nope', 's:solo']);
+    assert.equal(r.local, true);
+    assert.deepEqual(r.sites.map((s) => s.id), ['web-01', 'solo']);
+    assert.deepEqual(r.folders.map((f) => f.path), ['Clients']);
+    assert.deepEqual(r.looseSites.map((s) => s.id), ['solo']);
+  });
+
+  it('protocolBreakdown counts saved sites per tag, most first', () => {
+    const sites = [LOCAL, site('a'), site('b'), site('c', null, { protocol: 'ftp' }), site('d', null, { protocol: 'scp' })];
+    assert.deepEqual(protocolBreakdown(sites), [
+      { protocol: 'sftp', tag: 'SFTP', count: 3 },
+      { protocol: 'ftp', tag: 'FTP', count: 1 },
+    ]);
+  });
+
+  it('planMove moves sites and folders in one batch that applies like the backend', () => {
+    const sites = library();
+    const model = buildTree(sites, null);
+    const plan = planMove(model, ['s:solo', 's:local', 'f:Clients/Acme', 's:db-01'], 'Staging');
+    assert.deepEqual(plan.clashes, []);
+    assert.equal(plan.intoSelf, false);
+    assert.equal(plan.tooLong, false);
+    // db-01 is inside the moved folder, so it goes with it; Local never moves
+    assert.deepEqual(plan.sites.map((s) => s.id), ['solo']);
+    assert.deepEqual(plan.folders, [{ from: 'Clients/Acme', to: 'Staging/Acme', merges: false }]);
+    assert.deepEqual(plan.ops, [
+      { op: 'move_sites', ids: ['solo'], to: 'Staging' },
+      { op: 'move_folder', path: 'Clients/Acme', to: 'Staging' },
+    ]);
+    const out = run(sites, defaultLayout(), plan.ops);
+    assert.equal(groupOf(out.sites, 'solo'), 'Staging');
+    assert.equal(groupOf(out.sites, 'db-01'), 'Staging/Acme');
+    assert.equal(groupOf(out.sites, 'web-01'), 'Staging/Acme/Web');
+  });
+
+  it('planMove leaves out items already there and creates a new target', () => {
+    const sites = library();
+    const model = buildTree(sites, null);
+    assert.deepEqual(planMove(model, ['s:stg'], 'Staging').ops, []);
+    assert.deepEqual(planMove(model, ['f:Clients/Acme'], 'Clients').ops, []);
+    const plan = planMove(model, ['s:stg', 's:solo'], 'Archive/2026', { createTarget: true });
+    assert.deepEqual(plan.ops, [
+      { op: 'create_folder', path: 'Archive/2026' },
+      { op: 'move_sites', ids: ['stg', 'solo'], to: 'Archive/2026' },
+    ]);
+    const out = run(sites, defaultLayout(), plan.ops);
+    assert.equal(groupOf(out.sites, 'stg'), 'Archive/2026');
+    assert.ok(out.layout.folders.includes('Archive/2026'));
+    // To the top level
+    const top = planMove(model, ['s:stg', 'f:Clients/Acme'], '');
+    assert.deepEqual(top.ops, [
+      { op: 'move_sites', ids: ['stg'], to: null },
+      { op: 'move_folder', path: 'Clients/Acme', to: null },
+    ]);
+  });
+
+  it('planMove finds name clashes (ignoring case) and merges when asked', () => {
+    const sites = [...library(), site('x', 'Staging/acme')];
+    const model = buildTree(sites, null);
+    const plan = planMove(model, ['f:Clients/Acme'], 'Staging');
+    assert.deepEqual(plan.clashes, [{ path: 'Clients/Acme', existing: 'Staging/acme' }]);
+    assert.equal(errCode(() => run(sites, defaultLayout(), plan.ops)), 'site_tree.folder_exists');
+    const merged = planMove(model, ['f:Clients/Acme'], 'Staging', { merge: true });
+    assert.deepEqual(merged.folders, [{ from: 'Clients/Acme', to: 'Staging/acme', merges: true }]);
+    const out = run(sites, defaultLayout(), merged.ops);
+    assert.equal(groupOf(out.sites, 'db-01'), 'Staging/acme');
+    assert.equal(groupOf(out.sites, 'web-01'), 'Staging/acme/Web');
+    // Two moved folders with one name clash with each other
+    const twins = buildTree([site('a', 'One/Web'), site('b', 'Two/web')], null);
+    assert.deepEqual(planMove(twins, ['f:One/Web', 'f:Two/web'], '').clashes, [{ path: 'Two/web', existing: 'Web' }]);
+  });
+
+  it('planMove refuses a folder into itself and paths over 255 characters', () => {
+    const model = buildTree(library(), null);
+    assert.equal(planMove(model, ['f:Clients'], 'Clients/Acme').intoSelf, true);
+    assert.equal(planMove(model, ['f:Clients'], 'Clients').intoSelf, true);
+    const long = 'x'.repeat(250);
+    const deep = buildTree([site('a', `${long}/Inner`), site('b', 'Clients')], null);
+    assert.equal(planMove(deep, ['f:Clients'], long).tooLong, true);
+    assert.equal(planMove(deep, ['s:b'], long).tooLong, false);
+  });
+
+  it('duplicateItems names copies per folder, counting earlier copies in the batch', () => {
+    const sites = [...library(), site('web-01 copy', 'Clients/Acme/Web', { name: 'web-01 copy' })];
+    const model = buildTree(sites, null);
+    const items = duplicateItems(model, [model.sitesById.get('web-01')!, model.sitesById.get('web-01')!, model.sitesById.get('solo')!, LOCAL], (n) => `${n} copy`, (n, i) => `${n} copy ${i}`);
+    assert.deepEqual(items, [
+      { id: 'web-01', name: 'web-01 copy 2', group: 'Clients/Acme/Web' },
+      { id: 'web-01', name: 'web-01 copy 3', group: 'Clients/Acme/Web' },
+      { id: 'solo', name: 'solo copy', group: null },
+    ]);
   });
 });
