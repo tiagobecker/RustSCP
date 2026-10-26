@@ -45,7 +45,7 @@ pub use vault::{
     get_rustscp_config_dir, load_local_vault, parse_vault_from_json, save_local_vault,
     serialize_vault_to_json, VaultEnvelope, VaultError, VaultSecurityInfo,
 };
-pub use vfs::VirtualFileSystem;
+pub use vfs::{StreamId, VirtualFileSystem};
 pub use webdav_server::{VirtualDiskInfo, WebDavServer};
 pub use winscp::{
     decode_ini_bytes, decrypt_winscp_password, is_putty_private_key, normalize_key_path,

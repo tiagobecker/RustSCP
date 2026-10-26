@@ -5,8 +5,8 @@ use rustscp_core::{
     FileSystemInfo, FindFileMatch, FindFileQuery, FtpConfig, FtpDriver, LocalFsDriver,
     ManagedDiskCache, Protocol, QueueTransferTask, RemoteSystemInfo, RemoteTrashItem,
     RemoteTrashStatus, S3Config, S3Driver, ScriptCommandOutput, ScriptInterpreter, SftpDriver,
-    SyncEngine, SyncItem, SyncOptions, TransferQueueManager, VirtualDiskInfo, VirtualFileSystem,
-    WebDavServer, WinScpImportResult,
+    StreamId, SyncEngine, SyncItem, SyncOptions, TransferQueueManager, VirtualDiskInfo,
+    VirtualFileSystem, WebDavServer, WinScpImportResult,
 };
 use rustscp_mcp::{
     ApprovalDecision, ApprovalRequest, AuditEvent, AuditLogger, CommandAccess, ConnectionInfo,
@@ -785,6 +785,42 @@ fn core_err(e: rustscp_core::CoreError) -> String {
     e.to_string()
 }
 
+/// Ends a read `stream` on `vfs`: after success its file is closed before this returns
+/// (nothing stays open on the server), after a failure it is abandoned.
+async fn end_read_stream<T>(
+    vfs: &Arc<dyn VirtualFileSystem>,
+    stream: StreamId,
+    result: Result<T, String>,
+) -> Result<T, String> {
+    match &result {
+        Ok(_) => {
+            let _ = vfs.finish_stream(stream).await;
+        }
+        Err(_) => vfs.abandon_stream(stream).await,
+    }
+    result
+}
+
+/// Ends a write `stream` on `vfs`: after success it must finish (a failed close is an
+/// error, since some servers only store a written file once it is closed), after a
+/// failure it is abandoned.
+async fn end_write_stream<T>(
+    vfs: &Arc<dyn VirtualFileSystem>,
+    stream: StreamId,
+    result: Result<T, String>,
+) -> Result<T, String> {
+    match result {
+        Ok(value) => {
+            vfs.finish_stream(stream).await.map_err(core_err)?;
+            Ok(value)
+        }
+        Err(e) => {
+            vfs.abandon_stream(stream).await;
+            Err(e)
+        }
+    }
+}
+
 /// Copies `src_path` to `dst_path`. Destinations with positional writes (local, SFTP) get
 /// the file chunk by chunk, so it is never held in memory as a whole; the others (S3,
 /// FTP) get a single `write_file`. Returns the number of bytes copied.
@@ -800,26 +836,32 @@ async fn stream_copy_file(
         dst.write_file(dst_path, data).await.map_err(core_err)?;
         return Ok(len);
     }
-    let mut offset = 0u64;
-    loop {
-        let chunk = src
-            .read_range(src_path, offset, STREAM_CHUNK_BYTES)
-            .await
-            .map_err(core_err)?;
-        let len = chunk.len() as u64;
-        if len == 0 && offset > 0 {
-            break;
+    let (read, write) = (StreamId::new(), StreamId::new());
+    let copied = async {
+        let mut offset = 0u64;
+        loop {
+            let chunk = src
+                .read_range_in(read, src_path, offset, STREAM_CHUNK_BYTES)
+                .await
+                .map_err(core_err)?;
+            let len = chunk.len() as u64;
+            if len == 0 && offset > 0 {
+                break;
+            }
+            // offset 0 creates / truncates the destination, even for an empty source.
+            dst.write_at_in(write, dst_path, offset, chunk)
+                .await
+                .map_err(core_err)?;
+            offset += len;
+            if len < STREAM_CHUNK_BYTES {
+                break;
+            }
         }
-        // offset 0 creates / truncates the destination, even for an empty source.
-        dst.write_at(dst_path, offset, chunk)
-            .await
-            .map_err(core_err)?;
-        offset += len;
-        if len < STREAM_CHUNK_BYTES {
-            break;
-        }
+        Ok(offset)
     }
-    Ok(offset)
+    .await;
+    let copied = end_read_stream(src, read, copied).await;
+    end_write_stream(dst, write, copied).await
 }
 
 /// Fills `buf` from `file` until it is full or the file ends; returns the bytes read.
@@ -856,28 +898,34 @@ async fn upload_local_file(
     let mut file = tokio::fs::File::open(local_path)
         .await
         .map_err(|e| format!("Could not read '{}': {}", local_path.display(), e))?;
-    let mut buf = vec![0u8; STREAM_CHUNK_BYTES as usize];
-    let mut offset = 0u64;
-    loop {
-        let n = read_full(&mut file, &mut buf)
+    let write = StreamId::new();
+    let uploaded = async {
+        let mut buf = vec![0u8; STREAM_CHUNK_BYTES as usize];
+        let mut offset = 0u64;
+        loop {
+            let n = read_full(&mut file, &mut buf)
+                .await
+                .map_err(|e| format!("Could not read '{}': {}", local_path.display(), e))?;
+            if n == 0 && offset > 0 {
+                break;
+            }
+            vfs.write_at_in(
+                write,
+                remote_path,
+                offset,
+                bytes::Bytes::copy_from_slice(&buf[..n]),
+            )
             .await
-            .map_err(|e| format!("Could not read '{}': {}", local_path.display(), e))?;
-        if n == 0 && offset > 0 {
-            break;
+            .map_err(core_err)?;
+            offset += n as u64;
+            if n < buf.len() {
+                break;
+            }
         }
-        vfs.write_at(
-            remote_path,
-            offset,
-            bytes::Bytes::copy_from_slice(&buf[..n]),
-        )
-        .await
-        .map_err(core_err)?;
-        offset += n as u64;
-        if n < buf.len() {
-            break;
-        }
+        Ok(offset)
     }
-    Ok(offset)
+    .await;
+    end_write_stream(vfs, write, uploaded).await
 }
 
 /// Creates `path` for writing with owner-only permissions (0600 on Unix); fails if it exists.
@@ -902,23 +950,29 @@ async fn download_to_private_file(
     let std_file = create_private_file(local_path)
         .map_err(|e| format!("Could not create '{}': {}", local_path.display(), e))?;
     let mut file = tokio::fs::File::from_std(std_file);
-    let mut offset = 0u64;
-    loop {
-        let chunk = vfs
-            .read_range(remote_path, offset, STREAM_CHUNK_BYTES)
-            .await
-            .map_err(core_err)?;
-        if chunk.is_empty() {
-            break;
+    let read = StreamId::new();
+    let downloaded = async {
+        let mut offset = 0u64;
+        loop {
+            let chunk = vfs
+                .read_range_in(read, remote_path, offset, STREAM_CHUNK_BYTES)
+                .await
+                .map_err(core_err)?;
+            if chunk.is_empty() {
+                break;
+            }
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| format!("Could not write '{}': {}", local_path.display(), e))?;
+            offset += chunk.len() as u64;
+            if (chunk.len() as u64) < STREAM_CHUNK_BYTES {
+                break;
+            }
         }
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| format!("Could not write '{}': {}", local_path.display(), e))?;
-        offset += chunk.len() as u64;
-        if (chunk.len() as u64) < STREAM_CHUNK_BYTES {
-            break;
-        }
+        Ok(offset)
     }
+    .await;
+    let offset = end_read_stream(vfs, read, downloaded).await?;
     file.flush()
         .await
         .map_err(|e| format!("Could not write '{}': {}", local_path.display(), e))?;
@@ -2488,21 +2542,27 @@ async fn stream_checksum(
     algo: ChecksumAlgo,
 ) -> Result<String, String> {
     let mut hasher = StreamingHasher::new(algo);
-    let mut offset = 0u64;
-    loop {
-        let chunk = vfs
-            .read_range(path, offset, STREAM_CHUNK_BYTES)
-            .await
-            .map_err(core_err)?;
-        if chunk.is_empty() {
-            break;
+    let read = StreamId::new();
+    let hashed = async {
+        let mut offset = 0u64;
+        loop {
+            let chunk = vfs
+                .read_range_in(read, path, offset, STREAM_CHUNK_BYTES)
+                .await
+                .map_err(core_err)?;
+            if chunk.is_empty() {
+                break;
+            }
+            hasher.update(&chunk);
+            offset += chunk.len() as u64;
+            if (chunk.len() as u64) < STREAM_CHUNK_BYTES {
+                break;
+            }
         }
-        hasher.update(&chunk);
-        offset += chunk.len() as u64;
-        if (chunk.len() as u64) < STREAM_CHUNK_BYTES {
-            break;
-        }
+        Ok(())
     }
+    .await;
+    end_read_stream(vfs, read, hashed).await?;
     Ok(hasher.finish())
 }
 

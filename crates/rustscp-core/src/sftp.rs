@@ -6,7 +6,7 @@ use crate::types::{
     AuthMethod, ConnectionConfig, CoreError, CoreResult, FileEntry, FileSystemInfo, FileType,
     FindFileMatch, FindFileQuery, Permissions, Protocol, SftpMode,
 };
-use crate::vfs::VirtualFileSystem;
+use crate::vfs::{StreamId, VirtualFileSystem};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{TimeZone, Utc};
@@ -14,7 +14,7 @@ use ssh2::{
     ErrorCode, FileStat, HashType, KeyboardInteractivePrompt, MethodType, OpenFlags, OpenType,
     Prompt, Session, Sftp,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
@@ -37,6 +37,18 @@ const KEEPALIVE_INTERVAL_SECS: u32 = 30;
 /// entries take about 250 MiB here).
 const MAX_LISTING_ENTRIES: usize = 2_000_000;
 const MAX_LISTING_NAME_BYTES: usize = 128 * 1024 * 1024;
+/// A stream's reads keep about two round trips of its measured delivery rate in
+/// flight (at least this long): enough to keep the link busy, while every other
+/// request on the connection, which waits behind that data, stays quick whatever
+/// the bandwidth. With less than STREAM_AHEAD_MIN, concurrent streams stall each
+/// other (a blocking read holds ssh2's session lock until its own data arrives).
+const STREAM_AHEAD_MIN_TIME: Duration = Duration::from_millis(50);
+const STREAM_AHEAD_MIN: u64 = 64 * 1024;
+const STREAM_AHEAD_MAX: u64 = 8 * 1024 * 1024;
+/// A stream's delivery rate is measured over at least this long.
+const STREAM_RATE_WINDOW: Duration = Duration::from_millis(500);
+/// A stream nobody ended is closed after this long unused.
+const STREAM_IDLE_CLOSE: Duration = Duration::from_secs(30);
 /// Default limit for one remote command.
 pub const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -120,6 +132,11 @@ struct DriverState {
     /// One SFTP subsystem channel reused by all operations of a session
     /// (opening one costs several round trips).
     sftp_cache: StdMutex<Option<(u64, Arc<SftpBackend>)>>,
+    /// Files kept open by streams (`read_range_in` / `write_at_in`).
+    streams: StdMutex<HashMap<StreamId, StreamFile>>,
+    /// Shortest single request (a stat or an open) seen on this connection, in
+    /// microseconds: its round trip, since waiting on a busy link only adds to it.
+    min_rtt_us: AtomicU64,
     /// Lets one operation start SFTP while the others wait for it. Only taken
     /// when the cache is empty.
     sftp_start_lock: Arc<Mutex<()>>,
@@ -140,6 +157,171 @@ struct DriverState {
     keepalive_started: AtomicBool,
     /// Home folder used to expand a leading `~` (looked up once).
     home_dir: StdMutex<Option<String>>,
+}
+
+impl Drop for DriverState {
+    /// Closing kept-open files and the channel waits for the server (up to the
+    /// whole I/O timeout on a hung connection); the last driver may be dropped
+    /// on the async runtime.
+    fn drop(&mut self) {
+        let streams = std::mem::take(self.streams.get_mut().unwrap_or_else(|p| p.into_inner()));
+        let sftp = self
+            .sftp_cache
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if !streams.is_empty() || sftp.is_some() {
+            std::thread::spawn(move || drop((streams, sftp)));
+        }
+    }
+}
+
+/// How a stream opened its file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Read,
+    Write,
+}
+
+/// The file a stream keeps open between its steps.
+struct StreamFile {
+    file: RemoteFile,
+    /// The channel the handle belongs to.
+    sftp: Arc<SftpBackend>,
+    path: String,
+    access: Access,
+    /// Where the stream's next step starts.
+    next: u64,
+    used: Instant,
+    /// Delivery rate measured so far (bytes per second, 0 until a first window
+    /// is complete) and the window being measured.
+    rate: f64,
+    window_start: Instant,
+    window_bytes: u64,
+}
+
+impl StreamFile {
+    /// Open the stream's file (a round trip sample for `state`).
+    fn open(
+        sftp: &Arc<SftpBackend>,
+        path: &str,
+        access: Access,
+        offset: u64,
+        state: &DriverState,
+    ) -> CoreResult<StreamFile> {
+        let started = Instant::now();
+        let file = match access {
+            Access::Read => sftp_open_at(sftp, path, offset)?,
+            Access::Write => {
+                let mut file = sftp_open_for_write(sftp, path, offset == 0)?;
+                if offset > 0 {
+                    file.seek(SeekFrom::Start(offset))
+                        .map_err(|e| io_error(e, format!("Failed to seek in '{}'", path)))?;
+                }
+                file
+            }
+        };
+        let now = Instant::now();
+        state.round_trip(now - started);
+        Ok(StreamFile {
+            file,
+            sftp: sftp.clone(),
+            path: path.to_string(),
+            access,
+            next: offset,
+            used: now,
+            rate: 0.0,
+            window_start: now,
+            window_bytes: 0,
+        })
+    }
+
+    /// Does the next step (`access` on `path` at `offset`) continue this file?
+    fn continues(&self, sftp: &Arc<SftpBackend>, path: &str, access: Access, offset: u64) -> bool {
+        self.access == access
+            && self.next == offset
+            && self.path == path
+            && Arc::ptr_eq(&self.sftp, sftp)
+    }
+
+    /// Bytes reads may keep in flight, past the current step too, on a link
+    /// with round trip `rtt`: two round trips at the measured rate, plus one read
+    /// request (requests are sent whole); `None` until a rate is known (the step
+    /// then reads like a one-off range). When the link is not the limit, the rate
+    /// measured is what is in flight per round trip, so this doubles it until it is.
+    fn read_ahead(&self, rtt: Duration) -> Option<u64> {
+        if self.rate <= 0.0 {
+            return None;
+        }
+        let secs = STREAM_AHEAD_MIN_TIME
+            .max(rtt.saturating_mul(2))
+            .as_secs_f64();
+        let ahead = (self.rate * secs) as u64 + self.sftp.read_request_size();
+        Some(ahead.clamp(STREAM_AHEAD_MIN, STREAM_AHEAD_MAX))
+    }
+
+    /// A step moved `n` bytes.
+    fn advanced(&mut self, n: u64) {
+        self.next = self.next.saturating_add(n);
+        self.window_bytes = self.window_bytes.saturating_add(n);
+        self.used = Instant::now();
+        let elapsed = self.window_start.elapsed();
+        if elapsed >= STREAM_RATE_WINDOW {
+            let rate = self.window_bytes as f64 / elapsed.as_secs_f64();
+            self.rate = if self.rate > 0.0 {
+                (self.rate + rate) / 2.0
+            } else {
+                rate
+            };
+            self.window_start = Instant::now();
+            self.window_bytes = 0;
+        }
+    }
+
+    /// Close and report the server's answer.
+    fn close(self) -> CoreResult<()> {
+        let path = self.path;
+        self.file
+            .close()
+            .map_err(|e| ssh_error(e, format!("Failed to close '{}'", path)))
+    }
+}
+
+impl DriverState {
+    /// A single request took `took`: the connection's round trip is at most that.
+    fn round_trip(&self, took: Duration) {
+        let us = u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
+        self.min_rtt_us.fetch_min(us, Ordering::Relaxed);
+    }
+
+    fn take_stream(&self, stream: StreamId) -> Option<StreamFile> {
+        lock(&self.streams).remove(&stream)
+    }
+
+    fn keep_stream(&self, stream: StreamId, file: StreamFile) {
+        let replaced = lock(&self.streams).insert(stream, file);
+        close_in_background(replaced.into_iter().collect());
+    }
+
+    /// Take the stream files that `which` selects.
+    fn take_streams(&self, mut which: impl FnMut(&StreamFile) -> bool) -> Vec<StreamFile> {
+        let mut streams = lock(&self.streams);
+        let ids: Vec<StreamId> = streams
+            .iter()
+            .filter(|(_, f)| which(f))
+            .map(|(id, _)| *id)
+            .collect();
+        ids.iter().filter_map(|id| streams.remove(id)).collect()
+    }
+}
+
+/// Close stream files nobody waits for on a thread of their own: a close first
+/// receives what is still in flight, and on a hung connection it takes the whole
+/// I/O timeout.
+fn close_in_background(files: Vec<StreamFile>) {
+    if !files.is_empty() {
+        std::thread::spawn(move || drop(files));
+    }
 }
 
 #[derive(Clone)]
@@ -285,6 +467,15 @@ pub(crate) enum SftpBackend {
 }
 
 impl SftpBackend {
+    /// Bytes one read request asks for (libssh2 splits reads into requests of at
+    /// most 30000 bytes; compatibility mode sends 32 KiB ones).
+    fn read_request_size(&self) -> u64 {
+        match self {
+            Self::Native(_) => 30_000,
+            Self::Exec(_) => u64::from(crate::exec_sftp::READ_CHUNK),
+        }
+    }
+
     fn opendir(&self, p: &Path) -> Result<RemoteDir, ssh2::Error> {
         match self {
             Self::Native(s) => s.opendir(p).map(RemoteDir::Native),
@@ -397,6 +588,14 @@ impl RemoteFile {
         match self {
             Self::Native(f) => f.stat(),
             Self::Exec(f) => f.stat(),
+        }
+    }
+
+    /// Close and report the server's answer (a drop closes without one).
+    fn close(self) -> Result<(), ssh2::Error> {
+        match self {
+            Self::Native(mut f) => f.close(),
+            Self::Exec(f) => f.close(),
         }
     }
 }
@@ -726,9 +925,27 @@ fn sftp_read_range(sftp: &SftpBackend, path: &str, offset: u64, length: u64) -> 
         return Ok(Bytes::new());
     }
     let mut file = sftp_open_at(sftp, path, offset)?;
-    let data = sftp_read_into(&mut file, path, length);
+    let data = sftp_read_into(&mut file, path, length, None);
     close_handle(file, data.as_ref().is_err_and(is_stalled));
     data
+}
+
+/// Read `file` to its end into `out`. Not `Read::read_to_end`: its small probing
+/// reads keep the read-ahead (4x the buffer given) small, which halves throughput
+/// over WAN.
+fn read_to_end(file: &mut RemoteFile, out: &mut Vec<u8>, size_hint: u64) -> std::io::Result<()> {
+    let buf_len = size_hint
+        .saturating_add(1)
+        .clamp(READ_BUF_MIN, READ_BUF_MAX);
+    let mut buf = vec![0u8; buf_len as usize];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Open `path` for reading at `offset`.
@@ -742,18 +959,27 @@ fn sftp_open_at(sftp: &SftpBackend, path: &str, offset: u64) -> CoreResult<Remot
 }
 
 /// Read up to `length` bytes from the current position of `file`, looping over
-/// short reads.
-fn sftp_read_into(file: &mut RemoteFile, path: &str, length: u64) -> CoreResult<Bytes> {
+/// short reads. `read_ahead`: bytes a stream may keep in flight, also past this
+/// range; `None` keeps the read-ahead inside the range.
+fn sftp_read_into(
+    file: &mut RemoteFile,
+    path: &str,
+    length: u64,
+    read_ahead: Option<u64>,
+) -> CoreResult<Bytes> {
     let mut out = Vec::with_capacity(length.min(MAX_PREALLOC) as usize);
     let mut buf = vec![0u8; length.min(READ_BUF_MAX) as usize];
     let mut remaining = length;
     while remaining > 0 {
-        // libssh2 pipelines a read-ahead of 4x the buffer it is given. Size the
-        // buffer so that read-ahead stays inside the requested range instead of
-        // fetching (and throwing away) data past it.
-        let want = (remaining / 4)
-            .clamp(READ_BUF_MIN, READ_BUF_MAX)
-            .min(remaining) as usize;
+        // libssh2 (and compatibility mode, which copies it) pipelines a
+        // read-ahead of 4x the buffer it is given, so the buffer size steers how
+        // much is in flight: by default no more than this range, so nothing is
+        // fetched and thrown away.
+        let want = match read_ahead {
+            Some(ahead) => (ahead / 4).clamp(STREAM_AHEAD_MIN / 4, READ_BUF_MAX),
+            None => (remaining / 4).clamp(READ_BUF_MIN, READ_BUF_MAX),
+        }
+        .min(remaining) as usize;
         match file.read(&mut buf[..want]) {
             Ok(0) => break,
             Ok(n) => {
@@ -1226,6 +1452,8 @@ impl SftpDriver {
             state: Arc::new(DriverState {
                 session_gen: AtomicU64::new(0),
                 sftp_cache: StdMutex::new(None),
+                streams: StdMutex::new(HashMap::new()),
+                min_rtt_us: AtomicU64::new(u64::MAX),
                 sftp_start_lock: Arc::new(Mutex::new(())),
                 sftp_gen_mode: StdMutex::new((0, GenMode::Unknown)),
                 native_proven: AtomicBool::new(false),
@@ -1678,13 +1906,15 @@ impl SftpDriver {
     }
 
     /// Periodic SSH keepalives on both connections, so NAT and firewall idle
-    /// timeouts do not silently drop them. Stops when the driver is dropped.
+    /// timeouts do not silently drop them, and closing of streams nobody ended.
+    /// Stops when the driver is dropped.
     fn start_keepalive(&self) {
         if self.state.keepalive_started.swap(true, Ordering::SeqCst) {
             return;
         }
         let primary = Arc::downgrade(&self.session);
         let shell = Arc::downgrade(&self.shell_session);
+        let state = Arc::downgrade(&self.state);
         tokio::spawn(async move {
             let mut ticker =
                 tokio::time::interval(Duration::from_secs(u64::from(KEEPALIVE_INTERVAL_SECS)));
@@ -1709,6 +1939,10 @@ impl SftpDriver {
                             }
                         });
                     }
+                }
+                // Streams their callers never ended.
+                if let Some(st) = state.upgrade() {
+                    close_in_background(st.take_streams(|f| f.used.elapsed() >= STREAM_IDLE_CLOSE));
                 }
             }
         });
@@ -2085,7 +2319,7 @@ impl SftpDriver {
     async fn with_sftp<T, F>(&self, op: F) -> CoreResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&Session, &SftpBackend) -> CoreResult<T> + Send + 'static,
+        F: FnOnce(&Session, &Arc<SftpBackend>) -> CoreResult<T> + Send + 'static,
     {
         let (sess, sftp) = self.acquire_sftp().await?;
         let sftp_for_op = sftp.clone();
@@ -2119,6 +2353,49 @@ impl SftpDriver {
             task::spawn_blocking(move || drop((dropped, sftp)));
         }
         result
+    }
+
+    /// One step of `stream` on the file it keeps open (opened by this step when the
+    /// stream has none, or one for another file or position). `step` returns its
+    /// value and the bytes it moved.
+    async fn stream_step<T, F>(
+        &self,
+        stream: StreamId,
+        path: &str,
+        access: Access,
+        offset: u64,
+        step: F,
+    ) -> CoreResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut StreamFile, Duration) -> CoreResult<(T, u64)> + Send + 'static,
+    {
+        let path = self.expand_home(path).await?;
+        let state = self.state.clone();
+        self.with_sftp(move |_, sftp| {
+            let mut file = match state.take_stream(stream) {
+                Some(file) if file.continues(sftp, &path, access, offset) => file,
+                other => {
+                    close_in_background(other.into_iter().collect());
+                    StreamFile::open(sftp, &path, access, offset, &state)?
+                }
+            };
+            let rtt = Duration::from_micros(state.min_rtt_us.load(Ordering::Relaxed));
+            match step(&mut file, rtt) {
+                Ok((value, moved)) => {
+                    file.advanced(moved);
+                    state.keep_stream(stream, file);
+                    Ok(value)
+                }
+                Err(e) => {
+                    if is_stalled(&e) {
+                        close_in_background(vec![file]);
+                    }
+                    Err(e)
+                }
+            }
+        })
+        .await
     }
 
     /// The account's home folder (`realpath .`), looked up once per driver.
@@ -2669,8 +2946,12 @@ impl VirtualFileSystem for SftpDriver {
 
     async fn metadata(&self, path: &str) -> CoreResult<FileEntry> {
         let path_owned = self.expand_home(path).await?;
+        let state = self.state.clone();
         self.with_sftp(move |_, sftp| {
-            let stat = sftp.stat(Path::new(&path_owned)).map_err(|e| {
+            let started = Instant::now();
+            let stat = sftp.stat(Path::new(&path_owned));
+            state.round_trip(started.elapsed());
+            let stat = stat.map_err(|e| {
                 into_not_found(ssh_error(
                     e,
                     format!("Cannot stat SFTP path '{}'", path_owned),
@@ -2695,8 +2976,7 @@ impl VirtualFileSystem for SftpDriver {
             })?;
             let size_hint = file.stat().ok().and_then(|s| s.size).unwrap_or(0);
             let mut buffer = Vec::with_capacity(size_hint.min(MAX_PREALLOC * 16) as usize);
-            let read = file
-                .read_to_end(&mut buffer)
+            let read = read_to_end(&mut file, &mut buffer, size_hint)
                 .map_err(|e| io_error(e, format!("Failed to read '{}'", path_owned)));
             close_handle(file, read.as_ref().is_err_and(is_stalled));
             read.map(|_| Bytes::from(buffer))
@@ -2736,6 +3016,59 @@ impl VirtualFileSystem for SftpDriver {
             written
         })
         .await
+    }
+
+    /// Consecutive ranges of a stream share one open file. Its read-ahead also
+    /// runs into the next range, kept to about two round trips of transfer so
+    /// other requests on the connection do not wait long behind it.
+    async fn read_range_in(
+        &self,
+        stream: StreamId,
+        path: &str,
+        offset: u64,
+        length: u64,
+    ) -> CoreResult<Bytes> {
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
+        self.stream_step(stream, path, Access::Read, offset, move |f, rtt| {
+            let ahead = f.read_ahead(rtt);
+            let data = sftp_read_into(&mut f.file, &f.path, length, ahead)?;
+            let moved = data.len() as u64;
+            Ok((data, moved))
+        })
+        .await
+    }
+
+    /// Consecutive writes of a stream share one open file. Each write is
+    /// acknowledged by the server before this returns.
+    async fn write_at_in(
+        &self,
+        stream: StreamId,
+        path: &str,
+        offset: u64,
+        data: Bytes,
+    ) -> CoreResult<()> {
+        self.stream_step(stream, path, Access::Write, offset, move |f, _| {
+            f.file
+                .write_all(&data)
+                .map_err(|e| io_error(e, format!("Failed to write '{}'", f.path)))?;
+            Ok(((), data.len() as u64))
+        })
+        .await
+    }
+
+    async fn finish_stream(&self, stream: StreamId) -> CoreResult<()> {
+        let Some(file) = self.state.take_stream(stream) else {
+            return Ok(());
+        };
+        task::spawn_blocking(move || file.close())
+            .await
+            .unwrap_or_else(|e| Err(join_error(e)))
+    }
+
+    async fn abandon_stream(&self, stream: StreamId) {
+        close_in_background(self.state.take_stream(stream).into_iter().collect());
     }
 
     async fn create_dir(&self, path: &str) -> CoreResult<()> {
@@ -3119,7 +3452,9 @@ impl VirtualFileSystem for SftpDriver {
         .await
     }
 
+    /// A command may change any file: streams start again from a fresh open.
     async fn execute_command(&self, cmd: &str) -> CoreResult<(i32, String, String)> {
+        close_in_background(self.state.take_streams(|_| true));
         self.execute_remote_command(cmd.to_string()).await
     }
 
@@ -3128,6 +3463,7 @@ impl VirtualFileSystem for SftpDriver {
         cmd: &str,
         timeout: Duration,
     ) -> CoreResult<(i32, String, String)> {
+        close_in_background(self.state.take_streams(|_| true));
         self.execute_remote_command_with_timeout(cmd.to_string(), timeout)
             .await
     }

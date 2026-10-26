@@ -2,6 +2,29 @@ use crate::types::{CoreResult, FileEntry, FileSystemInfo, FindFileMatch, FindFil
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// One sequential pass over a file: a download or upload done as consecutive
+/// [`read_range_in`](VirtualFileSystem::read_range_in) or
+/// [`write_at_in`](VirtualFileSystem::write_at_in) calls. A driver may keep the file
+/// open from one call of a stream to the next (no open and close per chunk). Every
+/// stream is ended with [`finish_stream`](VirtualFileSystem::finish_stream), or with
+/// [`abandon_stream`](VirtualFileSystem::abandon_stream) after a failure or cancel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StreamId(u64);
+
+impl StreamId {
+    pub fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl Default for StreamId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Universal Virtual File System Trait
 /// Implemented by Local, SFTP, S3, FTP, WebDAV drivers.
@@ -40,6 +63,41 @@ pub trait VirtualFileSystem: Send + Sync + Debug {
             "positional write unsupported".to_string(),
         ))
     }
+
+    /// [`read_range`](Self::read_range) as the next step of `stream`.
+    async fn read_range_in(
+        &self,
+        _stream: StreamId,
+        path: &str,
+        offset: u64,
+        length: u64,
+    ) -> CoreResult<Bytes> {
+        self.read_range(path, offset, length).await
+    }
+
+    /// [`write_at`](Self::write_at) as the next step of `stream`. The data is
+    /// written when this returns; the file is complete once
+    /// [`finish_stream`](Self::finish_stream) succeeds.
+    async fn write_at_in(
+        &self,
+        _stream: StreamId,
+        path: &str,
+        offset: u64,
+        data: Bytes,
+    ) -> CoreResult<()> {
+        self.write_at(path, offset, data).await
+    }
+
+    /// End `stream` after its last step: what it kept open is closed, and a close
+    /// that fails is an error (some servers only store a written file once it is
+    /// closed).
+    async fn finish_stream(&self, _stream: StreamId) -> CoreResult<()> {
+        Ok(())
+    }
+
+    /// End `stream` after a failure or cancel: what it kept open is closed in the
+    /// background.
+    async fn abandon_stream(&self, _stream: StreamId) {}
 
     /// Create directory (creates parents if missing)
     async fn create_dir(&self, path: &str) -> CoreResult<()>;

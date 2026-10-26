@@ -55,7 +55,7 @@ const MAX_OUT_PACKET: usize = 256 * 1024 - 1024;
 /// Largest file handle accepted (OpenSSH uses 4 bytes; the spec allows 256).
 const MAX_HANDLE: usize = 4096;
 
-const READ_CHUNK: u32 = 32 * 1024;
+pub(crate) const READ_CHUNK: u32 = 32 * 1024;
 /// Read requests in flight per file: 8 MiB, the same as libssh2's read-ahead.
 const MAX_READS_IN_FLIGHT: usize = 256;
 const WRITE_CHUNK: usize = 32 * 1024;
@@ -798,11 +798,13 @@ impl Inner {
         if self.is_broken() {
             return;
         }
+        let _ = self.close_handle_checked(handle);
+    }
+
+    fn close_handle_checked(&self, handle: &[u8]) -> Result<(), ssh2::Error> {
         let mut h = Vec::with_capacity(handle.len() + 4);
         put_str(&mut h, handle);
-        if let Ok(reply) = self.request(FXP_CLOSE, &[&h]) {
-            let _ = reply.expect_ok();
-        }
+        self.request(FXP_CLOSE, &[&h])?.expect_ok()
     }
 }
 
@@ -1167,6 +1169,8 @@ pub(crate) struct ExecFile {
     stash_pos: usize,
     stash_end: usize,
     eof: bool,
+    /// Closed by [`close`](Self::close): nothing left to close on drop.
+    closed: bool,
 }
 
 impl ExecFile {
@@ -1184,7 +1188,16 @@ impl ExecFile {
             stash_pos: 0,
             stash_end: 0,
             eof: false,
+            closed: false,
         }
+    }
+
+    /// Close the file and report the server's answer (dropping it closes it
+    /// without one).
+    pub(crate) fn close(mut self) -> Result<(), ssh2::Error> {
+        self.reset_read_ahead();
+        self.closed = true;
+        self.inner.close_handle_checked(&self.handle)
     }
 
     pub(crate) fn stat(&mut self) -> Result<FileStat, ssh2::Error> {
@@ -1410,6 +1423,9 @@ impl Seek for ExecFile {
 
 impl Drop for ExecFile {
     fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
         self.reset_read_ahead();
         self.inner.close_handle(&self.handle);
     }

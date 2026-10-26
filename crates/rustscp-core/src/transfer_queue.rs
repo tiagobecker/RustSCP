@@ -28,7 +28,7 @@
 
 use crate::shell::sh_quote;
 use crate::types::{CoreError, CoreResult, FileEntry, FileType, Protocol, TransferStatus};
-use crate::vfs::VirtualFileSystem;
+use crate::vfs::{StreamId, VirtualFileSystem};
 use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1002,105 +1002,34 @@ impl Job {
         expected: u64,
         owned: bool,
     ) -> Result<(), CopyError> {
-        let (min_chunk, max_chunk) = self.chunk_range;
-        let mut chunk = min_chunk;
-        let mut offset = 0u64;
-        let mut wrote_any = false;
-
-        if expected == 0 {
-            if let Err(e) = self.dst.write_at(target, 0, Bytes::new()).await {
-                if owned {
-                    self.discard_partial(target).await;
-                }
-                return Err(CopyError::Failed(format!(
-                    "Cannot create '{}': {}",
-                    shown_as, e
-                )));
+        // The drivers may keep both files open from one chunk to the next; both
+        // streams are ended before the size check, the rename or a cleanup.
+        let (read, write) = (StreamId::new(), StreamId::new());
+        let copied = self
+            .stream_chunks(source_path, target, shown_as, expected, owned, read, write)
+            .await;
+        let copied = match copied {
+            Ok(()) => {
+                let _ = self.src.finish_stream(read).await;
+                // Some servers only store a written file once it is closed.
+                self.dst.finish_stream(write).await.map_err(|e| {
+                    (
+                        CopyError::Failed(format!("Write failed for '{}': {}", shown_as, e)),
+                        true,
+                    )
+                })
             }
-            wrote_any = true;
-        }
-
-        while offset < expected {
-            if self.is_cancelled().await {
-                if owned || wrote_any {
-                    self.discard_partial(target).await;
-                }
-                return Err(CopyError::Cancelled);
+            Err(failed) => {
+                self.src.abandon_stream(read).await;
+                let _ = self.dst.finish_stream(write).await;
+                Err(failed)
             }
-
-            let want = chunk.min(expected - offset);
-            let step_started = Instant::now();
-            let data = match self.src.read_range(source_path, offset, want).await {
-                Ok(d) => d,
-                Err(e) if offset == 0 => {
-                    // Driver without ranged reads: read the whole file once.
-                    match self.src.read_file(source_path).await {
-                        Ok(all) if all.len() as u64 == expected => all,
-                        other => {
-                            if owned {
-                                self.discard_partial(target).await;
-                            }
-                            return Err(CopyError::Failed(match other {
-                                Ok(all) => format!(
-                                    "The source changed during the transfer ({} bytes expected, {} read)",
-                                    expected,
-                                    all.len()
-                                ),
-                                Err(_) => format!("Read failed for '{}': {}", source_path, e),
-                            }));
-                        }
-                    }
-                }
-                Err(e) => {
-                    if owned || wrote_any {
-                        self.discard_partial(target).await;
-                    }
-                    return Err(CopyError::Failed(format!(
-                        "Read failed at byte {} of '{}': {}",
-                        offset, source_path, e
-                    )));
-                }
-            };
-
-            if data.is_empty() {
-                if owned || wrote_any {
-                    self.discard_partial(target).await;
-                }
-                return Err(CopyError::Failed(format!(
-                    "'{}' ended after {} of {} bytes (was it changed during the transfer?)",
-                    source_path, offset, expected
-                )));
+        };
+        if let Err((e, discard)) = copied {
+            if discard {
+                self.discard_partial(target).await;
             }
-            let data = if data.len() as u64 > expected - offset {
-                data.slice(..(expected - offset) as usize)
-            } else {
-                data
-            };
-            let n = data.len() as u64;
-
-            if let Err(e) = self.dst.write_at(target, offset, data).await {
-                // Only remove what this task owns or wrote: if the first
-                // write into an existing file fails (e.g. it is read-only),
-                // that file is left alone.
-                if owned || wrote_any {
-                    self.discard_partial(target).await;
-                }
-                return Err(CopyError::Failed(format!(
-                    "Write failed at byte {} of '{}': {}",
-                    offset, shown_as, e
-                )));
-            }
-            wrote_any = true;
-
-            offset += n;
-            self.add_progress(n).await;
-
-            let took = step_started.elapsed();
-            if took < Duration::from_millis(500) {
-                chunk = (chunk.saturating_mul(2)).min(max_chunk);
-            } else if took > Duration::from_secs(2) {
-                chunk = (chunk / 2).max(min_chunk);
-            }
+            return Err(e);
         }
 
         match self.dst.metadata(target).await {
@@ -1124,6 +1053,122 @@ impl Job {
         }
     }
 
+    /// The chunk loop of [`stream_verified`](Self::stream_verified). An error
+    /// says whether `target` is to be removed.
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_chunks(
+        &mut self,
+        source_path: &str,
+        target: &str,
+        shown_as: &str,
+        expected: u64,
+        owned: bool,
+        read: StreamId,
+        write: StreamId,
+    ) -> Result<(), (CopyError, bool)> {
+        let (min_chunk, max_chunk) = self.chunk_range;
+        let mut chunk = min_chunk;
+        let mut offset = 0u64;
+        let mut wrote_any = false;
+
+        if expected == 0 {
+            if let Err(e) = self.dst.write_at(target, 0, Bytes::new()).await {
+                return Err((
+                    CopyError::Failed(format!("Cannot create '{}': {}", shown_as, e)),
+                    owned,
+                ));
+            }
+            wrote_any = true;
+        }
+
+        while offset < expected {
+            if self.is_cancelled().await {
+                return Err((CopyError::Cancelled, owned || wrote_any));
+            }
+
+            let want = chunk.min(expected - offset);
+            let step_started = Instant::now();
+            let data = match self
+                .src
+                .read_range_in(read, source_path, offset, want)
+                .await
+            {
+                Ok(d) => d,
+                Err(e) if offset == 0 => {
+                    // Driver without ranged reads: read the whole file once.
+                    match self.src.read_file(source_path).await {
+                        Ok(all) if all.len() as u64 == expected => all,
+                        other => {
+                            return Err((
+                                CopyError::Failed(match other {
+                                    Ok(all) => format!(
+                                        "The source changed during the transfer ({} bytes expected, {} read)",
+                                        expected,
+                                        all.len()
+                                    ),
+                                    Err(_) => {
+                                        format!("Read failed for '{}': {}", source_path, e)
+                                    }
+                                }),
+                                owned,
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err((
+                        CopyError::Failed(format!(
+                            "Read failed at byte {} of '{}': {}",
+                            offset, source_path, e
+                        )),
+                        owned || wrote_any,
+                    ));
+                }
+            };
+
+            if data.is_empty() {
+                return Err((
+                    CopyError::Failed(format!(
+                        "'{}' ended after {} of {} bytes (was it changed during the transfer?)",
+                        source_path, offset, expected
+                    )),
+                    owned || wrote_any,
+                ));
+            }
+            let data = if data.len() as u64 > expected - offset {
+                data.slice(..(expected - offset) as usize)
+            } else {
+                data
+            };
+            let n = data.len() as u64;
+
+            if let Err(e) = self.dst.write_at_in(write, target, offset, data).await {
+                // Only remove what this task owns or wrote: if the first
+                // write into an existing file fails (e.g. it is read-only),
+                // that file is left alone.
+                return Err((
+                    CopyError::Failed(format!(
+                        "Write failed at byte {} of '{}': {}",
+                        offset, shown_as, e
+                    )),
+                    owned || wrote_any,
+                ));
+            }
+            wrote_any = true;
+
+            offset += n;
+            self.add_progress(n).await;
+
+            let took = step_started.elapsed();
+            if took < Duration::from_millis(500) {
+                chunk = (chunk.saturating_mul(2)).min(max_chunk);
+            } else if took > Duration::from_secs(2) {
+                chunk = (chunk / 2).max(min_chunk);
+            }
+        }
+        Ok(())
+    }
+
     /// Whole-file destinations (S3, FTP): read everything, write once, check.
     async fn copy_file_whole(
         &mut self,
@@ -1137,6 +1182,49 @@ impl Job {
             self.check_not_same_file(source_path, dest_path, None)
                 .await?;
         }
+        let read = StreamId::new();
+        let collected = self.read_chunks(source_path, expected, read).await;
+        match &collected {
+            Ok(_) => {
+                let _ = self.src.finish_stream(read).await;
+            }
+            Err(_) => self.src.abandon_stream(read).await,
+        }
+        let buf = collected?;
+
+        if self.is_cancelled().await {
+            return Err(CopyError::Cancelled);
+        }
+        if let Err(e) = self.dst.write_file(dest_path, buf.freeze()).await {
+            return Err(CopyError::Failed(format!(
+                "Write failed for '{}': {}",
+                dest_path, e
+            )));
+        }
+        match self.dst.metadata(dest_path).await {
+            Ok(m) if m.size == expected => Ok(()),
+            Ok(m) => {
+                self.discard_partial(dest_path).await;
+                Err(CopyError::Failed(format!(
+                    "Size check failed for '{}': {} bytes expected, {} written",
+                    dest_path, expected, m.size
+                )))
+            }
+            Err(e) => Err(CopyError::Failed(format!(
+                "Could not verify '{}' after writing it: {}",
+                dest_path, e
+            ))),
+        }
+    }
+
+    /// The source of [`copy_file_whole`](Self::copy_file_whole), read chunk by
+    /// chunk as `read`.
+    async fn read_chunks(
+        &mut self,
+        source_path: &str,
+        expected: u64,
+        read: StreamId,
+    ) -> Result<BytesMut, CopyError> {
         let (min_chunk, max_chunk) = self.chunk_range;
         let mut chunk = min_chunk;
         let mut offset = 0u64;
@@ -1148,7 +1236,11 @@ impl Job {
             }
             let want = chunk.min(expected - offset);
             let step_started = Instant::now();
-            let data = match self.src.read_range(source_path, offset, want).await {
+            let data = match self
+                .src
+                .read_range_in(read, source_path, offset, want)
+                .await
+            {
                 Ok(d) => d,
                 Err(e) if offset == 0 => match self.src.read_file(source_path).await {
                     Ok(all) if all.len() as u64 == expected => all,
@@ -1196,30 +1288,7 @@ impl Job {
                 chunk = (chunk / 2).max(min_chunk);
             }
         }
-
-        if self.is_cancelled().await {
-            return Err(CopyError::Cancelled);
-        }
-        if let Err(e) = self.dst.write_file(dest_path, buf.freeze()).await {
-            return Err(CopyError::Failed(format!(
-                "Write failed for '{}': {}",
-                dest_path, e
-            )));
-        }
-        match self.dst.metadata(dest_path).await {
-            Ok(m) if m.size == expected => Ok(()),
-            Ok(m) => {
-                self.discard_partial(dest_path).await;
-                Err(CopyError::Failed(format!(
-                    "Size check failed for '{}': {} bytes expected, {} written",
-                    dest_path, expected, m.size
-                )))
-            }
-            Err(e) => Err(CopyError::Failed(format!(
-                "Could not verify '{}' after writing it: {}",
-                dest_path, e
-            ))),
-        }
+        Ok(buf)
     }
 
     /// Copy one file and verify the result.
