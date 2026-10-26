@@ -11,6 +11,7 @@ import { Button } from '../ui/controls.tsx';
  * - `folder`: a folder with contents (or a selection holding one): [Delete everything] or the
  *   default [Keep connections], which lifts the contents one level.
  * - `merge`: a rename or move clashes with a folder of the same name: [Merge].
+ * - `copy`: an ⌥/Alt drop that would copy more than 50 connections: [Copy N].
  */
 export type DeleteRequest =
   | { kind: 'items'; count: number; sitesOnly: boolean }
@@ -29,9 +30,10 @@ export type DeleteRequest =
       /** The folders sit in different places: their contents each go one level up */
       mixedParents?: boolean;
     }
-  | { kind: 'merge'; name: string; parent: string | null; sites: number };
+  | { kind: 'merge'; name: string; parent: string | null; sites: number }
+  | { kind: 'copy'; connections: number };
 
-export type DeleteChoice = 'delete' | 'keep' | 'merge';
+export type DeleteChoice = 'delete' | 'keep' | 'merge' | 'copy';
 
 interface Props {
   request: DeleteRequest;
@@ -126,6 +128,22 @@ export const DeleteItemsDialog: React.FC<Props> = ({ request, onChoose, onCancel
         <p className="text-[11.5px] text-ink-faint text-right">{hint}</p>
       </div>
     );
+  } else if (request.kind === 'copy') {
+    const formatted = nf.format(request.connections);
+    title = t('siteTree.copyConfirmTitle', { count: request.connections, formatted, defaultValue_one: 'Copy 1 connection?', defaultValue_other: 'Copy {{formatted}} connections?' });
+    body = (
+      <p className="text-[13px] text-ink-muted leading-relaxed">
+        {t('siteTree.copyConfirmBody', 'Each copy keeps its saved sign-in. You can undo right after.')}
+      </p>
+    );
+    footer = (
+      <>
+        {cancel}
+        <Button ref={primaryRef} variant="primary" onClick={() => choose('copy')}>
+          {t('siteTree.copyCount', { formatted, defaultValue: 'Copy {{formatted}}' })}
+        </Button>
+      </>
+    );
   } else {
     title = t('siteTree.mergeTitle', 'Merge folders?');
     body = (
@@ -155,7 +173,7 @@ export const DeleteItemsDialog: React.FC<Props> = ({ request, onChoose, onCancel
       onClose={onCancel}
       size="md"
       title={title}
-      icon={request.kind === 'merge' ? undefined : <AlertTriangle className="w-[18px] h-[18px] text-red-600 dark:text-red-400" aria-hidden="true" />}
+      icon={request.kind === 'merge' || request.kind === 'copy' ? undefined : <AlertTriangle className="w-[18px] h-[18px] text-red-600 dark:text-red-400" aria-hidden="true" />}
       initialFocusRef={primaryRef}
       footer={footer}
     >

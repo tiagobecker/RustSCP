@@ -247,6 +247,11 @@
   .stree-row[data-cut] {
     @apply opacity-50;
   }
+  /* The drop target folder's contents during a drag */
+  [role='tree'] .stree-row[data-drop-block],
+  [role='tree']:focus-within .stree-row[data-drop-block] {
+    @apply bg-dark-650/30;
+  }
   [role='tree'] .stree-row[data-drop-target],
   [role='tree']:focus-within .stree-row[data-drop-target] {
     @apply bg-rust-500/10;
@@ -344,6 +349,23 @@
   [role='tree'] {
     scroll-behavior: auto !important;
   }
+}
+
+/* While a row of the connections tree is dragged (useTreeDrag): one cursor for the whole window
+   (rows set their own), no text selection; not-allowed over a target that refuses the drop. */
+html[data-stree-drag],
+html[data-stree-drag] * {
+  cursor: grabbing !important;
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}
+html[data-stree-drag='copy'],
+html[data-stree-drag='copy'] * {
+  cursor: copy !important;
+}
+html[data-stree-drag='none'],
+html[data-stree-drag='none'] * {
+  cursor: not-allowed !important;
 }
 
 /* Forced colours (Windows high contrast): selection, guides and focus stay visible in system colours.

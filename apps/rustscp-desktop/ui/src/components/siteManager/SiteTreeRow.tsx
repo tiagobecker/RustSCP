@@ -19,6 +19,7 @@ import {
 } from 'lucide-react';
 import type { ConnectionConfig } from '../../types.ts';
 import { plainTextInputProps } from '../../utils/inputHardening.ts';
+import { SPRING_DELAY_MS } from '../../utils/tabDragManager.ts';
 import { matchRanges } from './siteQuery.ts';
 import { canonicalProtocol, formatCount, isLocalSite, protocolTag, rowIndent, siteAddress } from './siteTreeModel.ts';
 import type { TreeRow } from './types.ts';
@@ -104,6 +105,14 @@ export interface SiteTreeRowProps {
   anyExpanded: boolean;
   /** Set only on the row being renamed or named (new folder) */
   edit: RowEditState | null;
+  /** Marked by ⌘X (50% opacity until pasted or Escape) */
+  cut?: boolean;
+  /** The drop target under a drag */
+  dropTarget?: boolean;
+  /** Inside the drop target folder (a lighter tint) */
+  dropBlock?: boolean;
+  /** A collapsed folder about to spring open during a drag (its bar fills) */
+  springing?: boolean;
 }
 
 /** Inline name editor (rename, new folder), with the error bubble under it. */
@@ -170,6 +179,10 @@ export const SiteTreeRow = memo(function SiteTreeRow({
   addressTerms,
   anyExpanded,
   edit,
+  cut,
+  dropTarget,
+  dropBlock,
+  springing,
 }: SiteTreeRowProps) {
   const { t, i18n } = useTranslation();
   const lang = i18n.language;
@@ -192,6 +205,9 @@ export const SiteTreeRow = memo(function SiteTreeRow({
     'data-row-key': row.key,
     'data-row-index': index,
     'data-active': active ? '' : undefined,
+    'data-cut': cut ? '' : undefined,
+    'data-drop-target': dropTarget ? '' : undefined,
+    'data-drop-block': dropBlock && !dropTarget ? '' : undefined,
   };
   const style: React.CSSProperties = { top, height, paddingLeft: row.kind === 'section' ? 10 : rowIndent(depth) };
   const rowClass = 'stree-row group absolute inset-x-0 flex items-center pr-2 cursor-default select-none';
@@ -283,6 +299,13 @@ export const SiteTreeRow = memo(function SiteTreeRow({
             )}
             <span className="ml-1 flex">{moreButton}</span>
           </>
+        )}
+        {springing && (
+          <span
+            aria-hidden
+            className="absolute left-1.5 right-1.5 bottom-0 h-0.5 rounded-full bg-rust-500 animate-spring-fill pointer-events-none"
+            style={{ animationDuration: `${SPRING_DELAY_MS}ms` }}
+          />
         )}
       </div>
     );

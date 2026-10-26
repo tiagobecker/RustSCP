@@ -56,6 +56,8 @@ import {
   sitesInside,
 } from './siteTreeModel.ts';
 import type { FolderNameProblem, MovePlan } from './siteTreeModel.ts';
+import { checkDrop, commonParent, dragPayload, planCopies } from './treeDragModel.ts';
+import type { CopyNames, DragPayload, DropSpot } from './treeDragModel.ts';
 import type { FolderNode, SectionId, SiteTreeOp, TreeRow } from './types.ts';
 import type { SiteTreeController } from './useSiteTree.ts';
 import { canonicalKey, isItemRow, paneFor, rangeKeys, selectedItems, useTreeSelection } from './useTreeSelection.ts';
@@ -110,6 +112,9 @@ export type PaneMode = 'form' | 'folder' | 'selection';
 
 const EMPTY_SET: ReadonlySet<string> = new Set();
 const EMPTY_TERMS: readonly string[] = [];
+
+/** An ⌥/Alt drop that copies more connections than this asks first */
+const COPY_ASK_ABOVE = 50;
 
 const WIDTH_KEY = 'rustscp_site_sidebar_width';
 const WIDTH_DEFAULT = 300;
@@ -217,6 +222,8 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   const [deleteReq, setDeleteReq] = useState<{ request: DeleteRequest; run: (choice: DeleteChoice) => void } | null>(null);
   const [moveReq, setMoveReq] = useState<MoveRequest | null>(null);
   const [showTips, setShowTips] = useState(false);
+  /** Items marked by ⌘X (canonical keys), kept in memory only until ⌘V or Escape */
+  const [cutKeys, setCutKeys] = useState<ReadonlySet<string>>(EMPTY_SET);
   /** The folder overview's escape layer (reverts an edited name) */
   const paneEscapeRef = useRef<(() => boolean) | null>(null);
   const [width, setWidth] = useState(() => {
@@ -231,6 +238,12 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   const pendingReveal = useRef<Set<string> | null>(null);
   /** A rename asked for before its row exists (a collapsed folder) */
   const pendingRename = useRef<string | null>(null);
+  /** A row to scroll to once the rows change (after a move the row's old place is still shown); short-lived */
+  const scrollAfterChange = useRef<{ key: string; until: number } | null>(null);
+  const scrollWhenShown = (key: string, now: boolean) => {
+    scrollAfterChange.current = { key, until: Date.now() + 1500 };
+    if (now) treeRef.current?.scrollToKey(key);
+  };
   /** The next form change must not move the selection (it follows a delete) */
   const suppressFollow = useRef(false);
 
@@ -367,6 +380,11 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
         selection.selectOnly(row.key);
         treeRef.current?.scrollToKey(row.key, 'start');
       }
+    }
+    const after = scrollAfterChange.current;
+    if (after && (Date.now() > after.until || indexByKey.has(after.key))) {
+      scrollAfterChange.current = null;
+      if (Date.now() <= after.until) treeRef.current?.scrollToKey(after.key);
     }
     const key = pendingRename.current;
     if (key && indexByKey.has(key)) {
@@ -683,6 +701,87 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     }
   };
 
+  const copyNames: CopyNames = {
+    first: (name) => t('siteTree.copyName', { name, defaultValue: '{{name}} copy' }),
+    nth: (name, n) => t('siteTree.copyNameN', { name, n, defaultValue: '{{name}} copy {{n}}' }),
+  };
+
+  /** Toast / announcement for copies into `target` (an ⌥/Alt drop). */
+  const copiedTitle = (count: number, name: string, target: string): string => {
+    const formatted = formatCount(lang, count);
+    const folder = target.split('/').join(' / ');
+    if (count === 1) {
+      return target
+        ? t('siteTree.copiedOne', { name, folder, defaultValue: 'Copied “{{name}}” to “{{folder}}”' })
+        : t('siteTree.copiedOneTop', { name, defaultValue: 'Copied “{{name}}” to the top level' });
+    }
+    return target
+      ? t('siteTree.copiedItems', { count, formatted, folder, defaultValue_one: 'Copied 1 item to “{{folder}}”', defaultValue_other: 'Copied {{formatted}} items to “{{folder}}”' })
+      : t('siteTree.copiedTop', { count, formatted, defaultValue_one: 'Copied 1 item to the top level', defaultValue_other: 'Copied {{formatted}} items to the top level' });
+  };
+
+  /**
+   * Copies items as one batch: into `target` (an ⌥/Alt drop; above 50 connections it asks first),
+   * or each next to itself when `target` is null (Duplicate, folders included). Copies run on the
+   * backend (it holds the secrets); the copies end up selected.
+   */
+  const runCopies = async (keys: string[], target: string | null, confirmed = false) => {
+    const plan = planCopies(model, keys, target, copyNames);
+    const failed = (text: string) => notify.error(t('siteTree.opFailed', "Couldn't update connections"), text);
+    if (plan.intoSelf) return failed(t('siteTree.errIntoSelf', "A folder can't go inside itself."));
+    if (plan.tooLong) return failed(t('siteTree.errPathTooLong', 'This path would be longer than 255 characters.'));
+    if (plan.ops.length === 0) return;
+    if (target !== null && !confirmed && plan.connections > COPY_ASK_ABOVE) {
+      setDeleteReq({
+        request: { kind: 'copy', connections: plan.connections },
+        run: (choice) => {
+          setDeleteReq(null);
+          if (choice === 'copy') void runCopies(keys, target, true);
+        },
+      });
+      return;
+    }
+    const count = plan.siteItems.length + plan.folders.length;
+    const firstName = plan.siteItems.length ? model.sitesById.get(plan.siteItems[0].id)?.name ?? '' : baseName(plan.folders[0].from);
+    const res = await tree.run(plan.ops, { errorParams: plan.folders.length ? { name: baseName(plan.folders[0].to) } : undefined });
+    if (!res) return;
+    // `created` lists the copy_sites copies first, in item order
+    const siteCopies = res.created
+      .slice(0, plan.siteItems.length)
+      .map((c) => res.sites.find((x) => x.id === c.id))
+      .filter((x): x is ConnectionConfig => !!x);
+    const copies = [...plan.folders.map((f) => folderKey(f.to)), ...siteCopies.map((x) => siteKey(x.id))];
+    if (copies.length === 0) return;
+    if (target !== null) expandChain(target);
+    if (copies.length === 1 && siteCopies.length === 1) {
+      // One copied site is selected (and shown in the form unless it has unsaved edits)
+      if (formDirtyRef.current) selection.selectOnly(copies[0]);
+      else onSelectSite(siteCopies[0]);
+    } else {
+      selection.selectKeys(copies);
+    }
+    // The copies may already be rows (the result came back), or show with the next render
+    scrollWhenShown(copies[0], true);
+    if (target !== null) {
+      const title = copiedTitle(count, firstName, target);
+      if (res.undo_token) tree.toastWithUndo({ title, token: res.undo_token });
+      announce(title);
+    } else {
+      announce(
+        count === 1 && plan.folders.length === 1
+          ? t('siteTree.duplicatedFolder', { name: baseName(plan.folders[0].from), defaultValue: 'Duplicated folder “{{name}}”' })
+          : t('siteTree.duplicatedItems', { count, formatted: formatCount(lang, count), defaultValue_one: 'Duplicated 1 item', defaultValue_other: 'Duplicated {{formatted}} items' })
+      );
+    }
+  };
+
+  /** Duplicate (⇧⌘D, the menus): sites next to themselves; folders with everything inside (copy_folder). */
+  const duplicate = (keys: string[]) => {
+    const items = resolveItems(model, keys);
+    if (items.folders.length === 0) void duplicateSites(items.sites);
+    else void runCopies(keys, null);
+  };
+
   const deleteItems = (keys: string[]) => {
     const sites: ConnectionConfig[] = [];
     const folders: FolderNode[] = [];
@@ -920,7 +1019,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     expandChain(target);
     if (moved.length > 0) {
       selection.selectKeys(moved, moved[0], moved[0]);
-      treeRef.current?.scrollToKey(moved[0]);
+      scrollWhenShown(moved[0], false);
     }
     void tree.run(plan.ops).then((res) => {
       if (!res?.undo_token) return;
@@ -928,6 +1027,129 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
       tree.toastWithUndo({ title, token: res.undo_token });
       announce(title);
     });
+  };
+
+  /* ------------------------- cut / paste, new folder with ------------------------- */
+
+  /** ⌘X: marks the items (rows at 50% opacity) until ⌘V moves them or Escape clears the marks. */
+  const cutItems = (keys: string[]) => {
+    const payload = dragPayload(model, keys);
+    if (!payload) return;
+    setCutKeys(new Set(payload.keys));
+    announce(
+      t('siteTree.a11yCut', {
+        count: payload.count,
+        formatted: formatCount(lang, payload.count),
+        shortcut: shortcutLabels(mac).paste,
+        defaultValue_one: 'Cut 1 item. Select a folder and press {{shortcut}} to move it.',
+        defaultValue_other: 'Cut {{formatted}} items. Select a folder and press {{shortcut}} to move them.',
+      })
+    );
+  };
+
+  /** ⌘V / Paste: moves the cut items into `folder` (one undoable batch, like Move to…). */
+  const pasteInto = (folder: string) => {
+    const payload = dragPayload(model, cutKeys);
+    if (!payload) {
+      setCutKeys(EMPTY_SET);
+      return;
+    }
+    if (checkDrop(payload, folder, false) === 'into_self') {
+      // The marks stay, so another folder can be picked
+      notify.error(t('siteTree.opFailed', "Couldn't update connections"), t('siteTree.errIntoSelf', "A folder can't go inside itself."));
+      return;
+    }
+    setCutKeys(EMPTY_SET);
+    runMove(payload.keys, folder, false);
+  };
+
+  /**
+   * ⌃⌘N (Ctrl+Alt+N), menus A and D: one batch in the items' common parent (`create_folder` plus
+   * the moves), so one ⌘Z undoes it; then the new folder's name is edited in place.
+   */
+  const newFolderWithItems = (keys: string[], merge = false) => {
+    const { looseSites, folders } = resolveItems(model, keys);
+    const count = looseSites.length + folders.length;
+    if (count === 0) return;
+    const parent = commonParent(model, keys);
+    const name = pickFreeName(t('siteTree.newFolder', 'New folder'), childFolderNames(model, parent), (n) => t('siteTree.newFolderN', { n, defaultValue: 'New folder {{n}}' }));
+    const path = joinPath(parent, name);
+    const plan = planMove(model, keys, path, { merge, createTarget: true });
+    if (plan.tooLong) {
+      notify.error(t('siteTree.opFailed', "Couldn't update connections"), t('siteTree.errPathTooLong', 'This path would be longer than 255 characters.'));
+      return;
+    }
+    if (plan.clashes.length > 0 && !merge) {
+      // Two of the folders share a name: they merge in the new folder (after asking)
+      const sites = plan.clashes.reduce((n, c) => n + (model.folders.get(c.path)?.count ?? 0), 0);
+      setDeleteReq({
+        request: { kind: 'merge', name: baseName(plan.clashes[0].existing), parent: path.split('/').join(' / '), sites },
+        run: (choice) => {
+          setDeleteReq(null);
+          if (choice === 'merge') newFolderWithItems(keys, true);
+        },
+      });
+      return;
+    }
+    if (plan.ops.length === 0) return;
+    selection.selectOnly(folderKey(path));
+    void tree.run(plan.ops, { errorParams: { name } }).then((res) => {
+      if (res) {
+        announce(
+          t('siteTree.a11yFolderCreatedWith', {
+            name,
+            count,
+            formatted: formatCount(lang, count),
+            defaultValue_one: 'Folder “{{name}}” created with 1 item',
+            defaultValue_other: 'Folder “{{name}}” created with {{formatted}} items',
+          })
+        );
+      }
+    });
+    // The folder shows at once (the batch is applied locally first); its name is edited then
+    startRenameByKey(folderKey(path));
+  };
+
+  /* ------------------------------ drag and drop ------------------------------ */
+
+  /** What a drag from this row carries: the selection when the row is in it, else the row alone. Never Local. */
+  const dragPayloadFor = (row: TreeRow): DragPayload | null => {
+    if (row.kind !== 'site' && row.kind !== 'folder') return null;
+    if (row.kind === 'site' && isLocalSite(row.site)) return null;
+    const s = selection.stateRef.current;
+    return dragPayload(model, s.keys.has(row.key) ? selectedItems(s.keys) : [canonicalKey(row.key)]);
+  };
+
+  /** Spring-loading (and folding back) during a drag; while searching, the search's own collapsed set. */
+  const dragExpand = (paths: string[], expanded: boolean) => {
+    if (paths.length === 0) return;
+    updateCollapsed((prev) => {
+      let changed = false;
+      const next = new Set(prev);
+      for (const p of paths) {
+        if (expanded ? next.delete(p) : !next.has(p) && !!next.add(p)) changed = true;
+      }
+      return changed ? next : prev;
+    });
+  };
+
+  const dragHover = (spot: DropSpot | null, valid: boolean, copy: boolean) => {
+    if (!spot) return;
+    const name = spot.folder ? baseName(spot.folder) : t('siteTree.topLevel', 'Top level');
+    if (!valid) announce(t('siteTree.a11yDragNotHere', "Can't drop here"));
+    else if (copy) announce(t('siteTree.a11yDragCopyOver', { name, defaultValue: 'Over {{name}}. Release to copy.' }));
+    else announce(t('siteTree.a11yDragOver', { name, defaultValue: 'Over {{name}}. Release to move.' }));
+  };
+
+  /** A drop: one batch (a move, or copies with ⌥/Alt). Folders spring-loading opened fold back unless they took it. */
+  const dropItems = (payload: DragPayload, folder: string, copy: boolean, springOpened: string[]) => {
+    const keep = new Set(folderChain(folder));
+    dragExpand(
+      springOpened.filter((p) => !keep.has(p)),
+      false
+    );
+    if (copy) void runCopies(payload.keys, folder);
+    else runMove(payload.keys, folder, false);
   };
 
   /* --------------------------------- menus --------------------------------- */
@@ -941,9 +1163,12 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     copyAddress: (site) => void copySiteAddresses([site]),
     deleteItems,
     moveItems: openMove,
-    duplicateItems: (keys) => void duplicateSites(resolveItems(model, keys).sites),
+    duplicateItems: duplicate,
     copyAddresses: (keys) => void copySiteAddresses(resolveItems(model, keys).sites),
     selectInside,
+    newFolderWith: (keys) => newFolderWithItems(keys),
+    duplicateFolder: (path) => duplicate([folderKey(path)]),
+    paste: cutKeys.size > 0 ? pasteInto : undefined,
     newConnection: (folder) => onNewConnection(folder),
     newFolder: (parent) => startNewFolder(parent),
     renameFolder: (path) => startRenameByKey(folderKey(path)),
@@ -1136,14 +1361,19 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     },
     newConnection: (row) => onNewConnection(folderOfRow(row)),
     newFolder: (row) => startNewFolder(folderOfRow(row)),
-    duplicate: (row) => {
-      // Sites only: a selection holding a folder is not duplicated (folders come with WP6)
-      const items = resolveItems(model, itemsFor(row));
-      if (items.folders.length === 0) void duplicateSites(items.sites);
-    },
+    duplicate: (row) => duplicate(itemsFor(row)),
     copyAddress: (row) => void copySiteAddresses(resolveItems(model, itemsFor(row)).sites),
     remove: (row) => deleteItems(itemsFor(row)),
     focusSearch,
+    cut: (row) => cutItems(itemsFor(row)),
+    paste: (row) => {
+      if (cutKeys.size > 0) pasteInto(folderOfRow(row));
+    },
+    newFolderWith: (row) => newFolderWithItems(itemsFor(row)),
+    dragPayload: dragPayloadFor,
+    dragExpand,
+    dragHover,
+    drop: dropItems,
   };
 
   /* ------------------------------ escape layer ------------------------------ */
@@ -1152,6 +1382,12 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   escapeRef.current = () => {
     if (rename || newFolder) {
       closeEdit();
+      return true;
+    }
+    // A drag, then the cut marks (spec §6, steps 2 and 3)
+    if (treeRef.current?.cancelDrag()) return true;
+    if (cutKeys.size > 0) {
+      setCutKeys(EMPTY_SET);
       return true;
     }
     if (paneEscapeRef.current?.()) return true;
@@ -1262,11 +1498,20 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
 
   /* ------------------------------ sidebar keys ------------------------------ */
 
-  // ⌘N / ⇧⌘N anywhere in the sidebar (the tree handles its own keys first)
+  // ⌘N / ⇧⌘N / ⌃⌘N anywhere in the sidebar (the tree handles its own keys first)
   const onAsideKeyDown = (e: React.KeyboardEvent) => {
     if (e.defaultPrevented) return;
+    const lower = e.key.toLowerCase();
+    const withSelection = mac ? e.metaKey && e.ctrlKey && !e.altKey : e.ctrlKey && e.altKey && !e.metaKey;
+    // Not in the search field: Ctrl+Alt is AltGr on many Windows layouts (AltGr+N types a letter)
+    const inField = (e.target as HTMLElement).closest?.('input, textarea') != null;
+    if (withSelection && !inField && !e.shiftKey && (lower === 'n' || e.code === 'KeyN')) {
+      e.preventDefault();
+      newFolderWithItems(itemsFor(selectedRow()));
+      return;
+    }
     const mod = mac ? e.metaKey : e.ctrlKey;
-    if (!mod || e.altKey || e.key.toLowerCase() !== 'n') return;
+    if (!mod || e.altKey || (mac && e.ctrlKey) || lower !== 'n') return;
     e.preventDefault();
     const row = selectedRow();
     if (e.shiftKey) startNewFolder(folderOfRow(row));
@@ -1518,6 +1763,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
           actionsRef={actionsRef}
           ariaLabel={t('loginDialog.title', 'Connections')}
           describedById={descId}
+          cutKeys={cutKeys}
         />
         {onlyLocal && (
           <div className="absolute inset-x-3 flex flex-col items-center gap-1 text-center" style={{ top: overlayTop }}>

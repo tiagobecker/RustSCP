@@ -1,14 +1,21 @@
 import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef } from 'react';
 import type { MutableRefObject } from 'react';
+import { createPortal } from 'react-dom';
+import { useTranslation } from 'react-i18next';
+import { Folder } from 'lucide-react';
 import { isMacPlatform } from '../fileListUtils.ts';
 import type { MenuAnchor } from '../ui/contextMenuUtils.ts';
 import { useVirtualRows } from '../../utils/useVirtualRows.ts';
 import type { ScrollAlign } from '../../utils/useVirtualRows.ts';
-import { SiteTreeRow } from './SiteTreeRow.tsx';
+import { ProtocolGlyph, SiteTreeRow } from './SiteTreeRow.tsx';
 import type { RowEditState } from './SiteTreeRow.tsx';
-import { isInside, rowFolderPath } from './siteTreeModel.ts';
+import { formatCount, isInside, rowFolderPath } from './siteTreeModel.ts';
+import { inDropBlock } from './treeDragModel.ts';
+import type { DragPayload, DropSpot } from './treeDragModel.ts';
 import type { TreeRow } from './types.ts';
-import { firstChildIndex, moveIndex, parentIndex } from './useTreeSelection.ts';
+import { useTreeDrag } from './useTreeDrag.ts';
+import type { TreeDragHost } from './useTreeDrag.ts';
+import { canonicalKey, firstChildIndex, moveIndex, parentIndex } from './useTreeSelection.ts';
 import type { TreeSelection } from './useTreeSelection.ts';
 
 /** What the tree asks its owner to do (SiteSidebar holds the state and the dialogs). */
@@ -43,6 +50,20 @@ export interface TreeActions {
   remove: (row: TreeRow) => void;
   /** ⌘F, `/`, or a printable key (type-to-search appends it) */
   focusSearch: (append?: string) => void;
+  /** ⌘X: marks the selection (or the row) as cut */
+  cut: (row: TreeRow | null) => void;
+  /** ⌘V: moves the cut items into the row's folder (a site's folder; the top level for none) */
+  paste: (row: TreeRow | null) => void;
+  /** ⌃⌘N (Ctrl+Alt+N): a new folder holding the selection (or the row), then rename */
+  newFolderWith: (row: TreeRow | null) => void;
+  /** Drag and drop: what a drag from this row carries (null: not draggable) */
+  dragPayload: (row: TreeRow) => DragPayload | null;
+  /** Spring-loading opens folders during a drag; folding back closes them */
+  dragExpand: (paths: string[], expanded: boolean) => void;
+  /** The drop target under the pointer changed (live region) */
+  dragHover: (spot: DropSpot | null, valid: boolean, copy: boolean) => void;
+  /** A valid drop: move (or copy, with ⌥/Alt) into `folder` */
+  drop: (payload: DragPayload, folder: string, copy: boolean, springOpened: string[]) => void;
 }
 
 export interface SiteTreeHandle {
@@ -51,6 +72,8 @@ export interface SiteTreeHandle {
   scrollToKey: (key: string, align?: ScrollAlign) => void;
   /** Screen rectangle of a rendered row */
   rowRect: (key: string) => DOMRect | null;
+  /** Cancels a running drag (Escape); true when one was running */
+  cancelDrag: () => boolean;
 }
 
 interface SiteTreeProps {
@@ -69,6 +92,8 @@ interface SiteTreeProps {
   ariaLabel: string;
   /** Id of the hidden "Enter connects, F2 renames…" description */
   describedById: string;
+  /** Canonical item keys marked by ⌘X (shown at 50% opacity) */
+  cutKeys: ReadonlySet<string>;
 }
 
 const isPrintable = (e: React.KeyboardEvent) =>
@@ -76,9 +101,10 @@ const isPrintable = (e: React.KeyboardEvent) =>
 
 /** The virtualized `role="tree"` list: rows, keyboard map and mouse wiring. */
 export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteTree(
-  { rows, indexByKey, rowHeight, compact, showAddress, selection, nameTerms, addressTerms, anyExpanded, edit, actionsRef, ariaLabel, describedById },
+  { rows, indexByKey, rowHeight, compact, showAddress, selection, nameTerms, addressTerms, anyExpanded, edit, actionsRef, ariaLabel, describedById, cutKeys },
   ref
 ) {
+  const { t, i18n } = useTranslation();
   const mac = useMemo(() => isMacPlatform(), []);
   const activeKey = selection.active;
   const activeIndex = activeKey !== null ? indexByKey.get(activeKey) ?? -1 : -1;
@@ -86,6 +112,16 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
   // The row being edited stays rendered like the active one (it usually is the active one)
   const pinIndex = editIndex >= 0 ? editIndex : activeIndex;
   const { scrollRef, onScroll, range, totalHeight, isPinnedOutside, scrollToIndex, pageSize } = useVirtualRows({ count: rows.length, rowHeight, pinIndex });
+
+  // Drag and drop asks the owner through the actions (always the latest ones)
+  const dragHost = useRef<TreeDragHost>({
+    payload: (row) => actionsRef.current.dragPayload(row),
+    setExpanded: (paths, expanded) => actionsRef.current.dragExpand(paths, expanded),
+    hover: (spot, valid, copy) => actionsRef.current.dragHover(spot, valid, copy),
+    drop: (payload, folder, copy, springOpened) => actionsRef.current.drop(payload, folder, copy, springOpened),
+  });
+  const drag = useTreeDrag({ scrollRef, rows, rowHeight, hostRef: dragHost });
+  const dragCancel = drag.cancel;
 
   // Stable DOM ids per row key (folder paths are not valid ids)
   const ids = useRef(new Map<string, number>());
@@ -131,8 +167,9 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
         const el = n === undefined ? null : document.getElementById(`stree-${n}`);
         return el ? el.getBoundingClientRect() : null;
       },
+      cancelDrag: dragCancel,
     }),
-    [scrollRef, scrollToKey]
+    [scrollRef, scrollToKey, dragCancel]
   );
 
   /* ------------------------------- keyboard -------------------------------- */
@@ -274,7 +311,21 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
       default:
         break;
     }
+    // ⌃⌘N (Ctrl+Alt+N elsewhere): new folder with the selection
+    const withSelection = mac ? e.metaKey && e.ctrlKey && !e.altKey : e.ctrlKey && e.altKey && !e.metaKey;
+    if (withSelection && !e.shiftKey && (lower === 'n' || e.code === 'KeyN')) {
+      a.newFolderWith(cur?.row ?? null);
+      return handled();
+    }
     if (mod && !e.altKey) {
+      if (lower === 'x' && !e.shiftKey) {
+        a.cut(cur?.row ?? null);
+        return handled();
+      }
+      if (lower === 'v' && !e.shiftKey) {
+        a.paste(cur?.row ?? null);
+        return handled();
+      }
       if (lower === 'n') {
         if (e.shiftKey) a.newFolder(cur?.row ?? null);
         else a.newConnection(cur?.row ?? null);
@@ -334,7 +385,8 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
   };
 
   const onClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (isInInput(e)) return;
+    // The click that ends a drag selects and opens nothing
+    if (drag.consumeClick() || isInInput(e)) return;
     const hit = rowFromEvent(e);
     if (e.detail <= 1) firstClickKey.current = hit?.row.key ?? null;
     if (!hit) return;
@@ -426,6 +478,7 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
       tabIndex={0}
       onScroll={onScroll}
       onKeyDown={onKeyDown}
+      onPointerDown={drag.onPointerDown}
       onMouseDown={onMouseDown}
       onClick={onClick}
       onDoubleClick={onDoubleClick}
@@ -437,6 +490,7 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
           const row = rows[i];
           const folderPath = rowFolderPath(row);
           const strong = strongLevel >= 0 && row.kind !== 'section' && isInside(folderPath, strongParent) && folderPath !== '' ? strongLevel : -1;
+          const dragView = drag.view;
           return (
             <SiteTreeRow
               key={row.key}
@@ -455,10 +509,44 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
               addressTerms={addressTerms}
               anyExpanded={anyExpanded}
               edit={edit && edit.rowKey === row.key ? edit.state : null}
+              cut={cutKeys.size > 0 && cutKeys.has(canonicalKey(row.key))}
+              dropTarget={dragView.targetKey === row.key}
+              dropBlock={dragView.block !== null && inDropBlock(row, dragView.block)}
+              springing={dragView.springKey === row.key}
             />
           );
         })}
       </div>
+      {drag.view.payload && typeof document !== 'undefined' && createPortal(<DragGhost drag={drag.view} lang={i18n.language} t={t} ghostRef={drag.ghostRef} />, document.body)}
     </div>
   );
 });
+
+/** The card that follows the pointer during a drag: the first item's icon and name (or "3 items"), "+ Copy" with ⌥/Alt. */
+const DragGhost: React.FC<{
+  drag: { payload: DragPayload | null; copy: boolean };
+  lang: string;
+  t: ReturnType<typeof useTranslation>['t'];
+  ghostRef: (el: HTMLElement | null) => void;
+}> = ({ drag, lang, t, ghostRef }) => {
+  const p = drag.payload;
+  if (!p) return null;
+  const label =
+    p.count === 1
+      ? p.first.kind === 'site'
+        ? p.first.site.name
+        : p.first.name
+      : t('siteTree.dragItems', { count: p.count, formatted: formatCount(lang, p.count), defaultValue_one: '1 item', defaultValue_other: '{{formatted}} items' });
+  return (
+    <div
+      ref={ghostRef}
+      aria-hidden
+      style={{ position: 'fixed', left: 0, top: 0, pointerEvents: 'none', zIndex: 200 }}
+      className="ui-card shadow-pop h-7 px-2.5 max-w-[280px] flex items-center gap-2 text-[12.5px] text-ink whitespace-nowrap select-none"
+    >
+      {p.first.kind === 'site' ? <ProtocolGlyph site={p.first.site} className="w-3.5 h-3.5" /> : <Folder aria-hidden className="w-3.5 h-3.5 shrink-0 text-ink-faint" />}
+      <span className="min-w-0 truncate">{label}</span>
+      {drag.copy && <span className="shrink-0 text-[11px] font-medium text-rust-500">{t('siteTree.dragCopy', '+ Copy')}</span>}
+    </div>
+  );
+};

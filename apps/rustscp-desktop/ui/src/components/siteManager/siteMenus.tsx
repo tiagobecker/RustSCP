@@ -4,7 +4,7 @@
  *
  * Menus (spec §5): A one site, B Local, C folder, D several items, E empty area / "All connections"
  * header, the footer's import & export entries and the search field's filter menu. Items of later
- * work packages (favorites, labels, export, paste, sort…) are added by those packages.
+ * work packages (favorites, labels, export, sort…) are added by those packages.
  */
 import React from 'react';
 import type { TFunction } from 'i18next';
@@ -12,6 +12,7 @@ import {
   ArrowDownUp,
   ChevronsDownUp,
   ChevronsUpDown,
+  ClipboardPaste,
   Copy,
   CopyPlus,
   FileKey2,
@@ -44,12 +45,18 @@ export interface MenuActions {
   deleteItems: (keys: string[]) => void;
   /** Opens Move to… for these item keys */
   moveItems: (keys: string[]) => void;
-  /** Duplicates the sites among these item keys */
+  /** Duplicates these items: sites next to themselves ("web-01 copy"), folders with everything inside */
   duplicateItems: (keys: string[]) => void;
   /** Copies the addresses of the sites among these item keys, one per line */
   copyAddresses: (keys: string[]) => void;
   /** Selects every connection inside a folder */
   selectInside: (path: string) => void;
+  /** A new folder holding these items (in their common parent), then rename */
+  newFolderWith: (keys: string[]) => void;
+  /** Copies a folder with everything inside next to it ("Acme copy") */
+  duplicateFolder: (path: string) => void;
+  /** Present while items are cut (⌘X): moves them into `folder` ('' = top level) */
+  paste?: (folder: string) => void;
   newConnection: (folder: string) => void;
   newFolder: (parent: string) => void;
   renameFolder: (path: string) => void;
@@ -87,7 +94,18 @@ export const shortcutLabels = (mac: boolean) => ({
   undo: formatShortcut('Mod+Z', mac),
   moveTo: formatShortcut('Mod+Shift+M', mac),
   connectNow: formatShortcut('Mod+Enter', mac),
+  // ⌃⌘N on macOS; Ctrl+Alt+N elsewhere (Ctrl+Shift+N is New folder)
+  newFolderWith: mac ? formatShortcut('Ctrl+Mod+N', true) : formatShortcut('Ctrl+Alt+N', false),
+  cut: formatShortcut('Mod+X', mac),
+  paste: formatShortcut('Mod+V', mac),
 });
+
+/** "Paste" while items are cut (⌘X), moving them into `folder`. */
+const pasteEntry = (ctx: MenuContext, folder: string): ContextMenuEntry[] => {
+  const paste = ctx.actions.paste;
+  if (!paste) return [];
+  return [{ kind: 'item', id: 'paste', label: ctx.t('siteTree.paste', 'Paste'), icon: icon(ClipboardPaste), shortcut: shortcutLabels(ctx.mac).paste, onSelect: () => paste(folder) }];
+};
 
 /** A. One saved site (not Local). */
 export function siteMenu(site: ConnectionConfig, ctx: MenuContext): ContextMenuEntry[] {
@@ -100,6 +118,14 @@ export function siteMenu(site: ConnectionConfig, ctx: MenuContext): ContextMenuE
     { kind: 'item', id: 'duplicate', label: t('siteTree.duplicate', 'Duplicate'), icon: icon(CopyPlus), shortcut: k.duplicate, onSelect: () => a.duplicate(site) },
     SEP,
     { kind: 'item', id: 'move', label: t('siteTree.moveTo', 'Move to…'), icon: icon(FolderInput), shortcut: k.moveTo, onSelect: () => a.moveItems([`s:${site.id}`]) },
+    {
+      kind: 'item',
+      id: 'new-folder-with',
+      label: t('siteTree.newFolderWithSelection', 'New folder with selection'),
+      icon: icon(FolderPlus),
+      shortcut: k.newFolderWith,
+      onSelect: () => a.newFolderWith([`s:${site.id}`]),
+    },
     SEP,
   ];
   if (a.share) {
@@ -133,6 +159,7 @@ export function folderMenu(node: FolderNode, ctx: MenuContext): ContextMenuEntry
   return [
     { kind: 'item', id: 'new-connection', label: t('siteTree.newConnectionHere', 'New connection here'), icon: icon(Plus), shortcut: k.newConnection, onSelect: () => a.newConnection(node.path) },
     { kind: 'item', id: 'new-folder', label: t('siteTree.newFolderInside', 'New folder inside'), icon: icon(FolderPlus), shortcut: k.newFolder, onSelect: () => a.newFolder(node.path) },
+    ...pasteEntry(ctx, node.path),
     SEP,
     { kind: 'item', id: 'rename', label: t('siteTree.rename', 'Rename'), icon: icon(TextCursorInput), shortcut: k.rename, onSelect: () => a.renameFolder(node.path) },
     SEP,
@@ -163,6 +190,7 @@ export function folderMenu(node: FolderNode, ctx: MenuContext): ContextMenuEntry
     },
     SEP,
     { kind: 'item', id: 'move', label: t('siteTree.moveTo', 'Move to…'), icon: icon(FolderInput), shortcut: k.moveTo, onSelect: () => a.moveItems([`f:${node.path}`]) },
+    { kind: 'item', id: 'duplicate', label: t('siteTree.duplicateFolder', 'Duplicate folder'), icon: icon(CopyPlus), shortcut: k.duplicate, onSelect: () => a.duplicateFolder(node.path) },
     SEP,
     { kind: 'item', id: 'delete', label: t('siteTree.deleteFolder', 'Delete folder…'), icon: icon(Trash2), shortcut: k.delete, danger: true, onSelect: () => a.deleteItems([`f:${node.path}`]) },
   ];
@@ -199,12 +227,21 @@ export function multiMenu(sum: MultiSummary, ctx: MenuContext): ContextMenuEntry
     },
     {
       kind: 'item',
+      id: 'new-folder-with',
+      label: t('siteTree.newFolderWithN', { count, formatted: sum.format(count), defaultValue_one: 'New folder with 1 item', defaultValue_other: 'New folder with {{formatted}} items' }),
+      icon: icon(FolderPlus),
+      shortcut: k.newFolderWith,
+      disabled: count === 0,
+      onSelect: () => a.newFolderWith(sum.keys),
+    },
+    {
+      kind: 'item',
       id: 'duplicate',
       label: t('siteTree.duplicate', 'Duplicate'),
       icon: icon(CopyPlus),
       shortcut: k.duplicate,
-      // Folders are duplicated one at a time (WP6), so a selection holding one is not duplicated
-      disabled: sum.sites === 0 || sum.folders > 0,
+      // Sites with copy_sites, folders with everything inside (copy_folder), in one batch
+      disabled: count === 0,
       onSelect: () => a.duplicateItems(sum.keys),
     },
     { kind: 'item', id: 'copy', label: t('siteTree.copyAddresses', 'Copy addresses'), icon: icon(Copy), shortcut: k.copy, disabled: !sum.hasAddress, onSelect: () => a.copyAddresses(sum.keys) },
@@ -300,6 +337,7 @@ export function emptyAreaMenu(ctx: MenuContext, state: { hasFolders: boolean; an
   const entries: ContextMenuEntry[] = [
     { kind: 'item', id: 'new-connection', label: t('loginDialog.newConnection', 'New connection'), icon: icon(Plus), shortcut: k.newConnection, onSelect: () => a.newConnection('') },
     { kind: 'item', id: 'new-folder', label: t('siteTree.newFolder', 'New folder'), icon: icon(FolderPlus), shortcut: k.newFolder, onSelect: () => a.newFolder('') },
+    ...pasteEntry(ctx, ''),
   ];
   if (state.hasFolders) {
     entries.push(
