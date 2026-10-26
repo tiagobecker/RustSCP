@@ -25,6 +25,11 @@ interface VaultModalProps {
    * caller can show them. The dialog closes right after.
    */
   onViewConnections?: (folders: string[]) => void;
+  /**
+   * Export only these saved sites (the connections tree's Export… on a selection or a folder).
+   * The export tab names them and offers "Export all instead".
+   */
+  exportSiteIds?: string[];
 }
 
 /** What the last WinSCP import saved, shown until the next preview or import. */
@@ -187,8 +192,8 @@ const PasswordInput = React.forwardRef<
 ));
 PasswordInput.displayName = 'PasswordInput';
 
-export const VaultModal = ({ isOpen, onClose, siteCount, onSitesUpdated, initialTab, onViewConnections }: VaultModalProps) => {
-  const { i18n } = useTranslation();
+export const VaultModal = ({ isOpen, onClose, siteCount, onSitesUpdated, initialTab, onViewConnections, exportSiteIds }: VaultModalProps) => {
+  const { t, i18n } = useTranslation();
   const isPt = (i18n.language || '').startsWith('pt');
   const tr = (pt: string, en: string) => (isPt ? pt : en);
 
@@ -203,6 +208,8 @@ export const VaultModal = ({ isOpen, onClose, siteCount, onSitesUpdated, initial
   const [securityInfo, setSecurityInfo] = useState<VaultSecurityInfo | null>(null);
 
   // --- Export state ---
+  // A selection or folder to export (null: every saved connection)
+  const [exportIds, setExportIds] = useState<string[] | null>(exportSiteIds?.length ? exportSiteIds : null);
   const [exportPassword, setExportPassword] = useState('');
   const [exportPasswordConfirm, setExportPasswordConfirm] = useState('');
   const [showExportPassword, setShowExportPassword] = useState(false);
@@ -262,6 +269,7 @@ export const VaultModal = ({ isOpen, onClose, siteCount, onSitesUpdated, initial
   useEffect(() => {
     if (!isOpen) return;
     setActiveTab(defaultTab);
+    setExportIds(exportSiteIds?.length ? exportSiteIds : null);
     setExportPassword('');
     setExportPasswordConfirm('');
     setShowExportPassword(false);
@@ -316,7 +324,9 @@ export const VaultModal = ({ isOpen, onClose, siteCount, onSitesUpdated, initial
   const confirmMatches = exportPassword.length > 0 && exportPassword === exportPasswordConfirm;
   const confirmMismatch = exportPasswordConfirm.length > 0 && exportPassword !== exportPasswordConfirm;
   const hasOuterSpaces = exportPassword.length > 0 && exportPassword !== trimmedExportPw;
-  const canExport = siteCount > 0 && !tooShort && confirmMatches && !isExporting;
+  // The export holds the chosen connections, or all of them
+  const exportCount = exportIds ? exportIds.length : siteCount;
+  const canExport = exportCount > 0 && !tooShort && confirmMatches && !isExporting;
 
   const strengthLabels = [tr('Muito fraca', 'Very weak'), tr('Fraca', 'Weak'), tr('Razoável', 'Fair'), tr('Boa', 'Good'), tr('Forte', 'Strong')];
   const strengthColor = strength <= 1 ? 'bg-red-500' : strength === 2 ? 'bg-amber-500' : 'bg-emerald-500';
@@ -325,7 +335,7 @@ export const VaultModal = ({ isOpen, onClose, siteCount, onSitesUpdated, initial
   const handleExport = async (e?: React.FormEvent) => {
     e?.preventDefault();
     setExportError(null);
-    if (siteCount === 0) {
+    if (exportCount === 0) {
       setExportError(tr('Não há conexões salvas para exportar.', 'There are no saved connections to export.'));
       return;
     }
@@ -346,7 +356,8 @@ export const VaultModal = ({ isOpen, onClose, siteCount, onSitesUpdated, initial
     if (isExporting) return;
     setIsExporting(true);
     try {
-      const json = await invoke<string>('export_sites_vault', { password: exportPassword });
+      // `ids` only for a selection: an older backend without it still exports everything it knows
+      const json = await invoke<string>('export_sites_vault', exportIds ? { password: exportPassword, ids: exportIds } : { password: exportPassword });
       if (!mountedRef.current) return;
       setExportedJson(json);
       setSavedPath(null);
@@ -700,12 +711,29 @@ export const VaultModal = ({ isOpen, onClose, siteCount, onSitesUpdated, initial
   const exportBody = !exportedJson ? (
     <form id={exportFormId} onSubmit={handleExport} className="space-y-4">
       <p className="text-[13px] text-ink-muted leading-relaxed">
-        {siteCount === 0
-          ? tr('Você ainda não tem conexões salvas para exportar.', "You don't have any saved connections to export yet.")
-          : siteCount === 1
-            ? tr('A conexão salva, com senhas e chaves, será cifrada em um único arquivo.', 'Your saved connection, including passwords and keys, will be encrypted into a single file.')
-            : tr(`As ${siteCount} conexões salvas, com senhas e chaves, serão cifradas em um único arquivo.`, `Your ${siteCount} saved connections, including passwords and keys, will be encrypted into a single file.`)}
+        {exportIds ? (
+          <>
+            {t('siteTree.exportIntro', {
+              count: exportIds.length,
+              formatted: exportIds.length.toLocaleString(i18n.language),
+              defaultValue_one: 'This connection, including its password or key, will be encrypted into a single file.',
+              defaultValue_other: 'These {{formatted}} connections, including passwords and keys, will be encrypted into a single file.',
+            })}{' '}
+            {siteCount > exportIds.length && (
+              <button type="button" className="text-ink hover:underline underline-offset-2" onClick={() => setExportIds(null)}>
+                {t('siteTree.exportAllInstead', 'Export all instead')}
+              </button>
+            )}
+          </>
+        ) : siteCount === 0 ? (
+          tr('Você ainda não tem conexões salvas para exportar.', "You don't have any saved connections to export yet.")
+        ) : siteCount === 1 ? (
+          tr('A conexão salva, com senhas e chaves, será cifrada em um único arquivo.', 'Your saved connection, including passwords and keys, will be encrypted into a single file.')
+        ) : (
+          tr(`As ${siteCount} conexões salvas, com senhas e chaves, serão cifradas em um único arquivo.`, `Your ${siteCount} saved connections, including passwords and keys, will be encrypted into a single file.`)
+        )}
       </p>
+      <p className="ui-hint !mt-1.5">{t('siteTree.vaultLocalOnly', 'Favorites, labels and empty folders stay on this computer.')}</p>
 
       <Field label={tr('Senha do backup', 'Backup passphrase')}>
         {(id) => (
@@ -1314,7 +1342,16 @@ export const VaultModal = ({ isOpen, onClose, siteCount, onSitesUpdated, initial
         isOpen
         onClose={onClose}
         size="lg"
-        title={tr('Exportar e importar conexões', 'Export and import connections')}
+        title={
+          exportIds && activeTab === 'export'
+            ? t('siteTree.exportTitle', {
+                count: exportIds.length,
+                formatted: exportIds.length.toLocaleString(i18n.language),
+                defaultValue_one: 'Export 1 connection',
+                defaultValue_other: 'Export {{formatted}} connections',
+              })
+            : tr('Exportar e importar conexões', 'Export and import connections')
+        }
         subtitle={
           activeTab === 'winscp'
             ? tr('Importe as sessões, pastas e senhas salvas no WinSCP.', 'Import the sessions, folders and saved passwords from WinSCP.')

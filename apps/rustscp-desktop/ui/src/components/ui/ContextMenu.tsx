@@ -11,7 +11,7 @@ export type { MenuAnchor } from './contextMenuUtils.ts';
 export type ContextMenuEntry =
   | { kind: 'item'; id: string; label: string; icon?: React.ReactNode; shortcut?: string; disabled?: boolean; danger?: boolean; bold?: boolean; title?: string; onSelect: () => void }
   | { kind: 'check'; id: string; label: string; icon?: React.ReactNode; checked: boolean | 'mixed'; keepOpen?: boolean; detail?: string; onToggle: () => void }
-  | { kind: 'radio'; id: string; label: string; checked: boolean; onSelect: () => void }
+  | { kind: 'radio'; id: string; label: string; icon?: React.ReactNode; checked: boolean; onSelect: () => void }
   | { kind: 'submenu'; id: string; label: string; icon?: React.ReactNode; entries: ContextMenuEntry[] }
   | { kind: 'label'; label: string }
   | { kind: 'separator' };
@@ -323,7 +323,7 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({ at, entries, ariaLabel
 
   const renderLevel = (level: Level, depth: number) => {
     const hasCheck = level.entries.some((e) => e.kind === 'check' || e.kind === 'radio');
-    const hasIcon = level.entries.some((e) => (e.kind === 'item' || e.kind === 'submenu' || e.kind === 'check') && !!e.icon);
+    const hasIcon = level.entries.some((e) => (e.kind === 'item' || e.kind === 'submenu' || e.kind === 'check' || e.kind === 'radio') && !!e.icon);
 
     const renderEntry = (entry: ContextMenuEntry, index: number): React.ReactNode => {
       if (entry.kind === 'separator') return <div key={`sep-${index}`} role="separator" className="ui-menu-sep" />;
@@ -334,7 +334,7 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({ at, entries, ariaLabel
       const danger = entry.kind === 'item' && !!entry.danger;
       const checked = entry.kind === 'check' || entry.kind === 'radio' ? entry.checked : undefined;
       const shortcut = entry.kind === 'item' ? entry.shortcut : undefined;
-      const icon = entry.kind === 'radio' ? undefined : entry.icon;
+      const icon = entry.icon;
       return (
         <button
           key={entry.id}

@@ -218,6 +218,8 @@ export interface TreeModel {
   labels: Map<string, LabelDef>;
   /** Site id → effective label id (own, else inherited) */
   siteLabel: Map<string, string>;
+  /** Site id → the site's own label id (defined labels only) */
+  siteOwnLabel: Map<string, string>;
 }
 
 /** Rows live in one of three sections; `addr` is the address row outside them. */
@@ -257,6 +259,10 @@ export interface FolderRow extends RowBase {
   empty: boolean;
   /** Effective label id */
   label: string | null;
+  /** The effective label's definition (its name goes in the tooltip and the accessible name) */
+  labelDef: LabelDef | null;
+  /** Draw the label dot: the folder's own label differs from its parent's (always in Favorites and list results) */
+  labelDot: boolean;
   favorite: boolean;
 }
 
@@ -269,6 +275,13 @@ export interface SiteRow extends RowBase {
   folder: string;
   /** Effective label id */
   label: string | null;
+  /** The effective label's definition (its name goes in the tooltip and the accessible name) */
+  labelDef: LabelDef | null;
+  /**
+   * Draw the label dot: in the tree only when the site's label differs from its folder's (the
+   * folder's dot already says it); always in Favorites, Recent and list results
+   */
+  labelDot: boolean;
   favorite: boolean;
   /** Recent rows: `recents.at` (Unix seconds) */
   recentAt: number | null;

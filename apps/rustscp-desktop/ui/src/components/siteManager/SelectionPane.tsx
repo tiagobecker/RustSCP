@@ -1,10 +1,10 @@
 import React, { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Folder, FolderInput, Star, StarOff, Trash2 } from 'lucide-react';
+import { ChevronRight, FileOutput, Folder, FolderInput, Plug, Star, StarOff, Tag, Trash2 } from 'lucide-react';
 import type { ConnectionConfig } from '../../types.ts';
 import { Button } from '../ui/controls.tsx';
 import { ProtocolGlyph } from './SiteTreeRow.tsx';
-import { formatCount, isLocalSite, protocolBreakdown } from './siteTreeModel.ts';
+import { CONNECT_MAX, formatCount, isLocalSite, protocolBreakdown } from './siteTreeModel.ts';
 import type { FolderNode } from './types.ts';
 
 export type SelectedItem = { kind: 'site'; site: ConnectionConfig } | { kind: 'folder'; node: FolderNode };
@@ -19,13 +19,21 @@ interface Props {
   onFavorite: () => void;
   /** Reduces the selection to the focused row */
   onClose: () => void;
+  /** Selected sites Connect N opens (folders' contents are not) */
+  connectCount: number;
+  onConnect: () => void;
+  /** Connections an export holds (folders: everything inside) */
+  exportCount: number;
+  onExport: () => void;
+  /** Label ▸: the label menu, anchored to the button */
+  onLabel: (rect: DOMRect) => void;
 }
 
 /** Names listed before "and N more" */
 const LISTED = 8;
 
 /** The right pane while 2 or more items are selected: what they are, and what can be done to all of them. */
-export const SelectionPane: React.FC<Props> = ({ items, onMove, onDelete, allFavorite, onFavorite, onClose }) => {
+export const SelectionPane: React.FC<Props> = ({ items, onMove, onDelete, allFavorite, onFavorite, onClose, connectCount, onConnect, exportCount, onExport, onLabel }) => {
   const { t, i18n } = useTranslation();
   const lang = i18n.language;
   const nf = (n: number) => formatCount(lang, n);
@@ -90,6 +98,13 @@ export const SelectionPane: React.FC<Props> = ({ items, onMove, onDelete, allFav
               ? t('siteTree.removeFavoritesN', { count: items.length, formatted: nf(items.length), defaultValue_one: 'Remove 1 from favorites', defaultValue_other: 'Remove {{formatted}} from favorites' })
               : t('siteTree.addFavoritesN', { count: items.length, formatted: nf(items.length), defaultValue_one: 'Add 1 to favorites', defaultValue_other: 'Add {{formatted}} to favorites' })}
           </Button>
+          <Button className="justify-start" icon={<Tag className="w-3.5 h-3.5 text-ink-muted" />} aria-haspopup="menu" onClick={(e) => onLabel(e.currentTarget.getBoundingClientRect())}>
+            <span className="flex-1 text-left">{t('siteTree.label', 'Label')}</span>
+            <ChevronRight aria-hidden className="w-3.5 h-3.5 text-ink-faint" />
+          </Button>
+          <Button className="justify-start" icon={<FileOutput className="w-3.5 h-3.5 text-ink-muted" />} onClick={onExport} disabled={exportCount === 0}>
+            {t('siteTree.exportN', { count: exportCount, formatted: nf(exportCount), defaultValue_one: 'Export 1 connection…', defaultValue_other: 'Export {{formatted}} connections…' })}
+          </Button>
           <Button className="justify-start !text-red-600 dark:!text-red-400" icon={<Trash2 className="w-3.5 h-3.5" />} onClick={onDelete} disabled={movable === 0}>
             {t('siteTree.deleteN', { count: movable, formatted: nf(movable), defaultValue_one: 'Delete 1 item', defaultValue_other: 'Delete {{formatted}} items' })}
           </Button>
@@ -101,9 +116,20 @@ export const SelectionPane: React.FC<Props> = ({ items, onMove, onDelete, allFav
         <Button variant="ghost" onClick={onClose}>
           {t('siteTree.close', 'Close')}
         </Button>
-        <Button variant="primary" icon={<FolderInput className="w-3.5 h-3.5" />} onClick={onMove} disabled={movable === 0}>
+        <Button variant={connectCount > 0 ? 'secondary' : 'primary'} icon={<FolderInput className="w-3.5 h-3.5" />} onClick={onMove} disabled={movable === 0}>
           {t('siteTree.moveTo', 'Move to…')}
         </Button>
+        {connectCount > 0 && (
+          <Button
+            variant="primary"
+            icon={<Plug className="w-3.5 h-3.5" />}
+            onClick={onConnect}
+            disabled={connectCount > CONNECT_MAX}
+            title={connectCount > CONNECT_MAX ? t('siteTree.connectTooMany', { max: CONNECT_MAX, defaultValue: 'You can open up to {{max}} connections at once.' }) : undefined}
+          >
+            {t('siteTree.connectN', { count: connectCount, formatted: nf(connectCount), defaultValue_one: 'Connect 1', defaultValue_other: 'Connect {{formatted}}' })}
+          </Button>
+        )}
       </div>
     </div>
   );

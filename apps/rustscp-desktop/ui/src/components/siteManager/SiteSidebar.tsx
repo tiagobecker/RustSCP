@@ -14,6 +14,9 @@ import { notify } from '../ui/toast.tsx';
 import { DeleteItemsDialog } from './DeleteItemsDialog.tsx';
 import type { DeleteChoice, DeleteRequest } from './DeleteItemsDialog.tsx';
 import { FolderPane } from './FolderPane.tsx';
+import { LabelsDialog } from './LabelsDialog.tsx';
+import { LABEL_PRESETS, labelChoiceState, labelList, labelUsage, planSetLabel, unusedPresets } from './labelsModel.ts';
+import type { LabelChoice } from './labelsModel.ts';
 import { MoveToDialog } from './MoveToDialog.tsx';
 import { SelectionPane } from './SelectionPane.tsx';
 import type { SelectedItem } from './SelectionPane.tsx';
@@ -27,6 +30,7 @@ import {
   filterMenu,
   folderMenu,
   importExportEntries,
+  labelEntries,
   localMenu,
   multiMenu,
   recentMenu,
@@ -37,10 +41,13 @@ import {
 } from './siteMenus.tsx';
 import type { MenuActions, MenuContext, ViewMenuState } from './siteMenus.tsx';
 import { allFavorites, checkFavoriteDrop, favoriteKey, favoriteRefOf, insertFavorites, moveFavorite, sameFavorites, setFavorites } from './sectionsModel.ts';
-import { activeValues, addressFromQuery, clearQualifiers, highlightTerms, matchContext, parseQuery, removeToken, searchTree, toggleQualifier } from './siteQuery.ts';
+import { activeValues, addressFromQuery, canonicalValue, clearQualifiers, highlightTerms, matchContext, parseQuery, removeToken, searchTree, toggleQualifier } from './siteQuery.ts';
 import {
+  CONNECT_ASK_ABOVE,
+  CONNECT_MAX,
   LOCAL_ID,
   MAX_FAVORITES,
+  MAX_LABELS,
   MAX_SITE_NAME_LEN,
   VIEW_PREFS_KEY,
   baseName,
@@ -70,11 +77,12 @@ import {
   rowHeightFor,
   siteKey,
   sitesInside,
+  sitesOfItems,
 } from './siteTreeModel.ts';
 import type { FolderNameProblem, MovePlan } from './siteTreeModel.ts';
 import { checkDrop, commonParent, dragPayload, planCopies } from './treeDragModel.ts';
 import type { CopyNames, DragPayload, DropSpot } from './treeDragModel.ts';
-import type { FavoriteRef, FolderNode, SectionId, SiteTreeOp, TreeRow, ViewPrefs } from './types.ts';
+import type { FavoriteRef, FolderNode, LabelDef, SectionId, SiteTreeOp, TreeRow, ViewPrefs } from './types.ts';
 import type { SiteTreeController } from './useSiteTree.ts';
 import { canonicalKey, isItemRow, paneFor, rangeKeys, selectedItems, useTreeSelection } from './useTreeSelection.ts';
 
@@ -88,6 +96,8 @@ export interface SiteSidebarApi {
   openItemMenu: (itemKey: string, rect: DOMRect) => void;
   /** The form header's Star: adds the item to the favorites or removes it */
   toggleFavorite: (itemKey: string) => void;
+  /** The form header's label pill: the item's Label menu anchored to it */
+  openLabelMenu: (itemKey: string, rect: DOMRect) => void;
 }
 
 export interface SiteSidebarProps {
@@ -123,6 +133,12 @@ export interface SiteSidebarProps {
   paneHost: HTMLElement | null;
   /** What the right pane shows; LoginDialog hides the form unless it is 'form' */
   onPaneModeChange: (mode: PaneMode) => void;
+  /** Ids of the saved sites with an open tab (the green dot, `is:open`) */
+  openSiteIds?: string[];
+  /** Connect N / Connect all: opens these sites one after the other (limits already checked) */
+  onConnectSites: (sites: ConnectionConfig[]) => void;
+  /** Export of a selection or a folder: the vault dialog for these site ids */
+  onExport: (ids: string[]) => void;
 }
 
 /** The right pane follows the selection (spec §4); a form with unsaved edits always stays. */
@@ -227,6 +243,9 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   apiRef,
   paneHost,
   onPaneModeChange,
+  openSiteIds,
+  onConnectSites,
+  onExport,
 }) => {
   const { t, i18n } = useTranslation();
   const lang = i18n.language;
@@ -278,6 +297,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   const [deleteReq, setDeleteReq] = useState<{ request: DeleteRequest; run: (choice: DeleteChoice) => void } | null>(null);
   const [moveReq, setMoveReq] = useState<MoveRequest | null>(null);
   const [showTips, setShowTips] = useState(false);
+  const [labelsOpen, setLabelsOpen] = useState(false);
   /** Items marked by ⌘X (canonical keys), kept in memory only until ⌘V or Escape */
   const [cutKeys, setCutKeys] = useState<ReadonlySet<string>>(EMPTY_SET);
   /** The folder overview's escape layer (reverts an edited name) */
@@ -327,9 +347,15 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   /** The text as typed (pills and the filter menu follow it at once) */
   const parsedNow = useMemo(() => parseQuery(query), [query]);
   const searching = !parsed.isEmpty;
+  // Sessions of saved sites (Local always has a tab: never marked)
+  const openKey = (openSiteIds ?? []).join('\n');
+  const openIds = useMemo<ReadonlySet<string>>(
+    () => new Set(openKey ? openKey.split('\n').filter((id) => id && id !== LOCAL_ID) : []),
+    [openKey]
+  );
   const search = useMemo(
-    () => (searching ? searchTree(model, parsed, matchContext(model), { asList: prefs.resultsAsList }) : null),
-    [model, parsed, searching, prefs.resultsAsList]
+    () => (searching ? searchTree(model, parsed, matchContext(model, { openSiteIds: openIds }), { asList: prefs.resultsAsList }) : null),
+    [model, parsed, searching, prefs.resultsAsList, openIds]
   );
   const address = useMemo(() => (searching ? addressFromQuery(parsed) : null), [parsed, searching]);
   const draft = useMemo(() => (draftFolder !== null ? { folder: draftFolder, name: draftName } : null), [draftFolder, draftName]);
@@ -1310,7 +1336,111 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     treeRef.current?.focus();
   };
 
+  /**
+   * The folder overview's table: shows the item in the tree (its folders open, scrolled to, the
+   * focus ring on it) while the selection, and so the overview, stays.
+   */
+  const revealItem = (itemKey: string) => {
+    const ref = parseItemKey(itemKey);
+    if (!ref) return;
+    if (searching) {
+      // The search decides what the tree shows; only a row it shows can take the focus ring
+      if (!indexByKey.has(itemKey)) return;
+    } else {
+      if (collapsedSections.has('all')) setCollapsedSections((prev) => new Set([...prev].filter((x) => x !== 'all')));
+      if (ref.kind === 'site') expandChain(model.siteFolder.get(ref.id) ?? '');
+      else expandChain(ref.path, false);
+    }
+    selection.setActive(itemKey);
+    treeRef.current?.scrollToKey(itemKey, 'center');
+  };
+
   const hideSection = (section: 'fav' | 'rec') => setView(section === 'fav' ? { showFavorites: false } : { showRecent: false });
+
+  /* ------------------------- labels, export, connect ------------------------- */
+
+  /** Gives the items a label, or takes their own away (one undoable batch; a preset is defined on first use). */
+  const setLabel = (keys: string[], choice: LabelChoice) => {
+    const plan = planSetLabel(model, keys.map(canonicalKey), choice);
+    if (plan === 'too_many') {
+      notify.error(t('siteTree.opFailed', "Couldn't update connections"), t('siteTree.errTooManyLabels', { max: MAX_LABELS, defaultValue: 'You can have up to {{max}} labels.' }));
+      return;
+    }
+    if (!plan) return;
+    const name = plan.labelId ? plan.created?.name ?? model.labels.get(plan.labelId)?.name ?? '' : null;
+    void tree.run(plan.ops).then((res) => {
+      if (!res) return;
+      announce(name ? t('siteTree.a11yLabelSet', { name, defaultValue: 'Label “{{name}}” set' }) : t('siteTree.a11yLabelCleared', 'Label removed'));
+    });
+  };
+
+  /** Label ▸ for these items: None (or "Same as folder"), the labels, presets not defined yet, Edit labels…. */
+  const labelSubmenu = (keys: string[]): ContextMenuEntry[] => {
+    const items = keys.map(canonicalKey);
+    const state = labelChoiceState(model, items);
+    const labels = labelList(model);
+    const presets = unusedPresets(
+      model,
+      LABEL_PRESETS.map((p) => ({ name: t(p.key, p.name), color: p.color, alt: p.name }))
+    ).slice(0, Math.max(0, MAX_LABELS - labels.length));
+    return labelEntries(menuCtx, { labels, own: state.own, inherited: state.inherited, presets, set: (choice) => setLabel(items, choice) });
+  };
+
+  /** Labels dialog: one `set_label_defs` (deleting a label removes its assignments), with Undo. */
+  const saveLabels = (labels: LabelDef[]) => {
+    setLabelsOpen(false);
+    void tree.run([{ op: 'set_label_defs', labels }]).then((res) => {
+      if (!res?.undo_token) return;
+      const title = t('siteTree.labelsSaved', 'Labels updated');
+      tree.toastWithUndo({ title, token: res.undo_token });
+      announce(title);
+    });
+  };
+
+  /** Export of a selection or a folder: every connection the items stand for (never Local). */
+  const exportItems = (keys: string[]) => {
+    const ids = sitesOfItems(model, keys.map(canonicalKey)).map((site) => site.id);
+    if (ids.length > 0) onExport(ids);
+  };
+
+  /**
+   * What Connect N opens: the selected sites in tree order (Local included; folders' contents are
+   * not), or, for folders alone (Connect all), every site inside.
+   */
+  const connectTargets = (keys: string[]): ConnectionConfig[] => {
+    const items = [...new Set(keys.map(canonicalKey))];
+    const sites = items
+      .filter((k) => k.startsWith('s:'))
+      .map((k) => model.sitesById.get(k.slice(2)))
+      .filter((x): x is ConnectionConfig => !!x);
+    if (sites.length === 0) return sitesOfItems(model, items);
+    const order = (x: ConnectionConfig) => indexByKey.get(siteKey(x.id)) ?? Number.MAX_SAFE_INTEGER;
+    return sites.map((x, i) => ({ x, i })).sort((a, b) => order(a.x) - order(b.x) || a.i - b.i).map((e) => e.x);
+  };
+
+  /** Connect N / Connect all: refused above 20, asks above 5, then each site in turn (LoginDialog). */
+  const connectItems = (keys: string[]) => {
+    const sites = connectTargets(keys);
+    if (sites.length === 0) return;
+    if (sites.length > CONNECT_MAX) {
+      notify.error(t('siteTree.connectTooMany', { max: CONNECT_MAX, defaultValue: 'You can open up to {{max}} connections at once.' }));
+      return;
+    }
+    if (sites.length > CONNECT_ASK_ABOVE) {
+      setDeleteReq({
+        request: { kind: 'connect', count: sites.length },
+        run: (choice) => {
+          setDeleteReq(null);
+          if (choice === 'connect') onConnectSites(sites);
+        },
+      });
+      return;
+    }
+    onConnectSites(sites);
+  };
+
+  /** Selected sites Connect N would open (Local included). */
+  const connectCount = (keys: string[]): number => keys.filter((k) => k.startsWith('s:') && model.sitesById.has(k.slice(2))).length;
 
   /* --------------------------------- menus --------------------------------- */
 
@@ -1342,8 +1472,12 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     clearRecent,
     hideSection,
     setView,
+    labelSubmenu,
+    editLabels: () => setLabelsOpen(true),
+    exportItems,
+    connectItems,
   };
-  const menuCtx: MenuContext = { t, actions: menuActions, mac };
+  const menuCtx: MenuContext = { t, actions: menuActions, mac, lang };
   const expandState = { hasFolders: folderPaths.length > 0, anyExpanded, anyCollapsed };
   const viewState: ViewMenuState = { prefs, density };
 
@@ -1374,7 +1508,20 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     }
     openMenu(
       at,
-      multiMenu({ keys, sites, folders, hasAddress, favoriteCount, allFavorite: allFavorites(model, keys), format: (n) => formatCount(lang, n) }, menuCtx),
+      multiMenu(
+        {
+          keys,
+          sites,
+          folders,
+          hasAddress,
+          favoriteCount,
+          allFavorite: allFavorites(model, keys),
+          connectSites: connectCount(keys),
+          exportCount: sitesOfItems(model, keys).length,
+          format: (n) => formatCount(lang, n),
+        },
+        menuCtx
+      ),
       selectedText(keys.length),
       focusFirst
     );
@@ -1524,11 +1671,18 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     moveTo: (row) => openMove(itemsFor(row)),
     open: (row) => {
       switch (row.kind) {
-        case 'site':
-          // Connecting several at once comes later (Connect N): Enter connects the focused one
-          if (selectedItems(selection.stateRef.current.keys).length > 1) selection.selectOnly(row.key);
+        case 'site': {
+          // Several selected, the focused one among them: Connect N
+          const s = selection.stateRef.current;
+          const items = selectedItems(s.keys);
+          if (items.length > 1 && s.keys.has(row.key) && connectCount(items) > 1) {
+            connectItems(items);
+            return;
+          }
+          if (items.length > 1) selection.selectOnly(row.key);
           onConnectSite(row.site);
           return;
+        }
         case 'address':
           newConnectionTo(row.address);
           return;
@@ -1678,6 +1832,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
       if (site) openMenu(at, siteEntries(site), site.name, false);
     },
     toggleFavorite: (itemKey) => toggleFavorites([itemKey]),
+    openLabelMenu: (itemKey, rect) => openMenu({ rect, placement: 'below' }, labelSubmenu([itemKey]), t('siteTree.label', 'Label'), false),
   };
   useEffect(
     () => () => {
@@ -1786,7 +1941,12 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   const k = shortcutLabels(mac);
   const total = model.totalSites;
   const onlyLocal = total === 0 && !searching;
-  const footerMenu = (btn: HTMLElement) => openMenu({ rect: btn.getBoundingClientRect(), placement: 'above' }, importExportEntries(menuCtx), t('siteTree.importExportMenu', 'Import & export'), false);
+  const footerMenu = (btn: HTMLElement) => {
+    // "Export selected (N)…" while sites are selected (the folders' contents count)
+    const keys = selectedItems(selection.stateRef.current.keys);
+    const exportSelected = { keys, count: keys.some((k) => k.startsWith('s:') || k.startsWith('f:')) ? sitesOfItems(model, keys).length : 0 };
+    openMenu({ rect: btn.getBoundingClientRect(), placement: 'above' }, importExportEntries(menuCtx, exportSelected), t('siteTree.importExportMenu', 'Import & export'), false);
+  };
   const overlayTop = rows.length * rowHeight + 8;
 
   const selectedCount = useMemo(() => selectedItems(selection.keys).length, [selection.keys]);
@@ -1807,6 +1967,10 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
       protocolOptions,
       hasFavorites: model.favorites.length > 0,
       hasRecents: model.recents.length > 0,
+      hasOpen: openIds.size > 0,
+      labels: labelList(model),
+      labelValues: activeValues(parsedNow, 'label'),
+      foldLabel: (name) => canonicalValue('label', name),
       hasQualifiers: parsedNow.hasQualifiers,
       toggle: (key, value, on) => setQuery(toggleQualifier(query, key, value, on)),
       openTips: () => setShowTips(true),
@@ -1841,6 +2005,9 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
           }}
           onClose={onCloseDialog}
           escapeRef={paneEscapeRef}
+          openSiteIds={openIds}
+          onRevealItem={revealItem}
+          onConnect={onConnectSite}
         />
       );
     }
@@ -1867,6 +2034,11 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
           allFavorite={allFavorites(model, pane.items)}
           onFavorite={() => toggleFavorites(pane.items)}
           onClose={reduceSelection}
+          connectCount={connectCount(pane.items)}
+          onConnect={() => connectItems(pane.items)}
+          exportCount={sitesOfItems(model, pane.items).length}
+          onExport={() => exportItems(pane.items)}
+          onLabel={(rect) => openMenu({ rect, placement: 'below' }, labelSubmenu(pane.items), t('siteTree.label', 'Label'), false)}
         />
       );
     }
@@ -1992,6 +2164,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
           ariaLabel={t('loginDialog.title', 'Connections')}
           describedById={descId}
           cutKeys={cutKeys}
+          openSiteIds={openIds}
         />
         {onlyLocal && (
           <div className="absolute inset-x-3 flex flex-col items-center gap-1 text-center" style={{ top: overlayTop }}>
@@ -2092,6 +2265,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
           onCancel={() => setMoveReq(null)}
         />
       )}
+      {labelsOpen && <LabelsDialog labels={labelList(model)} usage={labelUsage(model)} onSave={saveLabels} onCancel={() => setLabelsOpen(false)} />}
       {paneHost && paneContent && createPortal(paneContent, paneHost)}
     </aside>
   );

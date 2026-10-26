@@ -28,6 +28,8 @@ import { UnsavedChangesDialog } from './siteManager/UnsavedChangesDialog.tsx';
 import { parseAddressInput } from './siteManager/siteQuery.ts';
 import { folderChain, naturalCompare, needsPassword, normalizeGroup } from './siteManager/siteTreeModel.ts';
 import { useSiteTree } from './siteManager/useSiteTree.ts';
+import { LABEL_DOT_CLASS, layoutSiteLabel } from './siteManager/labelsModel.ts';
+import { notify } from './ui/toast.tsx';
 
 interface LoginDialogProps {
   isOpen: boolean;
@@ -42,6 +44,8 @@ interface LoginDialogProps {
   onShareSite?: (site: ConnectionConfig) => void;
   /** Opens a `.rustscp` file someone shared. */
   onOpenSharedConnection?: () => void;
+  /** Saved-site ids of the open tabs: the tree marks them and `is:open` finds them */
+  openSiteIds?: string[];
 }
 
 type AuthMode = 'password' | 'key' | 'agent';
@@ -212,11 +216,14 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   onSitesUpdated,
   onShareSite,
   onOpenSharedConnection,
+  openSiteIds,
 }) => {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [isVaultModalOpen, setIsVaultModalOpen] = useState(false);
   // undefined: the vault dialog picks its own default tab
   const [vaultInitialTab, setVaultInitialTab] = useState<VaultTab | undefined>(undefined);
+  // Export of a selection or a folder (the tree's Export…): only these site ids
+  const [vaultExportIds, setVaultExportIds] = useState<string[] | undefined>(undefined);
 
   const [selectedSiteId, setSelectedSiteId] = useState<string>('new');
   const [protocol, setProtocol] = useState<Protocol>('sftp');
@@ -272,6 +279,8 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   const [passwordGateId, setPasswordGateId] = useState<string | null>(null);
   // "Change…" in a new connection's header: Move to… in pick mode
   const [pickingFolder, setPickingFolder] = useState(false);
+  // Connect N / Connect all in progress: which one of how many
+  const [bulkConnect, setBulkConnect] = useState<{ index: number; total: number; name: string } | null>(null);
 
   const siteTree = useSiteTree({ isOpen, savedSites, onSitesUpdated });
 
@@ -563,6 +572,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
     if (attemptTokenRef.current) attemptTokenRef.current.cancelled = true;
     connectAttemptIdRef.current++;
     setIsConnecting(false);
+    setBulkConnect(null);
     setErrorMessage(t('loginDialog.cancelledMsg', 'Connection attempt cancelled. You can adjust the details and try again.'));
   };
 
@@ -622,6 +632,64 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
       if (needsPassword(site)) gatePassword(site.id);
       else runConnect(site);
     });
+  };
+
+  /**
+   * Connect N / Connect all (the tree checked the limits and asked): one site after the other, each
+   * in a new tab. Failures are collected into one error toast; the dialog closes once they are all
+   * done, if any opened. One site goes through the usual path (password gate included).
+   */
+  const connectSitesFromTree = (sites: ConnectionConfig[]) => {
+    if (sites.length === 0) return;
+    if (sites.length === 1) {
+      connectSiteFromTree(sites[0]);
+      return;
+    }
+    guardDirty(() => void runConnectMany(sites));
+  };
+
+  const runConnectMany = async (sites: ConnectionConfig[]) => {
+    if (isConnecting) return;
+    setErrorMessage('');
+    const currentAttempt = ++connectAttemptIdRef.current;
+    const token = { cancelled: false };
+    attemptTokenRef.current = token;
+    setIsConnecting(true);
+    const failures: string[] = [];
+    let opened = 0;
+    for (let i = 0; i < sites.length; i++) {
+      if (token.cancelled || connectAttemptIdRef.current !== currentAttempt) return;
+      const site = sites[i];
+      setBulkConnect({ index: i + 1, total: sites.length, name: site.name });
+      try {
+        await onConnect(site, token);
+        if (token.cancelled) return;
+        opened++;
+        if (site.id !== 'local') siteTree.recordConnected(site.id);
+      } catch (err: any) {
+        failures.push(`${site.name}: ${String(err?.message ?? err)}`);
+      }
+    }
+    if (connectAttemptIdRef.current !== currentAttempt) return;
+    setBulkConnect(null);
+    setIsConnecting(false);
+    if (failures.length > 0) {
+      const nf = new Intl.NumberFormat(i18n.language);
+      notify.error(
+        t('siteTree.connectFailed', {
+          count: failures.length,
+          formatted: nf.format(failures.length),
+          defaultValue_one: "Couldn't open 1 connection",
+          defaultValue_other: "Couldn't open {{formatted}} connections",
+        }),
+        failures.join('\n'),
+        { sticky: true }
+      );
+    }
+    if (opened > 0) {
+      resetForm();
+      onClose();
+    }
   };
 
   const focusFirstField = (local: boolean) =>
@@ -698,14 +766,19 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   };
 
   const isNew = selectedSiteId === 'new';
-  // A running attempt keeps the form (its progress and Cancel) in view
-  const showForm = paneMode === 'form' || isConnecting;
+  // A running attempt keeps the form (its progress and Cancel) in view; Connect N keeps the pane it started from
+  const showForm = paneMode === 'form' || (isConnecting && !bulkConnect);
+  const bulkText = bulkConnect
+    ? t('siteTree.connectingN', { done: bulkConnect.index, total: bulkConnect.total, name: bulkConnect.name, defaultValue: 'Connecting {{done}} of {{total}} · {{name}}' })
+    : '';
   const isS3 = protocol === 's3';
   const isLocal = protocol === 'local';
   const isBuiltInLocal = selectedSiteId === 'local';
   const normalizedGroup = isBuiltInLocal ? '' : normalizeGroup(group);
   // The open saved site's Star in the header (favorites live in the tree's layout)
   const favoriteSite = !isNew && siteTree.layout.favorites.some((f) => f.kind === 'site' && f.id === selectedSiteId);
+  // Its label pill (own, or from the folder typed in the form)
+  const labelInfo = isNew ? null : layoutSiteLabel(siteTree.layout, selectedSiteId, normalizedGroup);
 
   const protocolOptions: Array<{ value: Protocol; label: string; title?: string }> = [
     { value: 'sftp', label: 'SFTP' },
@@ -737,6 +810,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
           onFocusDraft={() => setTimeout(() => (hostRef.current ?? siteNameRef.current)?.focus(), 0)}
           onShareSite={onShareSite}
           onOpenVault={(tab) => {
+            setVaultExportIds(undefined);
             setVaultInitialTab(tab);
             setIsVaultModalOpen(true);
           }}
@@ -745,6 +819,13 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
           apiRef={sidebarApiRef}
           paneHost={paneHost}
           onPaneModeChange={setPaneMode}
+          openSiteIds={openSiteIds}
+          onConnectSites={connectSitesFromTree}
+          onExport={(ids) => {
+            setVaultExportIds(ids);
+            setVaultInitialTab('export');
+            setIsVaultModalOpen(true);
+          }}
         />
 
         {/* Connection form (a folder overview or the selection panel takes its place while one is selected) */}
@@ -776,6 +857,23 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
                         </React.Fragment>
                       ))}
                     </span>
+                  )}
+                  {labelInfo && (
+                    <button
+                      type="button"
+                      onClick={(e) => sidebarApiRef.current?.openLabelMenu(`s:${selectedSiteId}`, e.currentTarget.getBoundingClientRect())}
+                      className="ml-2 shrink-0 h-[18px] px-2 rounded-full bg-dark-650 hover:bg-dark-600 flex items-center gap-1.5 text-[11.5px] text-ink-muted hover:text-ink"
+                      aria-haspopup="menu"
+                      aria-label={t('siteTree.pillLabel', { value: labelInfo.def.name, defaultValue: 'Label: {{value}}' })}
+                      title={
+                        labelInfo.from
+                          ? t('siteTree.inheritedLabel', { folder: labelInfo.from.split('/').join(' / '), defaultValue: 'From folder “{{folder}}”' })
+                          : t('siteTree.changeLabel', 'Change label')
+                      }
+                    >
+                      <span aria-hidden className={`w-1.5 h-1.5 rounded-full ${LABEL_DOT_CLASS[labelInfo.def.color]}`} />
+                      <span className="max-w-[160px] truncate">{labelInfo.def.name}</span>
+                    </button>
                   )}
                   {isNew && (
                     <span className="shrink-0">
@@ -1107,7 +1205,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
               {isConnecting ? (
                 <span className="flex items-center gap-2 text-ink-muted truncate">
                   <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
-                  {t('loginDialog.connecting')} {host || ''}
+                  {bulkConnect ? bulkText : `${t('loginDialog.connecting')} ${host || ''}`}
                 </span>
               ) : saveSuccess ? (
                 <span className="flex items-center gap-1.5 text-emerald-700 dark:text-emerald-400">
@@ -1141,7 +1239,21 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
             )}
           </div>
         </div>
-        <div ref={setPaneHost} className={`flex-1 min-w-0 flex-col ${showForm ? 'hidden' : 'flex'}`} />
+        <div className={`relative flex-1 min-w-0 flex-col ${showForm ? 'hidden' : 'flex'}`}>
+          <div ref={setPaneHost} className="flex-1 min-h-0 flex flex-col" />
+          {bulkConnect && (
+            // Connect N covers the pane's footer with its progress and Cancel (Escape cancels too)
+            <div className="absolute inset-x-0 bottom-0 flex items-center gap-2 px-5 py-3.5 border-t border-line bg-surface-raised select-none" role="status">
+              <span className="flex-1 min-w-0 flex items-center gap-2 text-[12.5px] text-ink-muted truncate">
+                <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" aria-hidden />
+                <span className="truncate">{bulkText}</span>
+              </span>
+              <Button variant="secondary" onClick={handleCancelConnect}>
+                {t('loginDialog.cancelConnecting')}
+              </Button>
+            </div>
+          )}
+        </div>
       </div>
 
       {pickingFolder && (
@@ -1165,6 +1277,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
         <VaultModal
           isOpen={isVaultModalOpen}
           initialTab={vaultInitialTab}
+          exportSiteIds={vaultExportIds}
           onClose={() => setIsVaultModalOpen(false)}
           onViewConnections={showImportedConnections}
           siteCount={savedSites.filter((s) => s.id !== 'local').length}

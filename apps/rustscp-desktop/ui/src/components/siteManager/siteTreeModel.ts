@@ -47,6 +47,10 @@ export const MAX_IDS_PER_CALL = 5_000;
 export const MAX_LAYOUT_FOLDERS = 10_000;
 /** Recent rows shown in the sidebar */
 export const RECENT_SHOWN = 8;
+/** Connect N / Connect all: asks first above this many connections */
+export const CONNECT_ASK_ABOVE = 5;
+/** Connect N / Connect all: at most this many at once */
+export const CONNECT_MAX = 20;
 
 export const COMFORTABLE_ROW_H = 36;
 export const COMPACT_ROW_H = 28;
@@ -162,7 +166,7 @@ export const protocolTag = (p: Protocol | string): string => {
 
 /** Order of the "Protocol" sort */
 const PROTOCOL_ORDER = ['local', 'sftp', 'ftps', 'ftp', 's3', 'webdav'];
-const protocolRank = (p: Protocol | string): number => {
+export const protocolRank = (p: Protocol | string): number => {
   const i = PROTOCOL_ORDER.indexOf(canonicalProtocol(p));
   return i < 0 ? PROTOCOL_ORDER.length : i;
 };
@@ -640,7 +644,8 @@ export function buildTree(sites: readonly ConnectionConfig[], layout?: SiteLayou
     const node = folders.get(normalizeGroup(raw));
     if (node && node.path && labels.has(id)) node.label = id;
   }
-  const ownSiteLabels = new Map(Object.entries(layout?.site_labels ?? {}));
+  const siteOwnLabel = new Map<string, string>();
+  for (const [id, label] of Object.entries(layout?.site_labels ?? {})) if (sitesById.has(id) && labels.has(label)) siteOwnLabel.set(id, label);
   const siteLabel = new Map<string, string>();
 
   // "Last connected" rank: a time, then entries with no time, then never used
@@ -690,8 +695,7 @@ export function buildTree(sites: readonly ConnectionConfig[], layout?: SiteLayou
       if (c.lastAt !== null && (lastAt === null || c.lastAt > lastAt)) lastAt = c.lastAt;
     }
     for (const site of node.sites) {
-      const own = ownSiteLabels.get(site.id);
-      const eff = own && labels.has(own) ? own : node.effectiveLabel;
+      const eff = siteOwnLabel.get(site.id) ?? node.effectiveLabel;
       if (eff) siteLabel.set(site.id, eff);
       if (!isLocalSite(site)) count++;
       const at = recentAt.get(site.id);
@@ -735,6 +739,7 @@ export function buildTree(sites: readonly ConnectionConfig[], layout?: SiteLayou
     recentAt,
     labels,
     siteLabel,
+    siteOwnLabel,
   };
 }
 
@@ -814,6 +819,24 @@ export const resolveItems = (model: TreeModel, itemKeys: Iterable<string>): Reso
     return !g || !folders.some((f) => isInside(g, f.path));
   });
   return { sites, folders, looseSites, local };
+};
+
+/**
+ * Every saved site the items stand for, in item order without duplicates: the sites themselves and
+ * everything inside the folders (all levels). Local is never included (export and Connect all).
+ */
+export const sitesOfItems = (model: TreeModel, itemKeys: Iterable<string>): ConnectionConfig[] => {
+  const { sites, folders } = resolveItems(model, itemKeys);
+  const seen = new Set<string>();
+  const out: ConnectionConfig[] = [];
+  const add = (s: ConnectionConfig) => {
+    if (seen.has(s.id) || isLocalSite(s)) return;
+    seen.add(s.id);
+    out.push(s);
+  };
+  for (const s of sites) add(s);
+  for (const f of folders) for (const s of sitesInside(model, f.path)) add(s);
+  return out;
 };
 
 /** Saved sites per protocol tag, most first ("28 SFTP · 4 FTPS"); Local is never counted. */
@@ -954,6 +977,10 @@ export function flattenRows(model: TreeModel, state: FlattenState): FlatRows {
     posinset: number,
     extra?: { recentAt?: number | null; showPath?: boolean }
   ) => {
+    const folder = model.siteFolder.get(site.id) ?? '';
+    const label = model.siteLabel.get(site.id) ?? null;
+    // In the tree a site repeats no dot its folder already shows; lists without folders show it always
+    const inherited = isLocalSite(site) ? null : model.folders.get(folder)?.effectiveLabel ?? null;
     rows.push({
       kind: 'site',
       key,
@@ -964,8 +991,10 @@ export function flattenRows(model: TreeModel, state: FlattenState): FlatRows {
       posinset,
       itemKey: siteKey(site.id),
       site,
-      folder: model.siteFolder.get(site.id) ?? '',
-      label: model.siteLabel.get(site.id) ?? null,
+      folder,
+      label,
+      labelDef: label ? model.labels.get(label) ?? null : null,
+      labelDot: label !== null && (extra?.showPath === true || label !== inherited),
       favorite: model.favoriteSites.has(site.id),
       recentAt: extra?.recentAt ?? null,
       showPath: extra?.showPath ?? false,
@@ -981,8 +1010,12 @@ export function flattenRows(model: TreeModel, state: FlattenState): FlatRows {
     setsize: number,
     posinset: number,
     expanded: boolean,
-    count: number
+    count: number,
+    /** Favorites and list results: the dot shows whatever the parent's label is */
+    alwaysDot = false
   ) => {
+    const label = node.effectiveLabel;
+    const parentLabel = model.folders.get(node.parent)?.effectiveLabel ?? null;
     rows.push({
       kind: 'folder',
       key,
@@ -997,7 +1030,9 @@ export function flattenRows(model: TreeModel, state: FlattenState): FlatRows {
       expanded,
       count,
       empty: node.folders.length === 0 && node.sites.length === 0,
-      label: node.effectiveLabel,
+      label,
+      labelDef: label ? model.labels.get(label) ?? null : null,
+      labelDot: label !== null && (alwaysDot || label !== parentLabel),
       favorite: model.favoriteFolders.has(node.path),
     });
   };
@@ -1024,7 +1059,7 @@ export function flattenRows(model: TreeModel, state: FlattenState): FlatRows {
     if (withAddress && items.length === 0) pushAddress();
     for (const item of items) {
       if (item.kind === 'site') pushSite(siteKey(item.site.id), 'all', item.site, 0, 1, setsize, ++pos, { showPath: true });
-      else pushFolder(folderKey(item.node.path), 'all', item.node, 0, 1, setsize, ++pos, false, item.node.count);
+      else pushFolder(folderKey(item.node.path), 'all', item.node, 0, 1, setsize, ++pos, false, item.node.count, true);
     }
     if (withAddress && items.length > 0) pushAddress();
     return finishRows(rows);
@@ -1150,7 +1185,7 @@ export function flattenRows(model: TreeModel, state: FlattenState): FlatRows {
         if (!node) return;
         const key = `fav:${folderKey(f.path)}`;
         const open = favoriteExpanded.has(f.path);
-        pushFolder(key, 'fav', node, 0, 2, n, i + 1, open, node.count);
+        pushFolder(key, 'fav', node, 0, 2, n, i + 1, open, node.count, true);
         if (open) walk(node, 1, 2, 'fav', `${key}${FAV_NEST}`, false);
       });
     }

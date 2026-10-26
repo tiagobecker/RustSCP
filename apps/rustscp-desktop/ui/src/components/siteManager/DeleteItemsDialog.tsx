@@ -12,6 +12,7 @@ import { Button } from '../ui/controls.tsx';
  *   default [Keep connections], which lifts the contents one level.
  * - `merge`: a rename or move clashes with a folder of the same name: [Merge].
  * - `copy`: an ⌥/Alt drop that would copy more than 50 connections: [Copy N].
+ * - `connect`: Connect N / Connect all above 5 connections: [Connect N].
  */
 export type DeleteRequest =
   | { kind: 'items'; count: number; sitesOnly: boolean }
@@ -31,9 +32,10 @@ export type DeleteRequest =
       mixedParents?: boolean;
     }
   | { kind: 'merge'; name: string; parent: string | null; sites: number }
-  | { kind: 'copy'; connections: number };
+  | { kind: 'copy'; connections: number }
+  | { kind: 'connect'; count: number };
 
-export type DeleteChoice = 'delete' | 'keep' | 'merge' | 'copy';
+export type DeleteChoice = 'delete' | 'keep' | 'merge' | 'copy' | 'connect';
 
 interface Props {
   request: DeleteRequest;
@@ -144,6 +146,18 @@ export const DeleteItemsDialog: React.FC<Props> = ({ request, onChoose, onCancel
         </Button>
       </>
     );
+  } else if (request.kind === 'connect') {
+    const formatted = nf.format(request.count);
+    title = t('siteTree.connectManyTitle', { count: request.count, formatted, defaultValue_one: 'Open 1 connection?', defaultValue_other: 'Open {{formatted}} connections?' });
+    body = <p className="text-[13px] text-ink-muted leading-relaxed">{t('siteTree.connectManyBody', 'Each opens in a new tab.')}</p>;
+    footer = (
+      <>
+        {cancel}
+        <Button ref={primaryRef} variant="primary" onClick={() => choose('connect')}>
+          {t('siteTree.connectN', { count: request.count, formatted, defaultValue_one: 'Connect 1', defaultValue_other: 'Connect {{formatted}}' })}
+        </Button>
+      </>
+    );
   } else {
     title = t('siteTree.mergeTitle', 'Merge folders?');
     body = (
@@ -173,7 +187,7 @@ export const DeleteItemsDialog: React.FC<Props> = ({ request, onChoose, onCancel
       onClose={onCancel}
       size="md"
       title={title}
-      icon={request.kind === 'merge' || request.kind === 'copy' ? undefined : <AlertTriangle className="w-[18px] h-[18px] text-red-600 dark:text-red-400" aria-hidden="true" />}
+      icon={request.kind === 'merge' || request.kind === 'copy' || request.kind === 'connect' ? undefined : <AlertTriangle className="w-[18px] h-[18px] text-red-600 dark:text-red-400" aria-hidden="true" />}
       initialFocusRef={primaryRef}
       footer={footer}
     >

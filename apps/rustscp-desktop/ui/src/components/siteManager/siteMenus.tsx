@@ -4,8 +4,8 @@
  *
  * Menus (spec §5): A one site, B Local, C folder, D several items, E empty area / "All connections"
  * header, F a favorite row, G a recent row, H the Favorites / Recent headers, the header's View
- * options, the footer's import & export entries and the search field's filter menu. Items of later
- * work packages (labels, export, Connect N…) are added by those packages.
+ * options, the footer's import & export entries and the search field's filter menu, plus the
+ * Label ▸ submenu (labels, export and Connect N came with WP8).
  */
 import React from 'react';
 import type { TFunction } from 'i18next';
@@ -19,6 +19,7 @@ import {
   CopyPlus,
   EyeOff,
   FileKey2,
+  FileOutput,
   FolderInput,
   FolderPlus,
   FunnelX,
@@ -34,13 +35,18 @@ import {
   SquarePen,
   Star,
   StarOff,
+  Tag,
+  Tags,
   TextCursorInput,
   Trash2,
 } from 'lucide-react';
 import type { ContextMenuEntry } from '../ui/ContextMenu.tsx';
 import { formatShortcut } from '../ui/contextMenuUtils.ts';
 import type { ConnectionConfig } from '../../types.ts';
-import type { Density, FolderNode, SortKey, ViewPrefs } from './types.ts';
+import { LABEL_DOT_CLASS } from './labelsModel.ts';
+import type { LabelChoice } from './labelsModel.ts';
+import { CONNECT_MAX, formatCount } from './siteTreeModel.ts';
+import type { Density, FolderNode, LabelColor, LabelDef, SortKey, ViewPrefs } from './types.ts';
 
 export interface MenuActions {
   connect: (site: ConnectionConfig) => void;
@@ -86,6 +92,14 @@ export interface MenuActions {
   hideSection: (section: 'fav' | 'rec') => void;
   /** Changes view options (sort, folders on top, row size, sections…) */
   setView: (patch: Partial<ViewPrefs>) => void;
+  /** The Label ▸ submenu's entries for these item keys */
+  labelSubmenu: (keys: string[]) => ContextMenuEntry[];
+  /** Opens the Labels dialog */
+  editLabels: () => void;
+  /** Exports the connections these items stand for (folders: everything inside) */
+  exportItems: (keys: string[]) => void;
+  /** Connects the sites among these items (a folder: every site inside); asks above 5 */
+  connectItems: (keys: string[]) => void;
 }
 
 export interface MenuContext {
@@ -93,6 +107,8 @@ export interface MenuContext {
   actions: MenuActions;
   /** macOS shortcut glyphs (⌘⌫) instead of Ctrl+…/Del */
   mac: boolean;
+  /** UI language (number formatting) */
+  lang?: string;
 }
 
 const ICON = 'w-3.5 h-3.5';
@@ -147,6 +163,63 @@ const pasteEntry = (ctx: MenuContext, folder: string): ContextMenuEntry[] => {
   return [{ kind: 'item', id: 'paste', label: ctx.t('siteTree.paste', 'Paste'), icon: icon(ClipboardPaste), shortcut: shortcutLabels(ctx.mac).paste, onSelect: () => paste(folder) }];
 };
 
+/** Label ▸ for these item keys. */
+const labelSubmenuEntry = (ctx: MenuContext, keys: string[]): ContextMenuEntry => ({
+  kind: 'submenu',
+  id: 'label',
+  label: ctx.t('siteTree.label', 'Label'),
+  icon: icon(Tag),
+  entries: ctx.actions.labelSubmenu(keys),
+});
+
+/** "Connect N" / "Connect all (N)…": disabled above 20, with the reason in its tooltip. */
+const tooManyTitle = (ctx: MenuContext, n: number): string | undefined =>
+  n > CONNECT_MAX ? ctx.t('siteTree.connectTooMany', { max: CONNECT_MAX, defaultValue: 'You can open up to {{max}} connections at once.' }) : undefined;
+
+/** A small coloured dot (label menus and the filter menu). */
+export const labelDot = (color: LabelColor) => <span aria-hidden className={`w-2 h-2 rounded-full ${LABEL_DOT_CLASS[color]}`} />;
+
+/** What a Label ▸ submenu shows. */
+export interface LabelMenuState {
+  /** Defined labels, in order */
+  labels: LabelDef[];
+  /** The items' own label: an id, null for none, 'mixed' */
+  own: string | null | 'mixed';
+  /** What they inherit from their folder (the "None" entry names it) */
+  inherited: LabelDef | null;
+  /** Presets not defined yet (translated names); picking one defines it */
+  presets: Array<{ name: string; color: LabelColor }>;
+  set: (choice: LabelChoice) => void;
+}
+
+/** The Label ▸ entries: None (or "Same as folder"), each label, unused presets, Edit labels…. */
+export function labelEntries(ctx: MenuContext, state: LabelMenuState): ContextMenuEntry[] {
+  const { t } = ctx;
+  const entries: ContextMenuEntry[] = [
+    {
+      kind: 'radio',
+      id: 'label-none',
+      label: state.inherited
+        ? t('siteTree.labelSameAsFolder', { name: state.inherited.name, defaultValue: 'Same as folder ({{name}})' })
+        : t('siteTree.labelNone', 'None'),
+      checked: state.own === null,
+      onSelect: () => state.set({ kind: 'none' }),
+    },
+    ...state.labels.map(
+      (l): ContextMenuEntry => ({ kind: 'radio', id: `label-${l.id}`, label: l.name, icon: labelDot(l.color), checked: state.own === l.id, onSelect: () => state.set({ kind: 'label', id: l.id }) })
+    ),
+  ];
+  if (state.presets.length > 0) {
+    // Nothing exists until first use: the presets are defined when picked
+    if (state.labels.length > 0) entries.push(SEP, { kind: 'label', label: t('siteTree.labelSuggestions', 'Suggestions') });
+    for (const p of state.presets) {
+      entries.push({ kind: 'radio', id: `preset-${p.name}`, label: p.name, icon: labelDot(p.color), checked: false, onSelect: () => state.set({ kind: 'preset', name: p.name, color: p.color }) });
+    }
+  }
+  entries.push(SEP, { kind: 'item', id: 'edit-labels', label: t('siteTree.editLabels', 'Edit labels…'), icon: icon(Tags), onSelect: () => ctx.actions.editLabels() });
+  return entries;
+}
+
 /** A. One saved site (not Local). */
 export function siteMenu(site: ConnectionConfig, ctx: MenuContext, opts: { favorite: boolean } = { favorite: false }): ContextMenuEntry[] {
   const { t, actions: a } = ctx;
@@ -157,6 +230,7 @@ export function siteMenu(site: ConnectionConfig, ctx: MenuContext, opts: { favor
     { kind: 'item', id: 'rename', label: t('siteTree.rename', 'Rename'), icon: icon(TextCursorInput), shortcut: k.rename, onSelect: () => a.renameSite(site) },
     { kind: 'item', id: 'duplicate', label: t('siteTree.duplicate', 'Duplicate'), icon: icon(CopyPlus), shortcut: k.duplicate, onSelect: () => a.duplicate(site) },
     favoriteEntry(ctx, `s:${site.id}`, opts.favorite),
+    labelSubmenuEntry(ctx, [`s:${site.id}`]),
     SEP,
     { kind: 'item', id: 'move', label: t('siteTree.moveTo', 'Move to…'), icon: icon(FolderInput), shortcut: k.moveTo, onSelect: () => a.moveItems([`s:${site.id}`]) },
     {
@@ -175,6 +249,7 @@ export function siteMenu(site: ConnectionConfig, ctx: MenuContext, opts: { favor
   }
   entries.push(
     { kind: 'item', id: 'copy', label: t('siteTree.copyAddress', 'Copy address'), icon: icon(Copy), shortcut: k.copy, onSelect: () => a.copyAddress(site) },
+    { kind: 'item', id: 'export', label: t('siteTree.exportEllipsis', 'Export…'), icon: icon(FileOutput), onSelect: () => a.exportItems([`s:${site.id}`]) },
     SEP,
     { kind: 'item', id: 'delete', label: t('siteTree.delete', 'Delete'), icon: icon(Trash2), shortcut: k.delete, danger: true, onSelect: () => a.deleteItems([`s:${site.id}`]) }
   );
@@ -198,6 +273,8 @@ export function folderMenu(node: FolderNode, ctx: MenuContext, opts: { favorite:
   const { t, actions: a } = ctx;
   const k = shortcutLabels(ctx.mac);
   const hasSubfolders = node.folders.length > 0;
+  const n = node.count;
+  const formatted = formatCount(ctx.lang ?? '', n);
   return [
     { kind: 'item', id: 'new-connection', label: t('siteTree.newConnectionHere', 'New connection here'), icon: icon(Plus), shortcut: k.newConnection, onSelect: () => a.newConnection(node.path) },
     { kind: 'item', id: 'new-folder', label: t('siteTree.newFolderInside', 'New folder inside'), icon: icon(FolderPlus), shortcut: k.newFolder, onSelect: () => a.newFolder(node.path) },
@@ -205,6 +282,7 @@ export function folderMenu(node: FolderNode, ctx: MenuContext, opts: { favorite:
     SEP,
     { kind: 'item', id: 'rename', label: t('siteTree.rename', 'Rename'), icon: icon(TextCursorInput), shortcut: k.rename, onSelect: () => a.renameFolder(node.path) },
     favoriteEntry(ctx, `f:${node.path}`, opts.favorite),
+    labelSubmenuEntry(ctx, [`f:${node.path}`]),
     SEP,
     {
       kind: 'item',
@@ -234,6 +312,23 @@ export function folderMenu(node: FolderNode, ctx: MenuContext, opts: { favorite:
     SEP,
     { kind: 'item', id: 'move', label: t('siteTree.moveTo', 'Move to…'), icon: icon(FolderInput), shortcut: k.moveTo, onSelect: () => a.moveItems([`f:${node.path}`]) },
     { kind: 'item', id: 'duplicate', label: t('siteTree.duplicateFolder', 'Duplicate folder'), icon: icon(CopyPlus), shortcut: k.duplicate, onSelect: () => a.duplicateFolder(node.path) },
+    {
+      kind: 'item',
+      id: 'export',
+      label: t('siteTree.exportN', { count: n, formatted, defaultValue_one: 'Export 1 connection…', defaultValue_other: 'Export {{formatted}} connections…' }),
+      icon: icon(FileOutput),
+      disabled: n === 0,
+      onSelect: () => a.exportItems([`f:${node.path}`]),
+    },
+    {
+      kind: 'item',
+      id: 'connect-all',
+      label: t('siteTree.connectAll', { count: n, formatted, defaultValue_one: 'Connect (1)…', defaultValue_other: 'Connect all ({{formatted}})…' }),
+      icon: icon(Plug),
+      disabled: n === 0 || n > CONNECT_MAX,
+      title: tooManyTitle(ctx, n),
+      onSelect: () => a.connectItems([`f:${node.path}`]),
+    },
     SEP,
     { kind: 'item', id: 'delete', label: t('siteTree.deleteFolder', 'Delete folder…'), icon: icon(Trash2), shortcut: k.delete, danger: true, onSelect: () => a.deleteItems([`f:${node.path}`]) },
   ];
@@ -253,6 +348,10 @@ export interface MultiSummary {
   favoriteCount: number;
   /** Every one of them is a favorite already (the entry removes them) */
   allFavorite: boolean;
+  /** Selected sites Connect N opens (Local included; folders' contents are not) */
+  connectSites: number;
+  /** Connections an export holds (the sites, and everything inside the folders) */
+  exportCount: number;
   /** Formats a count for the UI language */
   format: (n: number) => string;
 }
@@ -264,7 +363,25 @@ export function multiMenu(sum: MultiSummary, ctx: MenuContext): ContextMenuEntry
   const count = sum.sites + sum.folders;
   const fav = sum.favoriteCount;
   const favFormatted = sum.format(fav);
+  const connect: ContextMenuEntry[] =
+    sum.connectSites > 0
+      ? [
+          {
+            kind: 'item',
+            id: 'connect',
+            label: t('siteTree.connectN', { count: sum.connectSites, formatted: sum.format(sum.connectSites), defaultValue_one: 'Connect 1', defaultValue_other: 'Connect {{formatted}}' }),
+            icon: icon(Plug),
+            shortcut: k.connect,
+            bold: true,
+            disabled: sum.connectSites > CONNECT_MAX,
+            title: tooManyTitle(ctx, sum.connectSites),
+            onSelect: () => a.connectItems(sum.keys),
+          },
+          SEP,
+        ]
+      : [];
   return [
+    ...connect,
     {
       kind: 'item',
       id: 'favorite',
@@ -276,6 +393,7 @@ export function multiMenu(sum: MultiSummary, ctx: MenuContext): ContextMenuEntry
       disabled: fav === 0,
       onSelect: () => a.toggleFavorites(sum.keys),
     },
+    labelSubmenuEntry(ctx, sum.keys),
     SEP,
     {
       kind: 'item',
@@ -306,6 +424,14 @@ export function multiMenu(sum: MultiSummary, ctx: MenuContext): ContextMenuEntry
       onSelect: () => a.duplicateItems(sum.keys),
     },
     { kind: 'item', id: 'copy', label: t('siteTree.copyAddresses', 'Copy addresses'), icon: icon(Copy), shortcut: k.copy, disabled: !sum.hasAddress, onSelect: () => a.copyAddresses(sum.keys) },
+    {
+      kind: 'item',
+      id: 'export',
+      label: t('siteTree.exportN', { count: sum.exportCount, formatted: sum.format(sum.exportCount), defaultValue_one: 'Export 1 connection…', defaultValue_other: 'Export {{formatted}} connections…' }),
+      icon: icon(FileOutput),
+      disabled: sum.exportCount === 0,
+      onSelect: () => a.exportItems(sum.keys),
+    },
     SEP,
     {
       kind: 'item',
@@ -330,11 +456,18 @@ export interface FilterMenuState {
   auth: ReadonlySet<string>;
   /** Protocols that exist in the library, with their formatted counts */
   protocolOptions: Array<{ value: string; label: string; count: string }>;
-  /** Offer "Favorites" / "Used in the last 30 days" (only when there are any) */
+  /** Offer "Favorites" / "Used in the last 30 days" / "Connected now" (only when there are any) */
   hasFavorites: boolean;
   hasRecents: boolean;
+  hasOpen: boolean;
+  /** Defined labels (the Labels group shows when there are any) */
+  labels: LabelDef[];
+  /** Active `label:` values (folded) */
+  labelValues: ReadonlySet<string>;
+  /** Folds a label name the way `label:` values are compared */
+  foldLabel: (name: string) => string;
   hasQualifiers: boolean;
-  toggle: (key: 'is' | 'p' | 'auth', value: string, on: boolean) => void;
+  toggle: (key: 'is' | 'p' | 'auth' | 'label', value: string, on: boolean) => void;
   openTips: () => void;
   clear: () => void;
 }
@@ -354,6 +487,7 @@ export function filterMenu(ctx: MenuContext, state: FilterMenuState): ContextMen
   const entries: ContextMenuEntry[] = [{ kind: 'label', label: t('siteTree.filterShow', 'Show') }];
   if (state.hasFavorites) entries.push(check('is', 'fav', t('siteTree.filterFavorites', 'Favorites'), state.is));
   if (state.hasRecents) entries.push(check('is', 'recent', t('siteTree.filterRecent', 'Used in the last 30 days'), state.is));
+  if (state.hasOpen || state.is.has('open')) entries.push(check('is', 'open', t('siteTree.filterOpen', 'Connected now'), state.is));
   entries.push(
     check('is', 'unfiled', t('siteTree.filterUnfiled', 'Not in a folder'), state.is),
     check('is', 'empty', t('siteTree.filterEmpty', 'Empty folders'), state.is),
@@ -369,7 +503,16 @@ export function filterMenu(ctx: MenuContext, state: FilterMenuState): ContextMen
     check('auth', 'password', t('siteTree.authPassword', 'Password'), state.auth),
     check('auth', 'key', t('siteTree.authKey', 'Key file'), state.auth),
     check('auth', 'agent', t('siteTree.authAgent', 'SSH agent'), state.auth),
-    check('auth', 'none', t('siteTree.authNone', 'Nothing saved'), state.auth),
+    check('auth', 'none', t('siteTree.authNone', 'Nothing saved'), state.auth)
+  );
+  if (state.labels.length > 0) {
+    entries.push({ kind: 'label', label: t('siteTree.filterLabels', 'Labels') });
+    for (const l of state.labels) {
+      const on = state.labelValues.has(state.foldLabel(l.name));
+      entries.push({ kind: 'check', id: `label:${l.id}`, label: l.name, icon: labelDot(l.color), checked: on, keepOpen: true, onToggle: () => state.toggle('label', l.name, !on) });
+    }
+  }
+  entries.push(
     SEP,
     { kind: 'item', id: 'tips', label: t('siteTree.searchTips', 'Search tips…'), icon: icon(Lightbulb), onSelect: state.openTips },
     { kind: 'item', id: 'clear', label: t('siteTree.clearFilters', 'Clear filters'), icon: icon(FunnelX), disabled: !state.hasQualifiers, onSelect: state.clear }
@@ -377,8 +520,11 @@ export function filterMenu(ctx: MenuContext, state: FilterMenuState): ContextMen
   return entries;
 }
 
-/** Import & export entries (footer button, empty-area menu, empty state). */
-export function importExportEntries(ctx: MenuContext): ContextMenuEntry[] {
+/**
+ * Import & export entries (footer button, empty-area menu, empty state). The footer adds
+ * "Export selected (N)…" while sites are selected.
+ */
+export function importExportEntries(ctx: MenuContext, exportSelected?: { keys: string[]; count: number }): ContextMenuEntry[] {
   const { t, actions: a } = ctx;
   const entries: ContextMenuEntry[] = [
     { kind: 'item', id: 'vault', label: t('siteTree.importExportVault', 'Import or export vault…'), icon: icon(ArrowDownUp), onSelect: () => a.openVault() },
@@ -387,6 +533,16 @@ export function importExportEntries(ctx: MenuContext): ContextMenuEntry[] {
   if (a.openShared) {
     const openShared = a.openShared;
     entries.push({ kind: 'item', id: 'open-shared', label: t('loginDialog.openShared', 'Open shared connection…'), icon: icon(FileKey2), onSelect: () => openShared() });
+  }
+  if (exportSelected && exportSelected.count > 0) {
+    const { keys, count } = exportSelected;
+    entries.push(SEP, {
+      kind: 'item',
+      id: 'export-selected',
+      label: t('siteTree.exportSelected', { count, formatted: formatCount(ctx.lang ?? '', count), defaultValue_one: 'Export selected (1)…', defaultValue_other: 'Export selected ({{formatted}})…' }),
+      icon: icon(FileOutput),
+      onSelect: () => a.exportItems(keys),
+    });
   }
   return entries;
 }
@@ -485,7 +641,9 @@ export function viewOptionsMenu(ctx: MenuContext, state: { hasFolders: boolean; 
     { kind: 'check', id: 'show-recent', label: t('siteTree.showRecent', 'Show recent'), checked: prefs.showRecent, keepOpen: true, onToggle: () => a.setView({ showRecent: !prefs.showRecent }) },
     { kind: 'check', id: 'results-as-list', label: t('siteTree.resultsAsList', 'Show search results as a list'), checked: prefs.resultsAsList, keepOpen: true, onToggle: () => a.setView({ resultsAsList: !prefs.resultsAsList }) },
     SEP,
-    ...expandEntries(ctx, state)
+    ...expandEntries(ctx, state),
+    SEP,
+    { kind: 'item', id: 'edit-labels', label: t('siteTree.editLabels', 'Edit labels…'), icon: icon(Tags), onSelect: () => a.editLabels() }
   );
   return entries;
 }

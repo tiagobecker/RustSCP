@@ -22,42 +22,12 @@ import type { ConnectionConfig } from '../../types.ts';
 import { plainTextInputProps } from '../../utils/inputHardening.ts';
 import { SPRING_DELAY_MS } from '../../utils/tabDragManager.ts';
 import { matchRanges } from './siteQuery.ts';
-import { canonicalProtocol, formatCount, isLocalSite, protocolTag, recentAge, rowIndent, siteAddress } from './siteTreeModel.ts';
-import type { TreeRow } from './types.ts';
+import { LABEL_DOT_CLASS } from './labelsModel.ts';
+import { fullDateText, recentText } from './siteFormat.ts';
+import { canonicalProtocol, formatCount, isLocalSite, protocolTag, rowIndent, siteAddress } from './siteTreeModel.ts';
+import type { LabelDef, TreeRow } from './types.ts';
 
 const cx = (...parts: Array<string | false | null | undefined>) => parts.filter(Boolean).join(' ');
-
-const dateFormats = new Map<string, { short: Intl.DateTimeFormat; full: Intl.DateTimeFormat }>();
-const dateFormat = (lang: string) => {
-  let f = dateFormats.get(lang);
-  if (!f) {
-    f = {
-      short: new Intl.DateTimeFormat(lang || undefined, { day: 'numeric', month: 'short' }),
-      full: new Intl.DateTimeFormat(lang || undefined, { dateStyle: 'medium', timeStyle: 'short' }),
-    };
-    dateFormats.set(lang, f);
-  }
-  return f;
-};
-
-type TFn = ReturnType<typeof useTranslation>['t'];
-
-/** Recent rows' time on the right: "now", "5 min", "2 h", "3 d", then a short date. */
-const recentText = (atSecs: number, lang: string, t: TFn): string => {
-  const age = recentAge(atSecs, Date.now());
-  switch (age.unit) {
-    case 'now':
-      return t('siteTree.agoNow', 'now');
-    case 'min':
-      return t('siteTree.agoMinutes', { count: age.count, defaultValue: '{{count}} min' });
-    case 'h':
-      return t('siteTree.agoHours', { count: age.count, defaultValue: '{{count}} h' });
-    case 'd':
-      return t('siteTree.agoDays', { count: age.count, defaultValue: '{{count}} d' });
-    default:
-      return dateFormat(lang).short.format(age.date);
-  }
-};
 
 /** Left of the indent guide for ancestor level `k` (the middle of that level's twisty). */
 const guideLeft = (k: number): number => rowIndent(k) + 7.5;
@@ -148,7 +118,14 @@ export interface SiteTreeRowProps {
   springing?: boolean;
   /** A drag over Favorites: the insertion line above or below this row */
   dropLine?: 'before' | 'after' | null;
+  /** A site with an open tab (a green dot on its icon) */
+  open?: boolean;
 }
+
+/** The 6px label dot after a name (its name is in the row's tooltip and accessible name). */
+const LabelDot: React.FC<{ def: LabelDef }> = ({ def }) => (
+  <span aria-hidden className={cx('ml-1.5 w-1.5 h-1.5 shrink-0 self-center rounded-full', LABEL_DOT_CLASS[def.color])} />
+);
 
 /** Inline name editor (rename, new folder), with the error bubble under it. */
 const NameInput: React.FC<{ edit: RowEditState; domId: string }> = ({ edit, domId }) => {
@@ -219,6 +196,7 @@ export const SiteTreeRow = memo(function SiteTreeRow({
   dropBlock,
   springing,
   dropLine,
+  open,
 }: SiteTreeRowProps) {
   const { t, i18n } = useTranslation();
   const lang = i18n.language;
@@ -351,8 +329,11 @@ export const SiteTreeRow = memo(function SiteTreeRow({
             defaultValue_one: '{{name}}, folder, 1 connection',
             defaultValue_other: '{{name}}, folder, {{formatted}} connections',
           });
+    const labelName = row.labelDef?.name ?? null;
+    const folderLabel = labelName ? `${label}, ${t('siteTree.a11yLabel', { name: labelName, defaultValue: 'label {{name}}' })}` : label;
+    const folderTitle = labelName ? `${row.path}\n${t('siteTree.pillLabel', { value: labelName, defaultValue: 'Label: {{value}}' })}` : row.path;
     return (
-      <div {...base} aria-expanded={row.expanded} aria-label={label} className={rowClass} style={style} title={row.path}>
+      <div {...base} aria-expanded={row.expanded} aria-label={folderLabel} className={rowClass} style={style} title={folderTitle}>
         {guides}
         <span data-action="twisty" className="w-4 h-4 shrink-0 flex items-center justify-center text-ink-faint hover:text-ink">
           <ChevronRight aria-hidden className={cx('w-3 h-3 transition-transform duration-[120ms] motion-reduce:transition-none', row.expanded && 'rotate-90')} />
@@ -364,9 +345,15 @@ export const SiteTreeRow = memo(function SiteTreeRow({
           </span>
         ) : (
           <>
-            <span className="ml-2 flex-1 min-w-0 truncate text-[13px] font-medium text-ink">
+            <span className={cx('ml-2 min-w-0 truncate text-[13px] font-medium text-ink', !(row.labelDot && row.labelDef) && 'flex-1')}>
               <Highlight text={row.name} terms={nameTerms} />
             </span>
+            {row.labelDot && row.labelDef && (
+              <>
+                <LabelDot def={row.labelDef} />
+                <span className="flex-1" />
+              </>
+            )}
             {row.count > 0 && (
               <span className={cx('ml-2 shrink-0 text-[11px] tabular-nums text-ink-faint', showActions ? 'hidden' : 'group-hover:hidden')}>{formatted}</span>
             )}
@@ -399,9 +386,12 @@ export const SiteTreeRow = memo(function SiteTreeRow({
         ? t('siteTree.a11yUserAt', { user: site.username, host: address.slice(address.indexOf('@') + 1), defaultValue: '{{user}} at {{host}}' })
         : address;
     const favLabel = row.favorite ? t('siteTree.a11yFavorite', 'favorite') : null;
+    const labelName = row.labelDef?.name ?? null;
+    const labelA11y = labelName ? t('siteTree.a11yLabel', { name: labelName, defaultValue: 'label {{name}}' }) : null;
+    const openA11y = open ? t('siteTree.a11yConnected', 'connected') : null;
     const a11y = local
-      ? [site.name, tag, favLabel].filter(Boolean).join(', ')
-      : [site.name, tag, userAt, ftp ? t('siteTree.notEncrypted', 'not encrypted') : null, favLabel].filter(Boolean).join(', ');
+      ? [site.name, tag, favLabel, labelA11y, openA11y].filter(Boolean).join(', ')
+      : [site.name, tag, userAt, ftp ? t('siteTree.notEncrypted', 'not encrypted') : null, favLabel, labelA11y, openA11y].filter(Boolean).join(', ');
     // The filled star after the name marks a favorite (not needed inside the Favorites list itself)
     const favMark = row.favorite && !(row.section === 'fav' && row.depth === 0) && !edit;
     const favTitle = row.favorite ? t('siteTree.removeFavorite', 'Remove from favorites') : t('siteTree.addFavorite', 'Add to favorites');
@@ -423,7 +413,16 @@ export const SiteTreeRow = memo(function SiteTreeRow({
       </button>
     );
     const recentAt = row.section === 'rec' && typeof row.recentAt === 'number' ? row.recentAt : null;
-    const tooltip = [site.name, address, row.folder, t('loginDialog.doubleClickHint', 'Double-click to connect')].filter(Boolean).join('\n');
+    const tooltip = [
+      site.name,
+      address,
+      row.folder,
+      labelName ? t('siteTree.pillLabel', { value: labelName, defaultValue: 'Label: {{value}}' }) : null,
+      open ? t('siteTree.openInTab', 'Open in a tab') : null,
+      t('loginDialog.doubleClickHint', 'Double-click to connect'),
+    ]
+      .filter(Boolean)
+      .join('\n');
     const tagEl = (
       <span
         className={cx('text-[10.5px] font-medium', ftp && 'text-amber-700 dark:text-amber-400')}
@@ -440,11 +439,24 @@ export const SiteTreeRow = memo(function SiteTreeRow({
       </span>
     );
     const favMarkEl = favMark ? <Star aria-hidden className="ml-1 w-[11px] h-[11px] shrink-0 self-center text-ink-muted" fill="currentColor" /> : null;
+    const labelDotEl = row.labelDot && row.labelDef && !edit ? <LabelDot def={row.labelDef} /> : null;
+    // The open-session dot sits on the icon's corner (top-right for FTP, whose lock badge is bottom-right)
+    const glyph = open ? (
+      <span className="relative inline-flex shrink-0">
+        <ProtocolGlyph site={site} selected={selected} />
+        <span
+          aria-hidden
+          className={cx('absolute w-1.5 h-1.5 rounded-full bg-emerald-500 ring-[1.5px] ring-dark-850', ftp ? '-right-0.5 -top-0.5' : '-right-0.5 -bottom-0.5')}
+        />
+      </span>
+    ) : (
+      <ProtocolGlyph site={site} selected={selected} />
+    );
     return (
       <div {...base} aria-label={a11y} className={rowClass} style={style} title={edit ? undefined : tooltip}>
         {guides}
         <span className="w-4 h-4 shrink-0" aria-hidden />
-        <ProtocolGlyph site={site} selected={selected} />
+        {glyph}
         {compact ? (
           <span className="ml-2 flex-1 min-w-0 flex items-baseline gap-2">
             {nameEl}
@@ -457,12 +469,14 @@ export const SiteTreeRow = memo(function SiteTreeRow({
               <span className="flex-1" />
             )}
             {favMarkEl}
+            {labelDotEl}
           </span>
         ) : (
           <span className="ml-2 flex-1 min-w-0 flex flex-col justify-center leading-tight">
             <span className="flex items-center min-w-0">
               {nameEl}
               {favMarkEl}
+              {labelDotEl}
             </span>
             {!edit && (
               <span className="truncate text-[11.5px] text-ink-muted mt-px">
@@ -481,7 +495,7 @@ export const SiteTreeRow = memo(function SiteTreeRow({
         {recentAt !== null && !edit && (
           <span
             className={cx('ml-2 shrink-0 text-[11px] tabular-nums text-ink-faint', showActions ? 'hidden' : 'group-hover:hidden')}
-            title={dateFormat(lang).full.format(new Date(recentAt * 1000))}
+            title={fullDateText(recentAt, lang)}
           >
             {recentText(recentAt, lang, t)}
           </span>

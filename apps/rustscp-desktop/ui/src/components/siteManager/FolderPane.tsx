@@ -4,8 +4,9 @@ import { useTranslation } from 'react-i18next';
 import { FolderInput, FolderPlus, Plus, TextCursorInput, Trash2 } from 'lucide-react';
 import { plainTextInputProps } from '../../utils/inputHardening.ts';
 import { Button } from '../ui/controls.tsx';
+import { FolderContentsTable } from './FolderContentsTable.tsx';
 import { folderChain, formatCount, protocolBreakdown, sitesInside } from './siteTreeModel.ts';
-import type { FolderNode, TreeModel } from './types.ts';
+import type { ConnectionConfig, FolderNode, TreeModel } from './types.ts';
 
 interface Props {
   /** The folder; null for the root overview ("All connections") */
@@ -23,6 +24,12 @@ interface Props {
   onClose: () => void;
   /** Escape layer of the dialog: reverts an edited name */
   escapeRef: MutableRefObject<(() => boolean) | null>;
+  /** Sites with an open tab (the contents table's dots) */
+  openSiteIds: ReadonlySet<string>;
+  /** The contents table: a click shows the item in the tree (this overview stays) */
+  onRevealItem: (itemKey: string) => void;
+  /** The contents table: double-click or Enter on a site */
+  onConnect: (site: ConnectionConfig) => void;
 }
 
 /** "34 connections in 3 folders · 28 SFTP · 4 FTPS · 2 S3" */
@@ -51,7 +58,21 @@ const useFolderStats = (model: TreeModel, node: FolderNode | null): string => {
  * The right pane while one folder (or the "All connections" header) is selected: its name (edit to
  * rename), what it holds, and its actions. The form comes back as soon as a site is selected.
  */
-export const FolderPane: React.FC<Props> = ({ node, model, onRename, onMove, onDelete, onNewFolder, onNewConnection, onReveal, onClose, escapeRef }) => {
+export const FolderPane: React.FC<Props> = ({
+  node,
+  model,
+  onRename,
+  onMove,
+  onDelete,
+  onNewFolder,
+  onNewConnection,
+  onReveal,
+  onClose,
+  escapeRef,
+  openSiteIds,
+  onRevealItem,
+  onConnect,
+}) => {
   const { t } = useTranslation();
   const inputRef = useRef<HTMLInputElement>(null);
   const [name, setName] = useState(node?.name ?? '');
@@ -99,8 +120,8 @@ export const FolderPane: React.FC<Props> = ({ node, model, onRename, onMove, onD
 
   return (
     <div className="flex-1 min-h-0 flex flex-col">
-      <div className="flex-1 overflow-y-auto px-7 pt-5 pb-6">
-        <nav className="h-[18px] text-[12px] text-ink-faint flex items-center min-w-0 whitespace-nowrap overflow-hidden" aria-label={t('siteTree.breadcrumb', 'Folder path')}>
+      <div className="flex-1 min-h-0 overflow-y-auto px-7 pt-5 pb-5 flex flex-col">
+        <nav className="h-[18px] shrink-0 text-[12px] text-ink-faint flex items-center min-w-0 whitespace-nowrap overflow-hidden" aria-label={t('siteTree.breadcrumb', 'Folder path')}>
           {node && (
             <>
               <button type="button" className="shrink-0 hover:text-ink hover:underline underline-offset-2" onClick={() => onReveal('')}>
@@ -139,22 +160,23 @@ export const FolderPane: React.FC<Props> = ({ node, model, onRename, onMove, onD
             aria-label={t('siteTree.folderName', 'Folder name')}
             aria-invalid={error ? true : undefined}
             aria-describedby={error ? errorId : undefined}
-            className="w-full h-9 bg-transparent text-[17px] font-semibold text-ink placeholder:text-ink-faint outline-none rounded-md -ml-1 px-1 hover:bg-dark-650/40 focus:bg-dark-650/40 transition-colors"
+            className="w-full h-9 shrink-0 bg-transparent text-[17px] font-semibold text-ink placeholder:text-ink-faint outline-none rounded-md -ml-1 px-1 hover:bg-dark-650/40 focus:bg-dark-650/40 transition-colors"
           />
         ) : (
-          <h2 className="h-9 flex items-center text-[17px] font-semibold text-ink">{t('siteTree.sectionAll', 'All connections')}</h2>
+          <h2 className="h-9 shrink-0 flex items-center text-[17px] font-semibold text-ink">{t('siteTree.sectionAll', 'All connections')}</h2>
         )}
         {error && (
-          <p id={errorId} role="alert" className="mt-0.5 text-[12px] text-red-600 dark:text-red-400">
+          <p id={errorId} role="alert" className="mt-0.5 shrink-0 text-[12px] text-red-600 dark:text-red-400">
             {error}
           </p>
         )}
-        <p className="mt-1 text-[12.5px] text-ink-muted leading-relaxed">{stats}</p>
+        <p className="mt-1 shrink-0 text-[12.5px] text-ink-muted leading-relaxed">{stats}</p>
 
         {node && (
-          <div className="mt-6 flex flex-col gap-2 w-64 max-w-full">
+          // A row, not a stack: the contents table below takes the height
+          <div className="mt-4 flex flex-wrap gap-2 shrink-0">
             <Button
-              className="justify-start"
+              size="sm"
               icon={<TextCursorInput className="w-3.5 h-3.5 text-ink-muted" />}
               onClick={() => {
                 inputRef.current?.focus();
@@ -163,14 +185,26 @@ export const FolderPane: React.FC<Props> = ({ node, model, onRename, onMove, onD
             >
               {t('siteTree.rename', 'Rename')}
             </Button>
-            <Button className="justify-start" icon={<FolderInput className="w-3.5 h-3.5 text-ink-muted" />} onClick={onMove}>
+            <Button size="sm" icon={<FolderInput className="w-3.5 h-3.5 text-ink-muted" />} onClick={onMove}>
               {t('siteTree.moveTo', 'Move to…')}
             </Button>
-            <Button className="justify-start !text-red-600 dark:!text-red-400" icon={<Trash2 className="w-3.5 h-3.5" />} onClick={onDelete}>
+            <Button size="sm" className="!text-red-600 dark:!text-red-400" icon={<Trash2 className="w-3.5 h-3.5" />} onClick={onDelete}>
               {t('siteTree.deleteFolder', 'Delete folder…')}
             </Button>
           </div>
         )}
+
+        <div className="mt-5 flex-1 min-h-0 flex flex-col">
+          <FolderContentsTable
+            model={model}
+            path={node?.path ?? ''}
+            name={node?.name ?? t('siteTree.sectionAll', 'All connections')}
+            openSiteIds={openSiteIds}
+            onReveal={onRevealItem}
+            onConnect={onConnect}
+            onOpenFolder={onReveal}
+          />
+        </div>
       </div>
 
       <div className="flex items-center gap-2 px-5 py-3.5 border-t border-line shrink-0 select-none">

@@ -2919,6 +2919,7 @@ export const App: React.FC = () => {
           onSitesUpdated={(newSites) => setSavedSites(newSites)}
           onShareSite={(site) => setShareSource({ siteId: site.id, name: site.name, host: site.host, username: site.username, startPath: '' })}
           onOpenSharedConnection={() => setShareFiles((prev) => [...prev, null])}
+          openSiteIds={sessions.map((s) => s.config.id)}
         />
       </ModalGuard>
 

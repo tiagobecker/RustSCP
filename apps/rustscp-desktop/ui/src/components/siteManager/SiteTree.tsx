@@ -108,6 +108,8 @@ interface SiteTreeProps {
   describedById: string;
   /** Canonical item keys marked by ⌘X (shown at 50% opacity) */
   cutKeys: ReadonlySet<string>;
+  /** Saved sites with an open tab (a green dot on their icon) */
+  openSiteIds: ReadonlySet<string>;
 }
 
 /** Height of the sticky breadcrumb over the list */
@@ -120,7 +122,7 @@ const isPrintable = (e: React.KeyboardEvent) =>
 
 /** The virtualized `role="tree"` list: rows, keyboard map and mouse wiring. */
 export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteTree(
-  { rows, indexByKey, rowHeight, compact, showAddress, selection, nameTerms, addressTerms, anyExpanded, edit, actionsRef, ariaLabel, describedById, cutKeys },
+  { rows, indexByKey, rowHeight, compact, showAddress, selection, nameTerms, addressTerms, anyExpanded, edit, actionsRef, ariaLabel, describedById, cutKeys, openSiteIds },
   ref
 ) {
   const { t, i18n } = useTranslation();
@@ -575,6 +577,7 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
               dropBlock={dragView.block !== null && inDropBlock(row, dragView.block)}
               springing={dragView.springKey === row.key}
               dropLine={dragView.line && dragView.line.key === row.key ? dragView.line.side : null}
+              open={row.kind === 'site' && openSiteIds.size > 0 && openSiteIds.has(row.site.id)}
             />
           );
         })}
