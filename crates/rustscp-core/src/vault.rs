@@ -743,9 +743,29 @@ fn resolve_device_key(
     })
 }
 
+/// Serializes, within this process, every step that finds, creates or moves the device
+/// key and every write sealed with it: the key is found (or made) and used under one
+/// lock, so two first writes (the first saved site and the first layout write) can never
+/// each make a key and seal a file with the one that loses. It is always the innermost
+/// lock: nothing else is taken while it is held.
+static VAULT_KEY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn vault_key_lock() -> std::sync::MutexGuard<'static, ()> {
+    VAULT_KEY_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Returns the vault's device key, creating one only when no vault exists yet. A new
 /// key goes into `store` when there is one (the key file is the fallback).
 fn get_or_create_device_key_with(
+    dir: &Path,
+    store: Option<&dyn KeyStore>,
+) -> Result<String, VaultError> {
+    let _guard = vault_key_lock();
+    get_or_create_device_key_locked(dir, store)
+}
+
+/// [`get_or_create_device_key_with`] for a caller that holds [`vault_key_lock`].
+fn get_or_create_device_key_locked(
     dir: &Path,
     store: Option<&dyn KeyStore>,
 ) -> Result<String, VaultError> {
@@ -793,7 +813,12 @@ fn get_or_create_device_key_with(
 
     let key_path = dir.join(DEVICE_KEY_FILE);
     if key_path.exists() {
-        // Present but blank: replace it atomically (no vault depends on it).
+        // Read it again: another RustSCP process may have just written its key, and that
+        // key may already seal a file. Only a file that is really blank is replaced
+        // (atomically; no vault depends on it).
+        if let Some(key) = read_device_key_in(dir)? {
+            return Ok(key);
+        }
         write_private_file_atomic(&key_path, key_hex.as_bytes())?;
         return Ok(key_hex);
     }
@@ -858,6 +883,7 @@ fn quarantine_file(path: &Path) -> Result<PathBuf, VaultError> {
 }
 
 fn quarantine_vault_in(dir: &Path) -> Result<Option<PathBuf>, VaultError> {
+    let _guard = vault_key_lock();
     let vault_path = dir.join(LOCAL_VAULT_FILE);
     if !vault_path.exists() {
         return Ok(None);
@@ -888,9 +914,11 @@ fn save_vault_with(
 ) -> Result<(), VaultError> {
     ensure_private_dir(dir)?;
     let vault_path = dir.join(LOCAL_VAULT_FILE);
+    // Held until the new vault is in place, so the key it is sealed with is the key.
+    let _guard = vault_key_lock();
     // Refuses (DeviceKeyMissing, KeychainUnavailable) instead of inventing a key when
     // the vault exists.
-    let device_key = get_or_create_device_key_with(dir, store)?;
+    let device_key = get_or_create_device_key_locked(dir, store)?;
 
     // Safety net: never overwrite a vault this key cannot open. Keep it as
     // `.corrupt-<ts>` and keep the last good version as `.bak`.
@@ -933,7 +961,9 @@ fn load_vault_with(
         Err(e) => return Err(VaultError::IoError(e)),
     };
     // Loading never creates a key: a vault without its key is an error, not "empty".
-    // An old key file is moved into the Keychain here, on the first load.
+    // An old key file is moved into the Keychain here, on the first load (under the
+    // lock, since that moves the key).
+    let _guard = vault_key_lock();
     let device_key = resolve_device_key(dir, store, true)?
         .ok_or_else(|| VaultError::DeviceKeyMissing(vault_path.to_string_lossy().to_string()))?;
     decrypt_local_envelope(&json_str, &device_key.key)
@@ -990,26 +1020,20 @@ pub async fn load_local_vault_async() -> Result<Vec<ConnectionConfig>, VaultErro
 
 // ----------------- OTHER FILES SEALED WITH THE DEVICE KEY -----------------
 
-/// Files of the config folder that a sealed file must never replace. Compared ignoring
-/// ASCII case, because the macOS and Windows file systems do.
-const RESERVED_CONFIG_FILES: [&str; 3] =
-    [LOCAL_VAULT_FILE, LOCAL_VAULT_BACKUP_FILE, DEVICE_KEY_FILE];
+/// The only names a sealed config file may have. An allow-list, not a list of names to
+/// avoid: file systems that ignore case fold more than ASCII (on APFS "\u{17F}ites.vault"
+/// opens sites.vault and ".vault_\u{212A}ey" opens .vault_key), so no deny-list can
+/// keep a sealed file off the vault or its key.
+const SEALED_CONFIG_FILES: &[&str] = &[crate::site_layout::SITE_LAYOUT_FILE];
 
 fn check_sealed_file_name(file_name: &str) -> Result<(), VaultError> {
-    let bad = file_name.is_empty()
-        || file_name == "."
-        || file_name == ".."
-        || file_name.contains(['/', '\\', '\0'])
-        || RESERVED_CONFIG_FILES
-            .iter()
-            .any(|reserved| reserved.eq_ignore_ascii_case(file_name));
-    if bad {
-        return Err(VaultError::Other(format!(
-            "invalid name for a sealed config file: \"{}\"",
-            file_name.escape_default()
-        )));
+    if SEALED_CONFIG_FILES.contains(&file_name) {
+        return Ok(());
     }
-    Ok(())
+    Err(VaultError::Other(format!(
+        "invalid name for a sealed config file: \"{}\"",
+        file_name.escape_default()
+    )))
 }
 
 fn save_sealed_with(
@@ -1020,9 +1044,11 @@ fn save_sealed_with(
 ) -> Result<(), VaultError> {
     check_sealed_file_name(file_name)?;
     ensure_private_dir(dir)?;
+    // Held until the file is in place, so the key it is sealed with is the key.
+    let _guard = vault_key_lock();
     // Refuses (DeviceKeyMissing, KeychainUnavailable) instead of inventing a key while a
     // sites.vault exists without one.
-    let key = get_or_create_device_key_with(dir, store)?;
+    let key = get_or_create_device_key_locked(dir, store)?;
     let envelope = encrypt_bytes_with_iterations(plaintext, &key, 0, LOCAL_VAULT_KDF_ITERATIONS)?;
     let json = serde_json::to_string(&envelope)?;
     write_private_file_atomic(&dir.join(file_name), json.as_bytes())?;
@@ -1043,7 +1069,9 @@ fn load_sealed_with(
     };
     // A file that is not an envelope at all is a file problem, whatever the key does.
     let envelope = parse_vault_from_json(&json)?;
-    // Loading never creates (or moves) a key.
+    // Loading never creates (or moves) a key. The lock keeps it from reading a key file
+    // that a writer of this process has created but not filled yet.
+    let _guard = vault_key_lock();
     let key = resolve_device_key(dir, store, false)?
         .ok_or_else(|| VaultError::DeviceKeyMissing(path.to_string_lossy().to_string()))?;
     decrypt_bytes_bounded(&envelope, &key.key, 1, MAX_PASSWORD_KDF_ITERATIONS).map(Some)
@@ -1051,6 +1079,7 @@ fn load_sealed_with(
 
 fn quarantine_config_file_in(dir: &Path, file_name: &str) -> Result<Option<PathBuf>, VaultError> {
     check_sealed_file_name(file_name)?;
+    let _guard = vault_key_lock();
     let path = dir.join(file_name);
     if !path.exists() {
         return Ok(None);
@@ -1060,7 +1089,7 @@ fn quarantine_config_file_in(dir: &Path, file_name: &str) -> Result<Option<PathB
 
 /// Encrypts `plaintext` with this device's vault key into `<config dir>/<file_name>` (same
 /// envelope and cipher as sites.vault, atomic 0600 write). A key is created only when no
-/// sites.vault exists. `file_name` is a bare name, never sites.vault, its backup or the key.
+/// sites.vault exists. `file_name` must be one of the allowed names (`site-layout.vault`).
 pub fn save_device_sealed_file(file_name: &str, plaintext: &[u8]) -> Result<(), VaultError> {
     let dir = get_rustscp_config_dir();
     let store = platform_key_store(&dir);
@@ -2102,5 +2131,113 @@ mod sealed_file_tests {
             );
         }
         assert_eq!(load_vault_in(dir.path()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_look_alike_name_never_reaches_sites_vault_or_its_key() {
+        let dir = tempdir().unwrap();
+        save_vault_in(dir.path(), &one_site()).unwrap();
+        let key_before = fs::read_to_string(dir.path().join(DEVICE_KEY_FILE)).unwrap();
+        // U+017F (long s) and U+212A (Kelvin sign) case-fold to "s" and "k": on a
+        // case-insensitive APFS volume these names open sites.vault and .vault_key.
+        for name in [
+            "\u{17F}ites.vault",
+            ".vault_\u{212A}ey",
+            "Site-Layout.vault",
+            "site-layout.vault.corrupt-1",
+        ] {
+            let shown = name.escape_unicode().to_string();
+            assert!(check_sealed_file_name(name).is_err(), "{shown}");
+            assert!(
+                save_sealed_with(dir.path(), None, name, b"{\"folders\":[]}").is_err(),
+                "{shown}"
+            );
+            assert!(load_sealed_with(dir.path(), None, name).is_err(), "{shown}");
+            assert!(
+                quarantine_config_file_in(dir.path(), name).is_err(),
+                "{shown}"
+            );
+        }
+        assert!(check_sealed_file_name(FILE).is_ok());
+        assert_eq!(load_vault_in(dir.path()).unwrap().len(), 1);
+        assert_eq!(
+            fs::read_to_string(dir.path().join(DEVICE_KEY_FILE)).unwrap(),
+            key_before
+        );
+    }
+
+    /// The first saved site and the first layout write of a fresh config folder both
+    /// need a device key. Whichever makes it, both files must open with the key kept.
+    #[test]
+    fn the_first_site_save_and_the_first_layout_write_share_one_key() {
+        use std::sync::{Arc, Barrier};
+        use std::time::{Duration, Instant};
+        let started = Instant::now();
+        let mut runs = 0;
+        while runs < 300 && started.elapsed() < Duration::from_secs(5) {
+            runs += 1;
+            let dir = tempdir().unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let (d1, b1) = (dir.path().to_path_buf(), barrier.clone());
+            let save_site = std::thread::spawn(move || {
+                b1.wait();
+                save_vault_in(&d1, &one_site())
+            });
+            let (d2, b2) = (dir.path().to_path_buf(), barrier);
+            let layout = std::thread::spawn(move || {
+                b2.wait();
+                save_sealed_in(&d2, FILE, b"{}")
+            });
+            save_site.join().unwrap().unwrap();
+            layout.join().unwrap().unwrap();
+            assert_eq!(
+                load_vault_in(dir.path()).map(|s| s.len()).ok(),
+                Some(1),
+                "run {runs}: sites.vault was sealed with a key that is gone"
+            );
+            assert_eq!(
+                load_sealed_in(dir.path(), FILE).ok().flatten().as_deref(),
+                Some(&b"{}"[..]),
+                "run {runs}: the layout was sealed with a key that is gone"
+            );
+        }
+    }
+
+    /// A Keychain that refuses a new key while another RustSCP process fills the blank
+    /// key file.
+    struct OtherProcessWritesTheKey(PathBuf);
+
+    impl KeyStore for OtherProcessWritesTheKey {
+        fn location(&self) -> String {
+            "test store".into()
+        }
+        fn get(&self) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+        fn add(&self, _key: &str) -> Result<bool, String> {
+            fs::write(self.0.join(DEVICE_KEY_FILE), "key-of-the-other-process").unwrap();
+            Err("denied".into())
+        }
+    }
+
+    #[test]
+    fn a_key_file_filled_meanwhile_is_used_and_only_a_blank_one_is_replaced() {
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join(DEVICE_KEY_FILE);
+        fs::write(&key_path, "").unwrap();
+        let store = OtherProcessWritesTheKey(dir.path().to_path_buf());
+        let key = get_or_create_device_key_with(dir.path(), Some(&store)).unwrap();
+        assert_eq!(key, "key-of-the-other-process");
+        assert_eq!(
+            fs::read_to_string(&key_path).unwrap(),
+            "key-of-the-other-process"
+        );
+
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join(DEVICE_KEY_FILE);
+        fs::write(&key_path, "  \n").unwrap();
+        let key = get_or_create_device_key_in(dir.path()).unwrap();
+        assert_eq!(key.len(), 64);
+        assert_eq!(fs::read_to_string(&key_path).unwrap(), key);
     }
 }

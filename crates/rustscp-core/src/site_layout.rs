@@ -24,9 +24,12 @@ pub const MAX_LAYOUT_FOLDERS: usize = 10_000;
 pub const MAX_FAVORITES: usize = 200;
 pub const MAX_RECENTS: usize = 50;
 pub const MAX_LABELS: usize = 12;
-pub const MAX_COLLAPSED: usize = 2_000;
-pub const MAX_OPS_PER_CALL: usize = 100;
-pub const MAX_IDS_PER_CALL: usize = 5_000;
+/// Every folder can be collapsed ("Collapse all" on the largest layout).
+pub const MAX_COLLAPSED: usize = MAX_LAYOUT_FOLDERS;
+/// Ops in one batch (moving 150 selected folders is 150 ops).
+pub const MAX_OPS_PER_CALL: usize = 2_000;
+/// Ids and items in one batch, and sites one batch may create by copying.
+pub const MAX_IDS_PER_CALL: usize = 50_000;
 pub const MAX_SITE_NAME_LEN: usize = 255;
 pub const MAX_LABEL_NAME_LEN: usize = 40;
 /// Longest label id (`label-<uuid>` is 42 characters).
@@ -227,6 +230,20 @@ impl SiteTreeOp {
                 | Self::SetLabelDefs { .. }
         )
     }
+
+    /// Whether the op renames, moves, copies or deletes a folder. Those rewrite folder
+    /// paths in the layout too (labels, favorites, collapsed state), so they are refused
+    /// as well while the layout is read-only: `sites.vault` would get the new paths and
+    /// the layout file would keep the old ones.
+    pub fn rewrites_folder_paths(&self) -> bool {
+        matches!(
+            self,
+            Self::RenameFolder { .. }
+                | Self::MoveFolder { .. }
+                | Self::DeleteFolder { .. }
+                | Self::CopyFolder { .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -283,6 +300,51 @@ pub struct UndoSnapshot {
     pub sites_after: Vec<(String, Option<Value>)>,
     pub layout_before: SiteLayout,
     pub layout_after: SiteLayout,
+    /// The folder renames, moves and lifts of the batch, in order.
+    pub folder_remaps: Vec<FolderRemap>,
+}
+
+impl UndoSnapshot {
+    /// Site records it holds (snapshots before and after, and ids of moved sites).
+    pub fn site_records(&self) -> usize {
+        self.sites_before.len()
+            + self.sites_after.len()
+            + self
+                .folder_remaps
+                .iter()
+                .map(|r| r.site_ids.as_ref().map_or(0, Vec::len))
+                .sum::<usize>()
+    }
+}
+
+/// One folder rename, move, or lift (a delete that keeps the contents), for [`undo`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FolderRemap {
+    /// Each `.0` folder, with everything inside it, went to `.1`.
+    pub moves: Vec<(String, String)>,
+    /// The sites it moved that the batch left changed; `None` when there were too many
+    /// to list, which [`undo`] reads as "any of them".
+    pub site_ids: Option<Vec<String>>,
+}
+
+/// What a batch did besides changing the lists, gathered while it runs.
+#[derive(Default)]
+struct BatchLog {
+    created: Vec<CreatedSite>,
+    remaps: Vec<FolderRemap>,
+    /// Site ids listed in `remaps` so far (at most [`MAX_IDS_PER_CALL`]).
+    remap_ids: usize,
+}
+
+impl BatchLog {
+    /// Refuses one more copy once the batch made [`MAX_IDS_PER_CALL`] of them: a copy of
+    /// a folder copies every site inside it, so a few ops could ask for millions.
+    fn check_copy_budget(&self) -> Result<(), SiteTreeError> {
+        if self.created.len() >= MAX_IDS_PER_CALL {
+            return Err(err_too_many("items at once"));
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -603,6 +665,8 @@ pub fn reconcile(layout: &mut SiteLayout, sites: &[ConnectionConfig]) -> bool {
 // ---------------------------------------------------------------------------------------
 
 /// Refuses a batch with more than [`MAX_OPS_PER_CALL`] ops or [`MAX_IDS_PER_CALL`] ids.
+/// [`apply_ops`] also refuses a batch that would create more than [`MAX_IDS_PER_CALL`]
+/// copies.
 pub fn check_op_limits(ops: &[SiteTreeOp]) -> Result<(), SiteTreeError> {
     if ops.len() > MAX_OPS_PER_CALL {
         return Err(err_too_many("changes at once"));
@@ -629,9 +693,9 @@ pub fn apply_ops(
     let layout_before = work_layout.clone();
     let folders_before = work_layout.folders.len();
 
-    let mut created = Vec::new();
+    let mut log = BatchLog::default();
     for op in ops {
-        apply_one(&mut work_sites, &mut work_layout, op, new_id, &mut created)?;
+        apply_one(&mut work_sites, &mut work_layout, op, new_id, &mut log)?;
     }
     if work_layout.folders.len() > MAX_LAYOUT_FOLDERS && work_layout.folders.len() > folders_before
     {
@@ -640,15 +704,23 @@ pub fn apply_ops(
     reconcile(&mut work_layout, &work_sites);
 
     let (sites_before, sites_after) = diff_sites(sites, &work_sites);
+    // Undo only looks at sites the batch left changed.
+    let changed: HashSet<&str> = sites_before.iter().map(|(id, _)| id.as_str()).collect();
+    for remap in &mut log.remaps {
+        if let Some(ids) = &mut remap.site_ids {
+            ids.retain(|id| changed.contains(id.as_str()));
+        }
+    }
     let outcome = ApplyOutcome {
         sites_changed: !sites_before.is_empty(),
         layout_changed: work_layout != *layout,
-        created,
+        created: log.created,
         undo: UndoSnapshot {
             sites_before,
             sites_after,
             layout_before,
             layout_after: work_layout.clone(),
+            folder_remaps: log.remaps,
         },
     };
     *sites = work_sites;
@@ -694,11 +766,11 @@ fn apply_one(
     layout: &mut SiteLayout,
     op: &SiteTreeOp,
     new_id: &mut dyn FnMut() -> String,
-    created: &mut Vec<CreatedSite>,
+    log: &mut BatchLog,
 ) -> Result<(), SiteTreeError> {
     match op {
         SiteTreeOp::MoveSites { ids, to } => move_sites(sites, ids, to.as_deref()),
-        SiteTreeOp::CopySites { items } => copy_sites(sites, layout, items, new_id, created),
+        SiteTreeOp::CopySites { items } => copy_sites(sites, layout, items, new_id, log),
         SiteTreeOp::DeleteSites { ids } => delete_sites(sites, ids),
         SiteTreeOp::RenameSite { id, name } => {
             let name = validate_site_name(name)?;
@@ -710,18 +782,18 @@ fn apply_one(
         }
         SiteTreeOp::CreateFolder { path } => create_folder(layout, path),
         SiteTreeOp::RenameFolder { path, name, merge } => {
-            rename_folder(sites, layout, path, name, *merge)
+            rename_folder(sites, layout, path, name, *merge, log)
         }
         SiteTreeOp::MoveFolder { path, to, merge } => {
-            move_folder(sites, layout, path, to.as_deref(), *merge)
+            move_folder(sites, layout, path, to.as_deref(), *merge, log)
         }
         SiteTreeOp::CopyFolder { path, to, name } => {
-            copy_folder(sites, layout, path, to.as_deref(), name, new_id, created)
+            copy_folder(sites, layout, path, to.as_deref(), name, new_id, log)
         }
         SiteTreeOp::DeleteFolder {
             path,
             keep_contents,
-        } => delete_folder(sites, layout, path, *keep_contents),
+        } => delete_folder(sites, layout, path, *keep_contents, log),
         SiteTreeOp::SetFavorites { items } => {
             if items.len() > MAX_FAVORITES {
                 return Err(err_too_many("favorites"));
@@ -793,7 +865,7 @@ fn copy_sites(
     layout: &mut SiteLayout,
     items: &[CopyItem],
     new_id: &mut dyn FnMut() -> String,
-    created: &mut Vec<CreatedSite>,
+    log: &mut BatchLog,
 ) -> Result<(), SiteTreeError> {
     let mut taken: HashSet<String> = sites.iter().map(|s| s.id.clone()).collect();
     let mut copies = Vec::with_capacity(items.len());
@@ -807,6 +879,7 @@ fn copy_sites(
             if is_local(source) {
                 return Err(err_local());
             }
+            log.check_copy_budget()?;
             let name = validate_site_name(&item.name)?;
             let group = normalize_folder_path(item.group.as_deref().unwrap_or(""))?;
             let id = fresh_id(&mut taken, new_id)?;
@@ -818,7 +891,7 @@ fn copy_sites(
             if let Some(label) = layout.site_labels.get(&source.id).cloned() {
                 layout.site_labels.insert(id.clone(), label);
             }
-            created.push(CreatedSite {
+            log.created.push(CreatedSite {
                 source_id: source.id.clone(),
                 id,
             });
@@ -894,38 +967,37 @@ fn prefix_map<'a>(old: &'a str, new: &'a str) -> impl Fn(&str) -> Option<String>
     }
 }
 
-/// Rewrites folder paths through `map` in one pass, as if every path moved at the same
-/// time: site groups, folders, folder favorites, folder labels and collapsed. On a merge
-/// the folder label already at the target wins.
-fn remap_paths(
-    sites: &mut [ConnectionConfig],
-    layout: &mut SiteLayout,
-    map: &dyn Fn(&str) -> Option<String>,
-) -> Result<(), SiteTreeError> {
-    let mut groups = Vec::new();
-    for (i, site) in sites.iter().enumerate() {
-        if let Some(new) = site_folder(site).and_then(|g| map(&g)) {
-            check_len(&new)?;
-            groups.push((i, new));
-        }
-    }
-    let mut folders = BTreeSet::new();
-    for f in &layout.folders {
-        match map(f) {
-            Some(new) => {
-                check_len(&new)?;
-                folders.insert(new);
-            }
-            None => {
-                folders.insert(f.clone());
-            }
-        }
-    }
+/// Folder moves done at the same time, by folder (none inside another).
+fn moves_lookup(moves: &[(String, String)]) -> HashMap<&str, &str> {
+    moves
+        .iter()
+        .map(|(from, to)| (from.as_str(), to.as_str()))
+        .collect()
+}
 
-    for (i, group) in groups {
-        sites[i].group = Some(group);
+/// Where `path` goes under `moves`: a moved folder, or something inside one, follows it.
+fn moved_path(moves: &HashMap<&str, &str>, path: &str) -> Option<String> {
+    let ends = path
+        .char_indices()
+        .filter(|&(_, c)| c == '/')
+        .map(|(i, _)| i)
+        .chain(std::iter::once(path.len()));
+    for end in ends {
+        if let Some(to) = moves.get(&path[..end]) {
+            return Some(format!("{to}{}", &path[end..]));
+        }
     }
-    layout.folders = folders;
+    None
+}
+
+/// Rewrites the folder paths of the layout through `map`, as if every path moved at the
+/// same time: folders, folder favorites, folder labels and collapsed. On a merge the
+/// folder label already at the target wins.
+fn remap_layout(layout: &mut SiteLayout, map: &dyn Fn(&str) -> Option<String>) {
+    layout.folders = std::mem::take(&mut layout.folders)
+        .into_iter()
+        .map(|f| map(&f).unwrap_or(f))
+        .collect();
     for fav in &mut layout.favorites {
         if let FavoriteRef::Folder { path } = fav {
             if let Some(new) = map(path) {
@@ -950,6 +1022,46 @@ fn remap_paths(
         .into_iter()
         .map(|p| map(&p).unwrap_or(p))
         .collect();
+}
+
+/// Moves folders (each `.0`, with everything inside it, to `.1`) all at once: site
+/// groups and the layout (see [`remap_layout`]). Logs the move for [`undo`].
+fn remap_paths(
+    sites: &mut [ConnectionConfig],
+    layout: &mut SiteLayout,
+    moves: Vec<(String, String)>,
+    log: &mut BatchLog,
+) -> Result<(), SiteTreeError> {
+    if moves.is_empty() {
+        return Ok(());
+    }
+    let moved_sites = {
+        let lookup = moves_lookup(&moves);
+        let map = |p: &str| moved_path(&lookup, p);
+        let mut groups = Vec::new();
+        for (i, site) in sites.iter().enumerate() {
+            if let Some(new) = site_folder(site).and_then(|g| map(&g)) {
+                check_len(&new)?;
+                groups.push((i, new));
+            }
+        }
+        for f in &layout.folders {
+            if let Some(new) = map(f) {
+                check_len(&new)?;
+            }
+        }
+        let moved_sites: Vec<usize> = groups.iter().map(|&(i, _)| i).collect();
+        for (i, group) in groups {
+            sites[i].group = Some(group);
+        }
+        remap_layout(layout, &map);
+        moved_sites
+    };
+    let site_ids = (log.remap_ids + moved_sites.len() <= MAX_IDS_PER_CALL).then(|| {
+        log.remap_ids += moved_sites.len();
+        moved_sites.iter().map(|&i| sites[i].id.clone()).collect()
+    });
+    log.remaps.push(FolderRemap { moves, site_ids });
     Ok(())
 }
 
@@ -959,6 +1071,7 @@ fn rename_folder(
     raw_path: &str,
     raw_name: &str,
     merge: bool,
+    log: &mut BatchLog,
 ) -> Result<(), SiteTreeError> {
     let path = existing_folder(layout, raw_path)?;
     let name = validate_folder_name(raw_name)?;
@@ -973,8 +1086,7 @@ fn rename_folder(
         }
         target = existing;
     }
-    let map = prefix_map(&path, &target);
-    remap_paths(sites, layout, &map)
+    remap_paths(sites, layout, vec![(path, target)], log)
 }
 
 fn move_folder(
@@ -983,6 +1095,7 @@ fn move_folder(
     raw_path: &str,
     to: Option<&str>,
     merge: bool,
+    log: &mut BatchLog,
 ) -> Result<(), SiteTreeError> {
     let path = existing_folder(layout, raw_path)?;
     let to = normalize_folder_path(to.unwrap_or(""))?;
@@ -1001,8 +1114,7 @@ fn move_folder(
         Some(existing) => return Err(err_folder_exists(base_name(&existing), to.as_deref())),
         None => join_path(to.as_deref(), name),
     };
-    let map = prefix_map(&path, &target);
-    remap_paths(sites, layout, &map)
+    remap_paths(sites, layout, vec![(path, target)], log)
 }
 
 fn copy_folder(
@@ -1012,7 +1124,7 @@ fn copy_folder(
     to: Option<&str>,
     raw_name: &str,
     new_id: &mut dyn FnMut() -> String,
-    created: &mut Vec<CreatedSite>,
+    log: &mut BatchLog,
 ) -> Result<(), SiteTreeError> {
     let path = existing_folder(layout, raw_path)?;
     let to = normalize_folder_path(to.unwrap_or(""))?;
@@ -1049,6 +1161,7 @@ fn copy_folder(
             continue;
         };
         check_len(&group)?;
+        log.check_copy_budget()?;
         let id = fresh_id(&mut taken, new_id)?;
         let mut copy = source.clone();
         copy.id = id.clone();
@@ -1056,7 +1169,7 @@ fn copy_folder(
         if let Some(label) = layout.site_labels.get(&source.id).cloned() {
             layout.site_labels.insert(id.clone(), label);
         }
-        created.push(CreatedSite {
+        log.created.push(CreatedSite {
             source_id: source.id.clone(),
             id,
         });
@@ -1076,6 +1189,7 @@ fn delete_folder(
     layout: &mut SiteLayout,
     raw_path: &str,
     keep_contents: bool,
+    log: &mut BatchLog,
 ) -> Result<(), SiteTreeError> {
     let path = existing_folder(layout, raw_path)?;
     if !keep_contents {
@@ -1097,17 +1211,6 @@ fn delete_folder(
                 .or_insert_with(|| f.clone());
         }
     }
-    let mut targets: HashMap<String, String> = HashMap::new();
-    for f in &layout.folders {
-        if parent_path(f) == Some(path.as_str()) {
-            let name = base_name(f);
-            let target = siblings
-                .get(&name.to_lowercase())
-                .cloned()
-                .unwrap_or_else(|| join_path(parent.as_deref(), name));
-            targets.insert(name.to_string(), target);
-        }
-    }
 
     // The folder itself goes, with what points at it.
     layout.folders.remove(&path);
@@ -1122,26 +1225,40 @@ fn delete_folder(
         }
     }
 
+    // Every child (a folder, or the first level of a site's group, inside the folder)
+    // moves up to the parent, or into the parent's folder of the same name.
     let prefix_len = path.len() + 1;
-    let map = |p: &str| -> Option<String> {
+    let first_level = |p: &str| -> Option<String> {
         if p.len() <= prefix_len || !is_same_or_under(p, &path) {
             return None;
         }
         let rest = &p[prefix_len..];
-        let (first, tail) = match rest.split_once('/') {
-            Some((first, tail)) => (first, Some(tail)),
-            None => (rest, None),
-        };
-        let target = targets
-            .get(first)
-            .cloned()
-            .unwrap_or_else(|| join_path(parent.as_deref(), first));
-        Some(match tail {
-            Some(tail) => format!("{target}/{tail}"),
-            None => target,
-        })
+        Some(
+            rest.split_once('/')
+                .map_or(rest, |(first, _)| first)
+                .to_string(),
+        )
     };
-    remap_paths(sites, layout, &map)
+    let mut children = BTreeSet::new();
+    for f in &layout.folders {
+        children.extend(first_level(f));
+    }
+    for site in sites.iter() {
+        if let Some(group) = site_folder(site) {
+            children.extend(first_level(&group));
+        }
+    }
+    let moves = children
+        .into_iter()
+        .map(|name| {
+            let target = siblings
+                .get(&name.to_lowercase())
+                .cloned()
+                .unwrap_or_else(|| join_path(parent.as_deref(), &name));
+            (join_path(Some(&path), &name), target)
+        })
+        .collect();
+    remap_paths(sites, layout, moves, log)
 }
 
 fn set_label(
@@ -1209,6 +1326,40 @@ fn set_label_defs(layout: &mut SiteLayout, labels: &[LabelDef]) -> Result<(), Si
 }
 
 // ---------------------------------------------------------------------------------------
+// Ids
+// ---------------------------------------------------------------------------------------
+
+/// Gives every saved site its own id: the first row with an id keeps it, and each later
+/// row with the same id gets a fresh one from `new_id` (the app passes
+/// `|| normalize_site_id("")`). Rows sharing an id are moved, deleted and undone as one,
+/// and an undo could bring back only one of them. Returns whether any id changed.
+pub fn dedupe_site_ids(sites: &mut [ConnectionConfig], new_id: &mut dyn FnMut() -> String) -> bool {
+    let mut taken: HashSet<String> = sites.iter().map(|s| s.id.clone()).collect();
+    let mut seen: HashSet<String> = HashSet::with_capacity(sites.len());
+    let mut changed = false;
+    for site in sites.iter_mut() {
+        if seen.insert(site.id.clone()) {
+            continue;
+        }
+        let id = fresh_id(&mut taken, new_id).unwrap_or_else(|_| {
+            // `new_id` keeps repeating itself: number the row instead.
+            (1u64..)
+                .map(|n| format!("site-{n}"))
+                .find(|id| taken.insert(id.clone()))
+                .expect("an unused number exists")
+        });
+        tracing::warn!(
+            "two saved sites shared the id \"{}\"; the later one is now \"{id}\"",
+            site.id.escape_default()
+        );
+        site.id = id.clone();
+        seen.insert(id);
+        changed = true;
+    }
+    changed
+}
+
+// ---------------------------------------------------------------------------------------
 // Recents
 // ---------------------------------------------------------------------------------------
 
@@ -1263,7 +1414,9 @@ pub fn seed_recents(
 
 /// Restores what a batch changed, key by key, wherever the current value is still the
 /// one the batch left: a site changed since (by a save, an import, another batch) is
-/// skipped and counted. Ends with [`reconcile`].
+/// skipped and counted. A folder rename, move or lift is undone only when every site it
+/// moved came back; otherwise the folder stays where the batch put it, with its label,
+/// favorite and collapsed state. Ends with [`reconcile`].
 pub fn undo(
     snapshot: &UndoSnapshot,
     sites: &mut Vec<ConnectionConfig>,
@@ -1278,6 +1431,7 @@ pub fn undo(
     let mut replace = Vec::new();
     let mut remove = HashSet::new();
     let mut insert = Vec::new();
+    let mut skipped: HashSet<&str> = HashSet::new();
     {
         let index = index_by_id(sites);
         for (id, before) in &snapshot.sites_before {
@@ -1286,6 +1440,7 @@ pub fn undo(
             let current = position.map(|i| site_value(&sites[i]));
             if current.as_ref() != expected {
                 report.skipped += 1;
+                skipped.insert(id.as_str());
                 continue;
             }
             match (before, position) {
@@ -1313,7 +1468,35 @@ pub fn undo(
     // Sites the batch removed go back at the end of the list.
     sites.extend(insert);
 
-    let (before, after) = (&snapshot.layout_before, &snapshot.layout_after);
+    // Folder moves that keep a skipped site stay: the layout from before the batch is
+    // read as if they had already happened, so their folders are left as they are.
+    let kept: Vec<&FolderRemap> = if skipped.is_empty() {
+        Vec::new()
+    } else {
+        snapshot
+            .folder_remaps
+            .iter()
+            .filter(|remap| {
+                remap
+                    .site_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids.iter().any(|id| skipped.contains(id.as_str())))
+            })
+            .collect()
+    };
+    let before_with_kept;
+    let before = if kept.is_empty() {
+        &snapshot.layout_before
+    } else {
+        let mut adjusted = snapshot.layout_before.clone();
+        for remap in kept {
+            let lookup = moves_lookup(&remap.moves);
+            remap_layout(&mut adjusted, &|p| moved_path(&lookup, p));
+        }
+        before_with_kept = adjusted;
+        &before_with_kept
+    };
+    let after = &snapshot.layout_after;
     restore_set(&mut layout.folders, &before.folders, &after.folders);
     restore_set(&mut layout.collapsed, &before.collapsed, &after.collapsed);
     restore_list(
@@ -1493,9 +1676,10 @@ pub fn parse_site_layout(bytes: &[u8]) -> Result<(SiteLayout, bool), serde_json:
     Ok((layout, newer))
 }
 
-/// Decides what a load gives: the layout, read-only (a newer version, or a key problem:
-/// not a file problem, so the file stays), or a fresh layout with the unreadable file
-/// moved aside by `quarantine`.
+/// Decides what a load gives: the layout, read-only (a newer version, a key problem, or
+/// a file that cannot be read right now: not a damaged file, so it stays), or a fresh
+/// layout with the damaged file (not JSON, not an envelope, does not decrypt) moved
+/// aside by `quarantine`.
 fn interpret_loaded_layout(
     loaded: Result<Option<Vec<u8>>, VaultError>,
     sites_vault_exists: bool,
@@ -1525,6 +1709,14 @@ fn interpret_loaded_layout(
         Err(e @ VaultError::DeviceKeyMissing(_)) if sites_vault_exists => {
             return LoadedSiteLayout::fresh(true, Some(format!("[{WARN_LAYOUT_UNAVAILABLE}] {e}")))
         }
+        // The file (or its key file) cannot be read right now (EACCES, EIO, ...), or the
+        // load failed for another reason than its content: the file stays.
+        Err(e)
+            if matches!(&e, VaultError::IoError(io) if io.kind() != std::io::ErrorKind::NotFound)
+                || matches!(&e, VaultError::Other(_)) =>
+        {
+            return LoadedSiteLayout::fresh(true, Some(format!("[{WARN_LAYOUT_UNAVAILABLE}] {e}")))
+        }
         // No sites.vault and no key: nothing can ever open the file.
         Err(e) => e.to_string(),
     };
@@ -1550,12 +1742,32 @@ fn interpret_loaded_layout(
     )
 }
 
+/// [`interpret_loaded_layout`], except that with `keep_file` (the saved sites could not
+/// be loaded in this run) a file that cannot be read is never moved aside: the same key
+/// problem may hide both files, and restoring the vault must bring the layout back too.
+fn interpret_loaded_layout_keeping(
+    loaded: Result<Option<Vec<u8>>, VaultError>,
+    sites_vault_exists: bool,
+    keep_file: bool,
+    quarantine: impl FnOnce() -> Result<Option<PathBuf>, VaultError>,
+) -> LoadedSiteLayout {
+    interpret_loaded_layout(loaded, sites_vault_exists || keep_file, || {
+        if keep_file {
+            return Err(VaultError::Other(
+                "kept while the saved sites cannot be read".into(),
+            ));
+        }
+        quarantine()
+    })
+}
+
 /// Loads `site-layout.vault`. Never fails: problems give a default layout and a warning
-/// (see [`LoadedSiteLayout`]).
-pub fn load_site_layout() -> LoadedSiteLayout {
+/// (see [`LoadedSiteLayout`]). With `keep_file` (the saved sites could not be loaded in
+/// this run) an unreadable file stays where it is and the layout is read-only.
+pub fn load_site_layout(keep_file: bool) -> LoadedSiteLayout {
     let loaded = vault::load_device_sealed_file(SITE_LAYOUT_FILE);
     let sites_vault_exists = vault::get_local_vault_path().exists();
-    interpret_loaded_layout(loaded, sites_vault_exists, || {
+    interpret_loaded_layout_keeping(loaded, sites_vault_exists, keep_file, || {
         vault::quarantine_config_file(SITE_LAYOUT_FILE)
     })
 }
@@ -1576,8 +1788,8 @@ pub fn save_site_layout(layout: &SiteLayout) -> Result<(), VaultError> {
 }
 
 /// [`load_site_layout`] on a blocking thread.
-pub async fn load_site_layout_async() -> LoadedSiteLayout {
-    match tokio::task::spawn_blocking(load_site_layout).await {
+pub async fn load_site_layout_async(keep_file: bool) -> LoadedSiteLayout {
+    match tokio::task::spawn_blocking(move || load_site_layout(keep_file)).await {
         Ok(loaded) => loaded,
         Err(e) => LoadedSiteLayout::fresh(
             true,
@@ -2729,5 +2941,582 @@ mod tests {
         let seeded: Vec<&str> = layout.recents.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(seeded, ["web-01", "stg"]);
         assert_eq!(layout.recents[0].at, None);
+    }
+
+    fn site_pw(id: &str, name: &str, group: Option<&str>, pw: &str) -> ConnectionConfig {
+        ConnectionConfig {
+            auth: AuthMethod::Password(pw.into()),
+            ..site(id, name, group)
+        }
+    }
+
+    #[test]
+    fn folder_path_ops_are_told_apart() {
+        let ops: Vec<SiteTreeOp> = serde_json::from_str(
+            r#"[
+            {"op":"rename_folder","path":"A","name":"B"},
+            {"op":"move_folder","path":"A","to":"B"},
+            {"op":"delete_folder","path":"A","keep_contents":true},
+            {"op":"copy_folder","path":"A","name":"B"},
+            {"op":"move_sites","ids":["a"]},
+            {"op":"copy_sites","items":[]},
+            {"op":"delete_sites","ids":[]},
+            {"op":"rename_site","id":"a","name":"b"},
+            {"op":"create_folder","path":"A"},
+            {"op":"set_favorites","items":[]},
+            {"op":"set_label","sites":[]},
+            {"op":"set_label_defs","labels":[]}
+        ]"#,
+        )
+        .unwrap();
+        let rewrites: Vec<bool> = ops.iter().map(SiteTreeOp::rewrites_folder_paths).collect();
+        assert_eq!(
+            rewrites,
+            [true, true, true, true, false, false, false, false, false, false, false, false]
+        );
+        assert!(ops[..4].iter().all(|op| !op.changes_layout_only()));
+    }
+
+    /// A rename, then a save of the moved site elsewhere: the undo skips the site, so
+    /// the folder stays renamed with its label, favorite and collapsed state.
+    #[test]
+    fn a_partial_undo_leaves_a_renamed_folder_with_its_label_and_favorite() {
+        let mut sites = vec![ConnectionConfig::local(), site("x", "web", Some("Clients"))];
+        let mut layout = SiteLayout {
+            labels: vec![label("label-a")],
+            folder_labels: BTreeMap::from([("Clients".into(), "label-a".into())]),
+            favorites: vec![FavoriteRef::Folder {
+                path: "Clients".into(),
+            }],
+            collapsed: BTreeSet::from(["Clients".to_string()]),
+            ..SiteLayout::default()
+        };
+        let outcome = run(
+            &mut sites,
+            &mut layout,
+            vec![SiteTreeOp::RenameFolder {
+                path: "Clients".into(),
+                name: "Customers".into(),
+                merge: false,
+            }],
+        )
+        .unwrap();
+        sites[1].auth = AuthMethod::Password("changed elsewhere".into()); // save_site
+        let report = undo(&outcome.undo, &mut sites, &mut layout);
+        assert_eq!(
+            report,
+            UndoReport {
+                restored: 0,
+                skipped: 1
+            }
+        );
+        assert_eq!(group_of(&sites, "x"), Some("Customers"));
+        assert_eq!(folders(&layout), ["Customers"], "no empty Clients folder");
+        assert_eq!(
+            layout.folder_labels,
+            BTreeMap::from([("Customers".to_string(), "label-a".to_string())])
+        );
+        assert_eq!(
+            layout.favorites,
+            [FavoriteRef::Folder {
+                path: "Customers".into()
+            }]
+        );
+        assert_eq!(layout.collapsed, BTreeSet::from(["Customers".to_string()]));
+    }
+
+    /// Two renames in one batch: the one whose site came back is undone, the one whose
+    /// site was changed since stays.
+    #[test]
+    fn a_partial_undo_decides_per_folder_move() {
+        let mut sites = vec![
+            ConnectionConfig::local(),
+            site("a", "a", Some("A/Sub")),
+            site("b", "b", Some("B")),
+        ];
+        let mut layout = SiteLayout {
+            labels: vec![label("label-a")],
+            folder_labels: BTreeMap::from([
+                ("A/Sub".into(), "label-a".into()),
+                ("B".into(), "label-a".into()),
+            ]),
+            ..SiteLayout::default()
+        };
+        let outcome = run(
+            &mut sites,
+            &mut layout,
+            vec![
+                SiteTreeOp::RenameFolder {
+                    path: "A".into(),
+                    name: "A2".into(),
+                    merge: false,
+                },
+                SiteTreeOp::RenameFolder {
+                    path: "B".into(),
+                    name: "B2".into(),
+                    merge: false,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(outcome.undo.folder_remaps.len(), 2);
+        let b = sites.iter_mut().find(|s| s.id == "b").unwrap();
+        b.host = "moved.example.com".into();
+        let report = undo(&outcome.undo, &mut sites, &mut layout);
+        assert_eq!(
+            report,
+            UndoReport {
+                restored: 1,
+                skipped: 1
+            }
+        );
+        assert_eq!(group_of(&sites, "a"), Some("A/Sub"));
+        assert_eq!(group_of(&sites, "b"), Some("B2"));
+        assert_eq!(folders(&layout), ["A", "A/Sub", "B2"]);
+        assert_eq!(
+            layout.folder_labels,
+            BTreeMap::from([
+                ("A/Sub".to_string(), "label-a".to_string()),
+                ("B2".to_string(), "label-a".to_string()),
+            ])
+        );
+    }
+
+    /// Deleting a folder but keeping its contents lifts its subfolders; when a lifted
+    /// site was changed since, its subfolder stays lifted with its label.
+    #[test]
+    fn a_partial_undo_of_a_lift_keeps_the_lifted_folder() {
+        let mut sites = vec![
+            ConnectionConfig::local(),
+            site("x", "x", Some("Clients/Acme")),
+        ];
+        let mut layout = SiteLayout {
+            labels: vec![label("label-a")],
+            folder_labels: BTreeMap::from([("Clients/Acme".into(), "label-a".into())]),
+            ..SiteLayout::default()
+        };
+        let outcome = run(
+            &mut sites,
+            &mut layout,
+            vec![SiteTreeOp::DeleteFolder {
+                path: "Clients".into(),
+                keep_contents: true,
+            }],
+        )
+        .unwrap();
+        assert_eq!(group_of(&sites, "x"), Some("Acme"));
+        sites[1].port = 2222;
+        let report = undo(&outcome.undo, &mut sites, &mut layout);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(group_of(&sites, "x"), Some("Acme"));
+        assert!(
+            !layout.folders.contains("Clients/Acme"),
+            "{:?}",
+            layout.folders
+        );
+        assert_eq!(
+            layout.folder_labels.get("Acme").map(String::as_str),
+            Some("label-a")
+        );
+    }
+
+    /// Copying a folder into itself and merging it back doubles it every two ops; the
+    /// batch is refused once it would create more than MAX_IDS_PER_CALL sites.
+    #[test]
+    fn a_batch_that_keeps_doubling_a_folder_is_refused() {
+        let mut sites = vec![ConnectionConfig::local(), site("s", "s", Some("T"))];
+        let mut layout = SiteLayout::default();
+        let mut ops = Vec::new();
+        for _ in 0..17 {
+            ops.push(SiteTreeOp::CopyFolder {
+                path: "T".into(),
+                to: None,
+                name: "c".into(),
+            });
+            ops.push(SiteTreeOp::RenameFolder {
+                path: "c".into(),
+                name: "T".into(),
+                merge: true,
+            });
+        }
+        assert!(check_op_limits(&ops).is_ok(), "34 ops carry 34 items");
+        let err = run(&mut sites, &mut layout, ops).unwrap_err();
+        assert_eq!(err.code, ERR_TOO_MANY);
+        assert_eq!(
+            err.to_string(),
+            "[site_tree.too_many] Too many items at once"
+        );
+        assert_eq!(sites.len(), 2, "all or nothing");
+        assert!(layout.folders.is_empty());
+
+        // Up to the limit, copies are fine.
+        let mut ops = Vec::new();
+        for _ in 0..10 {
+            ops.push(SiteTreeOp::CopyFolder {
+                path: "T".into(),
+                to: None,
+                name: "c".into(),
+            });
+            ops.push(SiteTreeOp::RenameFolder {
+                path: "c".into(),
+                name: "T".into(),
+                merge: true,
+            });
+        }
+        let outcome = run(&mut sites, &mut layout, ops).unwrap();
+        assert_eq!(outcome.created.len(), 1023);
+        assert_eq!(sites.len(), 1025);
+    }
+
+    #[test]
+    fn large_selections_fit_in_one_batch() {
+        // Move 6,000 selected sites.
+        let mut sites = vec![ConnectionConfig::local()];
+        sites.extend((0..6_000).map(|i| site(&format!("s{i}"), "s", Some("Old"))));
+        let mut layout = SiteLayout::default();
+        let ids: Vec<String> = (0..6_000).map(|i| format!("s{i}")).collect();
+        let outcome = run(
+            &mut sites,
+            &mut layout,
+            vec![SiteTreeOp::MoveSites {
+                ids,
+                to: Some("New".into()),
+            }],
+        )
+        .unwrap();
+        assert_eq!(outcome.undo.sites_before.len(), 6_000);
+        assert!(sites[1..].iter().all(|s| s.group.as_deref() == Some("New")));
+
+        // Move 150 selected folders into a new one (151 ops).
+        let mut sites = vec![ConnectionConfig::local()];
+        sites.extend((0..150).map(|i| site(&format!("s{i}"), "s", Some(&format!("F{i:03}")))));
+        let mut layout = SiteLayout::default();
+        let mut ops = vec![SiteTreeOp::CreateFolder {
+            path: "Archive".into(),
+        }];
+        ops.extend((0..150).map(|i| SiteTreeOp::MoveFolder {
+            path: format!("F{i:03}"),
+            to: Some("Archive".into()),
+            merge: false,
+        }));
+        run(&mut sites, &mut layout, ops).unwrap();
+        assert_eq!(group_of(&sites, "s149"), Some("Archive/F149"));
+        assert_eq!(layout.folders.len(), 151);
+
+        // The caps themselves.
+        let too_many_ops: Vec<SiteTreeOp> = (0..=MAX_OPS_PER_CALL)
+            .map(|i| SiteTreeOp::CreateFolder {
+                path: format!("F{i}"),
+            })
+            .collect();
+        assert_eq!(too_many_ops.len(), 2_001);
+        let err = check_op_limits(&too_many_ops).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "[site_tree.too_many] Too many changes at once"
+        );
+        let mut sites = vec![ConnectionConfig::local()];
+        assert!(run(&mut sites, &mut SiteLayout::default(), too_many_ops).is_err());
+        let too_many_ids = vec![SiteTreeOp::DeleteSites {
+            ids: vec!["x".into(); MAX_IDS_PER_CALL + 1],
+        }];
+        assert_eq!(
+            check_op_limits(&too_many_ids).unwrap_err().to_string(),
+            "[site_tree.too_many] Too many items at once"
+        );
+    }
+
+    #[test]
+    fn collapse_all_keeps_every_folder() {
+        assert_eq!(MAX_COLLAPSED, MAX_LAYOUT_FOLDERS);
+        let paths: Vec<String> = (0..2_525).map(|i| format!("F{i:04}")).collect();
+        let mut layout = SiteLayout {
+            folders: paths.iter().cloned().collect(),
+            collapsed: paths.iter().cloned().collect(),
+            ..SiteLayout::default()
+        };
+        reconcile(&mut layout, &[ConnectionConfig::local()]);
+        assert_eq!(layout.collapsed.len(), 2_525);
+    }
+
+    #[test]
+    fn only_a_damaged_layout_file_is_moved_aside() {
+        let never = || -> Result<Option<PathBuf>, VaultError> { panic!("must not quarantine") };
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+            std::io::ErrorKind::IsADirectory,
+        ] {
+            let loaded = interpret_loaded_layout(
+                Err(VaultError::IoError(std::io::Error::from(kind))),
+                true,
+                never,
+            );
+            assert!(loaded.read_only, "{kind:?}");
+            assert!(
+                loaded
+                    .warning
+                    .as_deref()
+                    .is_some_and(|w| w.starts_with("[site_tree.layout_unavailable]")),
+                "{kind:?}: {:?}",
+                loaded.warning
+            );
+        }
+        let damaged = [
+            VaultError::DecryptionFailed,
+            VaultError::InvalidHeader,
+            serde_json::from_str::<Value>("{").unwrap_err().into(),
+        ];
+        for error in damaged {
+            let mut moved = false;
+            let loaded = interpret_loaded_layout(Err(error), true, || {
+                moved = true;
+                Ok(None)
+            });
+            assert!(moved && !loaded.read_only);
+        }
+    }
+
+    /// While the saved sites could not be loaded, a layout file that does not open is
+    /// kept (read-only) whatever the reason, so restoring the vault brings it back.
+    #[test]
+    fn a_layout_is_never_moved_aside_while_the_saved_sites_are_unreadable() {
+        let never = || -> Result<Option<PathBuf>, VaultError> { panic!("must not quarantine") };
+        for error in [
+            VaultError::DeviceKeyMissing("x".into()),
+            VaultError::DecryptionFailed,
+        ] {
+            let loaded = interpret_loaded_layout_keeping(Err(error), false, true, never);
+            assert!(loaded.read_only);
+            assert!(loaded
+                .warning
+                .unwrap()
+                .starts_with("[site_tree.layout_unavailable]"));
+        }
+        let loaded = interpret_loaded_layout_keeping(Ok(Some(b"[1]".to_vec())), false, true, never);
+        assert!(loaded.read_only);
+
+        let mut moved = false;
+        let reset =
+            interpret_loaded_layout_keeping(Err(VaultError::DecryptionFailed), true, false, || {
+                moved = true;
+                Ok(None)
+            });
+        assert!(
+            moved && !reset.read_only,
+            "without keep_file a damaged file goes"
+        );
+    }
+
+    /// A layout file that cannot be read right now (EACCES here) stays as it is and the
+    /// layout is read-only for the run.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_layout_file_is_kept_and_read_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = SiteLayout::default();
+        layout.folders.insert("Clients".into());
+        layout.labels.push(label("label-a"));
+        vault::save_sealed_in(
+            dir.path(),
+            SITE_LAYOUT_FILE,
+            &layout_bytes(&layout).unwrap(),
+        )
+        .unwrap();
+        let path = dir.path().join(SITE_LAYOUT_FILE);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            // Running as root: permissions do not apply.
+            return;
+        }
+
+        let loaded_raw = vault::load_sealed_in(dir.path(), SITE_LAYOUT_FILE);
+        let mut quarantined = false;
+        let loaded = interpret_loaded_layout(loaded_raw, true, || {
+            quarantined = true;
+            Ok(Some(PathBuf::from("site-layout.vault.corrupt-1")))
+        });
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(loaded.read_only && !quarantined, "{:?}", loaded.warning);
+        assert!(loaded
+            .warning
+            .unwrap()
+            .starts_with("[site_tree.layout_unavailable]"));
+        let again = vault::load_sealed_in(dir.path(), SITE_LAYOUT_FILE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parse_site_layout(&again).unwrap().0, layout);
+    }
+
+    #[test]
+    fn repeated_site_ids_are_made_unique() {
+        let mut sites = vec![
+            ConnectionConfig::local(),
+            site_pw("dup", "prod-db", None, "pw-prod"),
+            site_pw("dup", "staging-db", None, "pw-staging"),
+            site_pw("new-1", "taken", None, "pw"),
+            site_pw("dup", "qa-db", None, "pw-qa"),
+            ConnectionConfig::local(),
+        ];
+        assert!(dedupe_site_ids(&mut sites, &mut ids()));
+        let got: Vec<(&str, &str)> = sites
+            .iter()
+            .map(|s| (s.id.as_str(), s.name.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("local", "Local Machine"),
+                ("dup", "prod-db"),
+                ("new-2", "staging-db"),
+                ("new-1", "taken"),
+                ("new-3", "qa-db"),
+                ("new-4", "Local Machine"),
+            ]
+        );
+        assert!(
+            !dedupe_site_ids(&mut sites, &mut ids()),
+            "nothing left to change"
+        );
+
+        // A generator that keeps repeating itself still ends with unique ids.
+        let mut sites = vec![
+            site("a", "a", None),
+            site("a", "b", None),
+            site("a", "c", None),
+        ];
+        assert!(dedupe_site_ids(&mut sites, &mut || "a".to_string()));
+        let unique: HashSet<&str> = sites.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(unique.len(), 3);
+    }
+
+    /// Two rows that shared an id (legacy data) get their own ids at startup, so a
+    /// delete and its undo bring both back with their passwords.
+    #[test]
+    fn a_delete_and_undo_of_deduplicated_sites_brings_both_back() {
+        let mut sites = vec![
+            ConnectionConfig::local(),
+            site_pw("dup", "prod-db", None, "pw-prod"),
+            site_pw("dup", "staging-db", None, "pw-staging"),
+        ];
+        dedupe_site_ids(&mut sites, &mut ids());
+        let ids_now: Vec<String> = sites[1..].iter().map(|s| s.id.clone()).collect();
+        let mut layout = SiteLayout::default();
+        let outcome = run(
+            &mut sites,
+            &mut layout,
+            vec![SiteTreeOp::DeleteSites { ids: ids_now }],
+        )
+        .unwrap();
+        assert_eq!(sites.len(), 1);
+        let report = undo(&outcome.undo, &mut sites, &mut layout);
+        assert_eq!(
+            report,
+            UndoReport {
+                restored: 2,
+                skipped: 0
+            }
+        );
+        let names: Vec<&str> = sites.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Local Machine", "prod-db", "staging-db"]);
+        assert!(matches!(&sites[2].auth, AuthMethod::Password(p) if p == "pw-staging"));
+    }
+
+    /// Undo across a "replace" import (the UI also calls forget_site_tree_undo): an
+    /// imported site with the same id is never overwritten; a deleted site that the
+    /// import does not contain comes back.
+    #[test]
+    fn undo_after_a_replace_import_never_overwrites_imported_sites() {
+        let mut sites = vec![
+            ConnectionConfig::local(),
+            site_pw("x", "web", None, "old-pw"),
+            site_pw("y", "db", None, "y-pw"),
+        ];
+        let mut layout = SiteLayout::default();
+        let outcome = run(
+            &mut sites,
+            &mut layout,
+            vec![SiteTreeOp::DeleteSites {
+                ids: vec!["x".into(), "y".into()],
+            }],
+        )
+        .unwrap();
+        // import_sites_vault "replace": Local + an x pointing elsewhere.
+        let mut imported_x = site_pw("x", "web", None, "");
+        imported_x.host = "other-host.example.com".into();
+        sites = vec![ConnectionConfig::local(), imported_x];
+        let report = undo(&outcome.undo, &mut sites, &mut layout);
+        assert_eq!(
+            report,
+            UndoReport {
+                restored: 1,
+                skipped: 1
+            }
+        );
+        let x = sites.iter().find(|s| s.id == "x").unwrap();
+        assert_eq!(x.host, "other-host.example.com");
+        assert!(matches!(&x.auth, AuthMethod::Password(p) if p.is_empty()));
+        assert!(
+            sites.iter().any(|s| s.id == "y"),
+            "y (not in the import) is back"
+        );
+    }
+
+    #[test]
+    fn undo_never_reverts_a_password_changed_since() {
+        let mut sites = vec![
+            ConnectionConfig::local(),
+            site_pw("x", "web", Some("A"), "old-pw"),
+        ];
+        let mut layout = SiteLayout::default();
+        let outcome = run(
+            &mut sites,
+            &mut layout,
+            vec![SiteTreeOp::MoveSites {
+                ids: vec!["x".into()],
+                to: Some("B".into()),
+            }],
+        )
+        .unwrap();
+        // save_site elsewhere: new password, same folder.
+        sites[1].auth = AuthMethod::Password("new-pw".into());
+        let report = undo(&outcome.undo, &mut sites, &mut layout);
+        assert_eq!(
+            report,
+            UndoReport {
+                restored: 0,
+                skipped: 1
+            }
+        );
+        assert!(matches!(&sites[1].auth, AuthMethod::Password(p) if p == "new-pw"));
+        assert_eq!(sites[1].group.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn paths_keep_dots_and_refuse_slashes_control_characters_and_overlong_names() {
+        assert_eq!(
+            normalize_folder_path(" A // .. / B ").unwrap().as_deref(),
+            Some("A/../B")
+        );
+        assert!(validate_folder_name("a/b").is_err());
+        assert!(validate_folder_name("a\u{7}b").is_err());
+        assert!(normalize_folder_path("a\nb").is_err());
+        assert!(validate_folder_name(&"é".repeat(255)).is_ok());
+        assert!(validate_folder_name(&"é".repeat(256)).is_err());
+        let mut layout = SiteLayout::default();
+        let deep = format!("{}/{}", "a".repeat(200), "b".repeat(54));
+        assert!(create_folder(&mut layout, &deep).is_ok());
+        let mut sites = vec![ConnectionConfig::local()];
+        let r = run(
+            &mut sites,
+            &mut layout,
+            vec![SiteTreeOp::RenameFolder {
+                path: "a".repeat(200),
+                name: "a".repeat(201),
+                merge: false,
+            }],
+        );
+        assert_eq!(r.unwrap_err().code, ERR_PATH_TOO_LONG);
     }
 }

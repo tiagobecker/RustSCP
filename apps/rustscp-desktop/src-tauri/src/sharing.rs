@@ -227,6 +227,12 @@ pub async fn accept_connection_share(
         let mut sites = state.saved_sites.write().await;
         let mut updated = sites.clone();
         updated.push(site.clone());
+        if rustscp_core::site_layout::dedupe_site_ids(&mut updated, &mut || normalize_site_id("")) {
+            // The new row is last: if its id was taken, it got another one.
+            if let Some(saved) = updated.last() {
+                site.id = saved.id.clone();
+            }
+        }
         rustscp_core::vault::save_local_vault_async(updated.clone())
             .await
             .map_err(|e| e.to_string())?;

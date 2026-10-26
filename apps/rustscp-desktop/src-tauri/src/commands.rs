@@ -701,6 +701,11 @@ impl AppState {
         if !initial_sites.iter().any(|s| s.id == "local") {
             initial_sites.insert(0, local_cfg.clone());
         }
+        // Rows that share an id (older data, or ids that normalize alike) get their own:
+        // in memory only, the next save writes it.
+        rustscp_core::site_layout::dedupe_site_ids(&mut initial_sites, &mut || {
+            normalize_site_id("")
+        });
 
         Self {
             local_vfs: local_driver,
@@ -1318,7 +1323,7 @@ pub async fn import_sites_vault(
     let mut sites = state.saved_sites.write().await;
     let local_cfg = ConnectionConfig::local();
 
-    let updated = if merge_mode == "replace" {
+    let mut updated = if merge_mode == "replace" {
         let mut new_list = vec![local_cfg];
         for s in imported_sites {
             if s.id != "local" {
@@ -1341,6 +1346,7 @@ pub async fn import_sites_vault(
         }
         merged
     };
+    rustscp_core::site_layout::dedupe_site_ids(&mut updated, &mut || normalize_site_id(""));
 
     // Memory changes only after the vault on disk has the new list.
     rustscp_core::vault::save_local_vault_async(updated.clone())
@@ -1619,7 +1625,8 @@ pub async fn import_winscp_ini(
     let imported = result.sites.len();
 
     let mut sites = state.saved_sites.write().await;
-    let merge = merge_winscp_sites_counted(&sites, result.sites, replace);
+    let mut merge = merge_winscp_sites_counted(&sites, result.sites, replace);
+    rustscp_core::site_layout::dedupe_site_ids(&mut merge.sites, &mut || normalize_site_id(""));
     rustscp_core::vault::save_local_vault_async(merge.sites.clone())
         .await
         .map_err(|e| e.to_string())?;
