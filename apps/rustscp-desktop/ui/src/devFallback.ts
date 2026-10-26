@@ -4,6 +4,7 @@
  * inside the desktop app. Contains no real hosts or credentials.
  */
 import type { FileEntry } from './types.ts';
+import { demoSiteCount, demoSites, siteFallback } from './components/siteManager/siteDevFallback.ts';
 
 const DEMO_HOME = '/home/demo';
 
@@ -12,6 +13,10 @@ let previewGatewayOff = false;
 let previewCommandAccess = 'ask';
 
 export function getFallbackData<T>(cmd: string, args?: any): T {
+  // Connections tree commands (and `?demoSites=N`) run against an in-memory copy of the sites
+  const siteTree = siteFallback(cmd, args, () => getFallbackData<unknown>('get_saved_sites'));
+  if (siteTree.handled) return siteTree.value as T;
+
   if (cmd === 'list_directory') {
     const p: string = args?.path || '/';
     const parent = p === '/' ? '/' : p.split('/').slice(0, -1).join('/') || '/';
@@ -28,6 +33,8 @@ export function getFallbackData<T>(cmd: string, args?: any): T {
   }
 
   if (cmd === 'get_saved_sites') {
+    const demoCount = demoSiteCount();
+    if (demoCount > 0) return demoSites(demoCount) as unknown as T;
     return [
       {
         id: 'local',

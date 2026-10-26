@@ -12,6 +12,7 @@ pub mod scripting;
 pub mod sftp;
 pub mod share;
 pub mod shell;
+pub mod site_layout;
 pub mod sync;
 pub mod terminal;
 pub mod transfer_queue;

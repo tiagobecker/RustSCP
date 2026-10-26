@@ -26,6 +26,9 @@ export const Menu: React.FC<MenuProps> = ({ trigger, children, align = 'left', w
         e.stopPropagation();
         setOpen(false);
         triggerRef.current?.focus();
+      } else if (e.key === 'Tab') {
+        // The Modal's focus trap steps aside while the menu is top-most, so Tab closes the menu first
+        setOpen(false);
       } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
         const items = Array.from(rootRef.current?.querySelectorAll<HTMLElement>('[role=menuitem], [role=menuitemcheckbox]') || []);
         if (!items.length) return;
@@ -54,6 +57,8 @@ export const Menu: React.FC<MenuProps> = ({ trigger, children, align = 'left', w
       {open && (
         <div
           role="menu"
+          // Top-most layer while open: a Modal around it steps aside, so one Escape closes only the menu
+          data-ui-modal=""
           className={cx('absolute top-full mt-1.5 z-40 ui-menu animate-pop', width, align === 'right' ? 'right-0' : 'left-0')}
         >
           {children(close)}

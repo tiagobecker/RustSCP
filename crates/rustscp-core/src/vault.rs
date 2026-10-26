@@ -988,6 +988,114 @@ pub async fn load_local_vault_async() -> Result<Vec<ConnectionConfig>, VaultErro
         .map_err(|e| VaultError::Other(format!("vault worker failed: {e}")))?
 }
 
+// ----------------- OTHER FILES SEALED WITH THE DEVICE KEY -----------------
+
+/// Files of the config folder that a sealed file must never replace. Compared ignoring
+/// ASCII case, because the macOS and Windows file systems do.
+const RESERVED_CONFIG_FILES: [&str; 3] =
+    [LOCAL_VAULT_FILE, LOCAL_VAULT_BACKUP_FILE, DEVICE_KEY_FILE];
+
+fn check_sealed_file_name(file_name: &str) -> Result<(), VaultError> {
+    let bad = file_name.is_empty()
+        || file_name == "."
+        || file_name == ".."
+        || file_name.contains(['/', '\\', '\0'])
+        || RESERVED_CONFIG_FILES
+            .iter()
+            .any(|reserved| reserved.eq_ignore_ascii_case(file_name));
+    if bad {
+        return Err(VaultError::Other(format!(
+            "invalid name for a sealed config file: \"{}\"",
+            file_name.escape_default()
+        )));
+    }
+    Ok(())
+}
+
+fn save_sealed_with(
+    dir: &Path,
+    store: Option<&dyn KeyStore>,
+    file_name: &str,
+    plaintext: &[u8],
+) -> Result<(), VaultError> {
+    check_sealed_file_name(file_name)?;
+    ensure_private_dir(dir)?;
+    // Refuses (DeviceKeyMissing, KeychainUnavailable) instead of inventing a key while a
+    // sites.vault exists without one.
+    let key = get_or_create_device_key_with(dir, store)?;
+    let envelope = encrypt_bytes_with_iterations(plaintext, &key, 0, LOCAL_VAULT_KDF_ITERATIONS)?;
+    let json = serde_json::to_string(&envelope)?;
+    write_private_file_atomic(&dir.join(file_name), json.as_bytes())?;
+    Ok(())
+}
+
+fn load_sealed_with(
+    dir: &Path,
+    store: Option<&dyn KeyStore>,
+    file_name: &str,
+) -> Result<Option<Vec<u8>>, VaultError> {
+    check_sealed_file_name(file_name)?;
+    let path = dir.join(file_name);
+    let json = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(VaultError::IoError(e)),
+    };
+    // A file that is not an envelope at all is a file problem, whatever the key does.
+    let envelope = parse_vault_from_json(&json)?;
+    // Loading never creates (or moves) a key.
+    let key = resolve_device_key(dir, store, false)?
+        .ok_or_else(|| VaultError::DeviceKeyMissing(path.to_string_lossy().to_string()))?;
+    decrypt_bytes_bounded(&envelope, &key.key, 1, MAX_PASSWORD_KDF_ITERATIONS).map(Some)
+}
+
+fn quarantine_config_file_in(dir: &Path, file_name: &str) -> Result<Option<PathBuf>, VaultError> {
+    check_sealed_file_name(file_name)?;
+    let path = dir.join(file_name);
+    if !path.exists() {
+        return Ok(None);
+    }
+    quarantine_file(&path).map(Some)
+}
+
+/// Encrypts `plaintext` with this device's vault key into `<config dir>/<file_name>` (same
+/// envelope and cipher as sites.vault, atomic 0600 write). A key is created only when no
+/// sites.vault exists. `file_name` is a bare name, never sites.vault, its backup or the key.
+pub fn save_device_sealed_file(file_name: &str, plaintext: &[u8]) -> Result<(), VaultError> {
+    let dir = get_rustscp_config_dir();
+    let store = platform_key_store(&dir);
+    save_sealed_with(&dir, store.as_deref(), file_name, plaintext)
+}
+
+/// Reads and decrypts `<config dir>/<file_name>` written by [`save_device_sealed_file`].
+/// `Ok(None)` when the file does not exist. Never creates a key.
+pub fn load_device_sealed_file(file_name: &str) -> Result<Option<Vec<u8>>, VaultError> {
+    let dir = get_rustscp_config_dir();
+    let store = platform_key_store(&dir);
+    load_sealed_with(&dir, store.as_deref(), file_name)
+}
+
+/// Moves `<config dir>/<file_name>` aside as `<file_name>.corrupt-<unix_ts>` and returns
+/// the new path, or `None` when there is no such file.
+pub fn quarantine_config_file(file_name: &str) -> Result<Option<PathBuf>, VaultError> {
+    quarantine_config_file_in(&get_rustscp_config_dir(), file_name)
+}
+
+/// File-only variants (no key store) for other modules' tests.
+#[cfg(test)]
+pub(crate) fn save_sealed_in(
+    dir: &Path,
+    file_name: &str,
+    plaintext: &[u8],
+) -> Result<(), VaultError> {
+    save_sealed_with(dir, None, file_name, plaintext)
+}
+
+#[cfg(test)]
+pub(crate) fn load_sealed_in(dir: &Path, file_name: &str) -> Result<Option<Vec<u8>>, VaultError> {
+    load_sealed_with(dir, None, file_name)
+}
+
 fn vault_security_info_with(
     dir: &Path,
     store: Option<&dyn KeyStore>,
@@ -1834,5 +1942,165 @@ mod tests {
             VaultError::KdfOutOfRange(1).code(),
             "vault.kdf_out_of_range"
         );
+    }
+}
+
+#[cfg(test)]
+mod sealed_file_tests {
+    use super::*;
+    use crate::types::{AuthMethod, Protocol};
+    use tempfile::tempdir;
+
+    const FILE: &str = "site-layout.vault";
+
+    fn one_site() -> Vec<ConnectionConfig> {
+        vec![ConnectionConfig {
+            id: "site-1".into(),
+            name: "web-01".into(),
+            protocol: Protocol::Sftp,
+            auth: AuthMethod::Password("pw".into()),
+            ..ConnectionConfig::local()
+        }]
+    }
+
+    #[test]
+    fn round_trip_uses_the_local_envelope() {
+        let dir = tempdir().unwrap();
+        save_sealed_with(dir.path(), None, FILE, b"{\"folders\":[\"Clients\"]}").unwrap();
+
+        let loaded = load_sealed_with(dir.path(), None, FILE).unwrap();
+        assert_eq!(loaded.as_deref(), Some(&b"{\"folders\":[\"Clients\"]}"[..]));
+
+        let raw = fs::read_to_string(dir.path().join(FILE)).unwrap();
+        assert!(!raw.contains("Clients"), "the file is encrypted");
+        let envelope = parse_vault_from_json(&raw).unwrap();
+        assert_eq!(envelope.site_count, 0);
+        assert_eq!(envelope.kdf_iterations, LOCAL_VAULT_KDF_ITERATIONS);
+        // No sites.vault existed, so a device key was created for it.
+        assert!(dir.path().join(DEVICE_KEY_FILE).exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir.path().join(FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn shares_the_key_of_sites_vault() {
+        let dir = tempdir().unwrap();
+        save_vault_in(dir.path(), &one_site()).unwrap();
+        let key_before = fs::read_to_string(dir.path().join(DEVICE_KEY_FILE)).unwrap();
+
+        save_sealed_with(dir.path(), None, FILE, b"layout").unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join(DEVICE_KEY_FILE)).unwrap(),
+            key_before
+        );
+        assert_eq!(
+            load_sealed_with(dir.path(), None, FILE).unwrap().as_deref(),
+            Some(&b"layout"[..])
+        );
+        assert_eq!(load_vault_in(dir.path()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn refuses_to_create_a_key_while_sites_vault_exists_without_one() {
+        let dir = tempdir().unwrap();
+        save_vault_in(dir.path(), &one_site()).unwrap();
+        fs::remove_file(dir.path().join(DEVICE_KEY_FILE)).unwrap();
+
+        let err = save_sealed_with(dir.path(), None, FILE, b"layout").unwrap_err();
+        assert!(matches!(err, VaultError::DeviceKeyMissing(_)), "{err}");
+        assert!(!dir.path().join(DEVICE_KEY_FILE).exists());
+        assert!(!dir.path().join(FILE).exists());
+    }
+
+    #[test]
+    fn loading_never_creates_a_key() {
+        let dir = tempdir().unwrap();
+        assert!(load_sealed_with(dir.path(), None, FILE).unwrap().is_none());
+        assert!(!dir.path().join(DEVICE_KEY_FILE).exists());
+
+        save_sealed_with(dir.path(), None, FILE, b"layout").unwrap();
+        fs::remove_file(dir.path().join(DEVICE_KEY_FILE)).unwrap();
+        let err = load_sealed_with(dir.path(), None, FILE).unwrap_err();
+        assert!(matches!(err, VaultError::DeviceKeyMissing(_)), "{err}");
+        assert!(!dir.path().join(DEVICE_KEY_FILE).exists());
+    }
+
+    #[test]
+    fn a_tampered_file_does_not_decrypt() {
+        let dir = tempdir().unwrap();
+        save_sealed_with(dir.path(), None, FILE, b"layout").unwrap();
+        let path = dir.path().join(FILE);
+        let mut envelope = parse_vault_from_json(&fs::read_to_string(&path).unwrap()).unwrap();
+        let flipped = if envelope.ciphertext_hex.starts_with('0') {
+            "1"
+        } else {
+            "0"
+        };
+        envelope.ciphertext_hex.replace_range(0..1, flipped);
+        fs::write(&path, serde_json::to_string(&envelope).unwrap()).unwrap();
+        assert!(matches!(
+            load_sealed_with(dir.path(), None, FILE),
+            Err(VaultError::DecryptionFailed)
+        ));
+
+        fs::write(&path, "not json").unwrap();
+        assert!(load_sealed_with(dir.path(), None, FILE).is_err());
+    }
+
+    #[test]
+    fn quarantine_renames_the_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        fs::write(&path, "garbage").unwrap();
+
+        let moved = quarantine_config_file_in(dir.path(), FILE)
+            .unwrap()
+            .unwrap();
+        assert!(!path.exists());
+        assert!(moved
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("site-layout.vault.corrupt-"));
+        assert_eq!(fs::read_to_string(&moved).unwrap(), "garbage");
+        assert!(quarantine_config_file_in(dir.path(), FILE)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn rejects_names_that_could_replace_the_vault_or_its_key() {
+        let dir = tempdir().unwrap();
+        save_vault_in(dir.path(), &one_site()).unwrap();
+        for name in [
+            "sites.vault",
+            "SITES.VAULT",
+            "sites.vault.bak",
+            ".vault_key",
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "../site-layout.vault",
+        ] {
+            assert!(
+                save_sealed_with(dir.path(), None, name, b"x").is_err(),
+                "{name}"
+            );
+            assert!(load_sealed_with(dir.path(), None, name).is_err(), "{name}");
+            assert!(
+                quarantine_config_file_in(dir.path(), name).is_err(),
+                "{name}"
+            );
+        }
+        assert_eq!(load_vault_in(dir.path()).unwrap().len(), 1);
     }
 }

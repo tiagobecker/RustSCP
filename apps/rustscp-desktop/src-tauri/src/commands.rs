@@ -1261,14 +1261,24 @@ pub async fn delete_site(state: tauri::State<'_, AppState>, id: String) -> Resul
 pub async fn export_sites_vault(
     state: tauri::State<'_, AppState>,
     password: String,
+    ids: Option<Vec<String>>,
 ) -> Result<String, String> {
     if password.trim().is_empty() {
         return Err("A senha para proteger o cofre não pode ser vazia.".to_string());
     }
+    // `ids`: export only those sites (a selection or a folder); never Local.
+    let only: Option<std::collections::HashSet<String>> = ids.map(|ids| ids.into_iter().collect());
     let exportable: Vec<_> = {
         let sites = state.saved_sites.read().await;
-        sites.iter().filter(|s| s.id != "local").cloned().collect()
+        sites
+            .iter()
+            .filter(|s| s.id != "local" && only.as_ref().is_none_or(|ids| ids.contains(&s.id)))
+            .cloned()
+            .collect()
     };
+    if only.is_some() && exportable.is_empty() {
+        return Err("Nothing to export".to_string());
+    }
     let envelope =
         rustscp_core::vault::encrypt_sites_async(exportable, password.trim().to_string())
             .await

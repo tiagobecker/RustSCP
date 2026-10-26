@@ -219,6 +219,48 @@
   .ui-kbd {
     @apply ml-auto text-[11px] text-ink-faint tabular-nums;
   }
+
+  /* ---------- Connections tree (Connect dialog sidebar) ----------
+     The scroller has role="tree" and keeps focus (aria-activedescendant). Each row is .stree-row with
+     aria-selected; the active descendant also gets data-active, a cut row data-cut and a drop target
+     data-drop-target. Indent guides are .stree-guide spans (left set inline; data-strong under the
+     selected row's parent). Search matches are <mark class="stree-match">. */
+  .stree-row {
+    @apply relative rounded-md text-ink;
+  }
+  .stree-row:hover {
+    @apply bg-dark-650/50;
+  }
+  .stree-row[aria-selected='true'] {
+    @apply bg-dark-650/60;
+  }
+  [role='tree']:focus-within .stree-row[aria-selected='true'] {
+    @apply bg-dark-650;
+  }
+  [role='tree']:focus-visible .stree-row[data-active] {
+    box-shadow: inset 0 0 0 1.5px rgb(var(--color-rust-500) / 0.55);
+  }
+  /* The active row carries the focus ring, so the tree itself needs no outline */
+  [role='tree']:focus-visible:has(.stree-row[data-active]) {
+    outline: none;
+  }
+  .stree-row[data-cut] {
+    @apply opacity-50;
+  }
+  [role='tree'] .stree-row[data-drop-target],
+  [role='tree']:focus-within .stree-row[data-drop-target] {
+    @apply bg-rust-500/10;
+    box-shadow: inset 0 0 0 1px rgb(var(--color-rust-500) / 0.4);
+  }
+  .stree-guide {
+    @apply absolute top-0 bottom-0 w-px bg-line/60 pointer-events-none;
+  }
+  .stree-guide[data-strong] {
+    @apply bg-line-strong;
+  }
+  mark.stree-match {
+    @apply bg-rust-500/20 text-inherit rounded-[3px];
+  }
 }
 
 /* Thin, unobtrusive scrollbars */
@@ -291,6 +333,46 @@
   .animate-natural-wave-2,
   .animate-wave-glow {
     animation: none !important;
+  }
+
+  /* Connections tree: no chevron turn, no state fades, instant scrolling */
+  .stree-row,
+  .stree-row *,
+  .ui-menu-item {
+    transition: none !important;
+  }
+  [role='tree'] {
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Forced colours (Windows high contrast): selection, guides and focus stay visible in system colours.
+   Unlayered and after the utilities, so it wins over background and shadow utility classes on the same elements. */
+@media (forced-colors: active) {
+  .stree-row[aria-selected='true'],
+  [role='tree']:focus-within .stree-row[aria-selected='true'] {
+    background-color: Highlight;
+    color: HighlightText;
+  }
+  .stree-guide,
+  .stree-guide[data-strong] {
+    background-color: CanvasText;
+  }
+  [role='tree']:focus-visible .stree-row[data-active] {
+    outline: 2px solid Highlight;
+    outline-offset: -2px;
+  }
+  [role='tree'] .stree-row[data-drop-target] {
+    outline: 2px dashed Highlight;
+    outline-offset: -2px;
+  }
+  mark.stree-match {
+    background-color: Mark;
+    color: MarkText;
+  }
+  .ui-menu [role^='menuitem']:focus {
+    outline: 2px solid Highlight;
+    outline-offset: -2px;
   }
 }
 

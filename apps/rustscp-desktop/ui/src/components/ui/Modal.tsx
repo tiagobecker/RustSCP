@@ -10,7 +10,7 @@ export interface ModalProps {
   /** Right side of the header, before the close button */
   headerActions?: React.ReactNode;
   footer?: React.ReactNode;
-  size?: 'sm' | 'md' | 'lg' | 'xl' | '2xl' | 'full';
+  size?: 'sm' | 'md' | 'lg' | 'xl' | '2xl' | '3xl' | 'full';
   /** Close when clicking the dimmed backdrop (default true) */
   dismissOnBackdrop?: boolean;
   /** Close on Escape (default true) */
@@ -30,6 +30,7 @@ const SIZES: Record<NonNullable<ModalProps['size']>, string> = {
   lg: 'max-w-lg',
   xl: 'max-w-2xl',
   '2xl': 'max-w-4xl',
+  '3xl': 'max-w-[min(1040px,calc(100vw-2rem))]',
   full: 'max-w-[min(1200px,calc(100vw-2rem))] h-[calc(100vh-2rem)]',
 };
 

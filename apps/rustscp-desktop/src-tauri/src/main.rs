@@ -3,10 +3,12 @@
 mod askpass;
 mod commands;
 mod sharing;
+mod site_tree;
 mod terminal;
 
 use commands::*;
 use sharing::*;
+use site_tree::*;
 use terminal::*;
 
 #[cfg(target_os = "macos")]
@@ -108,6 +110,7 @@ fn main() {
         .manage(AppState::new())
         .manage(SharingState::default())
         .manage(TerminalState::default())
+        .manage(site_tree::SiteTreeState::default())
         .invoke_handler(tauri::generate_handler![
             connect_session,
             disconnect_session,
@@ -200,6 +203,12 @@ fn main() {
             terminal_history_clear,
             clipboard_read_text,
             open_external_url,
+            get_site_layout,
+            apply_site_tree_ops,
+            undo_site_tree_ops,
+            forget_site_tree_undo,
+            set_site_tree_view,
+            record_site_connected,
         ])
         .build(tauri::generate_context!())
         .expect("error while building RustSCP desktop application")
@@ -270,4 +279,6 @@ fn stop_background_services_once(app: &tauri::AppHandle) {
             SHUTDOWN_TIMEOUT.as_secs()
         );
     }
+    // A pending change to folders, favorites or recents (2 s at most).
+    site_tree::flush_site_layout_blocking(app);
 }
