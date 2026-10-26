@@ -15,7 +15,7 @@ import type { DragPayload, DropSpot } from './treeDragModel.ts';
 import type { TreeRow } from './types.ts';
 import { useTreeDrag } from './useTreeDrag.ts';
 import type { TreeDragHost } from './useTreeDrag.ts';
-import { canonicalKey, firstChildIndex, moveIndex, parentIndex } from './useTreeSelection.ts';
+import { canonicalKey, clampToSection, firstChildIndex, moveIndex, parentIndex } from './useTreeSelection.ts';
 import type { TreeSelection } from './useTreeSelection.ts';
 
 /** What the tree asks its owner to do (SiteSidebar holds the state and the dialogs). */
@@ -64,8 +64,8 @@ export interface TreeActions {
   dragHover: (spot: DropSpot | null, valid: boolean, copy: boolean) => void;
   /** A valid drop: move (or copy, with ⌥/Alt) into `folder` */
   drop: (payload: DragPayload, folder: string, copy: boolean, springOpened: string[]) => void;
-  /** A drag started or ended (an empty Favorites section shows a drop zone meanwhile) */
-  dragActive: (on: boolean) => void;
+  /** A drag started or ended (an empty Favorites section shows a drop zone meanwhile); `dropped`: it ended in an accepted drop */
+  dragActive: (on: boolean, dropped?: boolean) => void;
   /** Whether dropping on Favorites at `index` changes the list */
   canFavorite: (payload: DragPayload, index: number) => boolean;
   /** A drop on Favorites: the items join (or move to) position `index` */
@@ -76,6 +76,8 @@ export interface TreeActions {
   reorderFavorite: (row: TreeRow, delta: number) => void;
   /** The Recent header's "Clear" link */
   clearRecent: () => void;
+  /** The Recent header's "Show all (8)" / "Show fewer" */
+  toggleAllRecent: () => void;
   /** A breadcrumb segment: scroll to that folder row, select and focus it */
   revealCrumb: (path: string) => void;
 }
@@ -88,6 +90,8 @@ export interface SiteTreeHandle {
   rowRect: (key: string) => DOMRect | null;
   /** Cancels a running drag (Escape); true when one was running */
   cancelDrag: () => boolean;
+  /** Whether `el` is the tree or inside it */
+  contains: (el: Element | null) => boolean;
 }
 
 interface SiteTreeProps {
@@ -110,10 +114,24 @@ interface SiteTreeProps {
   cutKeys: ReadonlySet<string>;
   /** Saved sites with an open tab (a green dot on their icon) */
   openSiteIds: ReadonlySet<string>;
+  /** A search is running: folder counts are matches */
+  searching: boolean;
 }
 
 /** Height of the sticky breadcrumb over the list */
 const CRUMB_H = 22;
+
+type CrumbItem = { path: string; role: 'first' | 'middle' | 'last' } | null;
+
+/**
+ * Breadcrumb segments: all of them up to three levels; deeper, the first, "…" (null) and the last
+ * two, so the nearest folders stay readable at the sidebar's width.
+ */
+const crumbItems = (chain: string[]): CrumbItem[] => {
+  const role = (i: number, n: number): 'first' | 'middle' | 'last' => (i === n - 1 ? 'last' : i === 0 ? 'first' : 'middle');
+  if (chain.length <= 3) return chain.map((path, i) => ({ path, role: role(i, chain.length) }));
+  return [{ path: chain[0], role: 'first' }, null, { path: chain[chain.length - 2], role: 'middle' }, { path: chain[chain.length - 1], role: 'last' }];
+};
 
 const cx = (...parts: Array<string | false | null | undefined>) => parts.filter(Boolean).join(' ');
 
@@ -122,7 +140,7 @@ const isPrintable = (e: React.KeyboardEvent) =>
 
 /** The virtualized `role="tree"` list: rows, keyboard map and mouse wiring. */
 export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteTree(
-  { rows, indexByKey, rowHeight, compact, showAddress, selection, nameTerms, addressTerms, anyExpanded, edit, actionsRef, ariaLabel, describedById, cutKeys, openSiteIds },
+  { rows, indexByKey, rowHeight, compact, showAddress, selection, nameTerms, addressTerms, anyExpanded, edit, actionsRef, ariaLabel, describedById, cutKeys, openSiteIds, searching },
   ref
 ) {
   const { t, i18n } = useTranslation();
@@ -159,7 +177,7 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
     setExpanded: (paths, expanded) => actionsRef.current.dragExpand(paths, expanded),
     hover: (spot, valid, copy) => actionsRef.current.dragHover(spot, valid, copy),
     drop: (payload, folder, copy, springOpened) => actionsRef.current.drop(payload, folder, copy, springOpened),
-    active: (on) => actionsRef.current.dragActive(on),
+    active: (on, dropped) => actionsRef.current.dragActive(on, dropped),
     canFavorite: (payload, index) => actionsRef.current.canFavorite(payload, index),
     dropFavorite: (payload, index) => actionsRef.current.dropFavorite(payload, index),
   });
@@ -190,6 +208,16 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
     },
     [indexByKey, scrollToIndex]
   );
+  // A fix-up moved the focus (the focused row went away, an undo): bring the new one into view
+  const revealSeq = selection.reveal;
+  useEffect(() => {
+    if (revealSeq === 0) return;
+    const key = selection.stateRef.current.active;
+    if (key) scrollToKey(key, 'nearest');
+    // Only when a fix-up asks
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [revealSeq]);
+
   // A row asked for before it existed (a reveal, a new folder): scroll once it is there
   useEffect(() => {
     const p = pendingScroll.current;
@@ -211,6 +239,7 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
         return el ? el.getBoundingClientRect() : null;
       },
       cancelDrag: dragCancel,
+      contains: (el: Element | null) => !!el && !!scrollRef.current?.contains(el),
     }),
     [scrollRef, scrollToKey, dragCancel]
   );
@@ -230,8 +259,11 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
     actionsRef.current.move(row);
   };
 
-  /** Shift+navigation: the range from the anchor grows or shrinks to row `i`. */
-  const extendTo = (i: number) => {
+  /** Shift+navigation: the range from the anchor grows or shrinks to row `i` (kept inside the anchor's section). */
+  const extendTo = (target: number) => {
+    const anchor = selection.stateRef.current.anchor;
+    const anchorIndex = anchor !== null ? indexByKey.get(anchor) ?? -1 : -1;
+    const i = clampToSection(rows, anchorIndex >= 0 ? anchorIndex : activeIndex, target);
     const row = rowAt(i);
     if (!row) return;
     scrollToIndex(i, 'nearest');
@@ -462,12 +494,16 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
       a.clearRecent();
       return;
     }
+    if (action === 'recent-more') {
+      a.toggleAllRecent();
+      return;
+    }
     if (action === 'new-here' && row.kind === 'placeholder') {
       a.newConnection(row);
       return;
     }
     if (action === 'twisty' && row.kind === 'folder') {
-      selection.setActive(row.key);
+      // Folds or unfolds only: focus and selection stay where they are (spec §6)
       a.toggle(row, e.altKey);
       return;
     }
@@ -578,6 +614,7 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
               springing={dragView.springKey === row.key}
               dropLine={dragView.line && dragView.line.key === row.key ? dragView.line.side : null}
               open={row.kind === 'site' && openSiteIds.size > 0 && openSiteIds.has(row.site.id)}
+              countIsMatches={searching}
             />
           );
         })}
@@ -588,27 +625,40 @@ export const SiteTree = forwardRef<SiteTreeHandle, SiteTreeProps>(function SiteT
       // Pointer-only shortcut (the tree's ← reaches the parent): hidden from screen readers
       <div
         aria-hidden
-        className="absolute left-1.5 right-4 top-0 h-[22px] z-[2] flex items-center min-w-0 px-2 gap-0.5 bg-dark-850 border-b border-line text-[11.5px] text-ink-faint whitespace-nowrap overflow-hidden select-none"
+        className="absolute left-1.5 right-4 top-0 h-[22px] z-[2] flex items-center min-w-0 px-2 gap-0.5 bg-dark-850 border-b border-line text-[11.5px] text-ink-muted whitespace-nowrap overflow-hidden select-none"
         onWheel={(e) => {
           const el = scrollRef.current;
           if (el) el.scrollTop += e.deltaY;
         }}
       >
-        {crumbChain.map((path, i) => (
-          <React.Fragment key={path}>
-            {i > 0 && <ChevronRight aria-hidden className="w-3 h-3 shrink-0 opacity-70" />}
-            <button
-              type="button"
-              tabIndex={-1}
-              title={path}
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() => actionsRef.current.revealCrumb(path)}
-              className={cx('min-w-0 truncate hover:text-ink hover:underline underline-offset-2', i === crumbChain.length - 1 ? 'shrink-0 max-w-[70%]' : 'shrink')}
-            >
-              {baseName(path)}
-            </button>
-          </React.Fragment>
-        ))}
+        {crumbItems(crumbChain).map((item, i) =>
+          item === null ? (
+            <React.Fragment key="…">
+              <ChevronRight aria-hidden className="w-3 h-3 shrink-0 opacity-70" />
+              <span className="shrink-0 px-0.5" title={crumbPath.split('/').join(' / ')}>
+                …
+              </span>
+            </React.Fragment>
+          ) : (
+            <React.Fragment key={item.path}>
+              {i > 0 && <ChevronRight aria-hidden className="w-3 h-3 shrink-0 opacity-70" />}
+              <button
+                type="button"
+                tabIndex={-1}
+                title={item.path.split('/').join(' / ')}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => actionsRef.current.revealCrumb(item.path)}
+                className={cx(
+                  'truncate hover:text-ink hover:underline underline-offset-2',
+                  // The first and the last stay whole as long as they can; the one before the last gives way first
+                  item.role === 'first' ? 'shrink-0 max-w-[40%]' : item.role === 'last' ? 'shrink-0 max-w-[60%]' : 'min-w-[2.5em] shrink'
+                )}
+              >
+                {baseName(item.path)}
+              </button>
+            </React.Fragment>
+          )
+        )}
       </div>
     )}
     </>

@@ -110,8 +110,16 @@ export const initialPick = (rows: readonly MoveRow[], preferred?: string | null)
   return rows.findIndex(isPickable);
 };
 
-/** First pickable row that matches the search (after the text changes), or -1. */
-export const firstMatch = (rows: readonly MoveRow[]): number => {
-  const i = rows.findIndex((r) => r.kind === 'folder' && r.match && !r.disabled);
-  return i >= 0 ? i : rows.findIndex(isPickable);
+/**
+ * Where the highlight starts when the dialog opens: nowhere in move mode (Move stays off until a
+ * folder is chosen, so a stray Enter never moves things to the top level); the current folder in
+ * pick mode, when it can be picked.
+ */
+export const startPick = (rows: readonly MoveRow[], mode: 'move' | 'pick', current: string | null): number => {
+  if (mode === 'move' || current === null) return -1;
+  const i = rows.findIndex((r) => (r.kind === 'top' && current === '') || (r.kind === 'folder' && !r.recent && r.path === current));
+  return i >= 0 && isPickable(rows[i]) ? i : -1;
 };
+
+/** First pickable row that matches the search (after the text changes), or -1 when none does. */
+export const firstMatch = (rows: readonly MoveRow[]): number => rows.findIndex((r) => r.kind === 'folder' && r.match && !r.disabled);

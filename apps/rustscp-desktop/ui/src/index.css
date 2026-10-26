@@ -227,18 +227,29 @@
      selected row's parent). Search matches are <mark class="stree-match">. */
   .stree-row {
     @apply relative rounded-md text-ink;
+    /* Selection and focus ring of the tree only (the app's tokens stay as they are). Light: a
+       selected row stands out from the sidebar at about 1.3:1 and keeps ink-muted text at 4.5:1;
+       the 2px ring is at least 3:1 against it, in both themes. */
+    --stree-sel: 219 216 204;
+    --stree-sel-blur: 227 224 214;
+    --stree-ring: var(--color-rust-600);
+  }
+  .dark .stree-row {
+    --stree-sel: var(--color-dark-650);
+    --stree-sel-blur: 49 48 45;
+    --stree-ring: var(--color-rust-500);
   }
   .stree-row:hover {
     @apply bg-dark-650/50;
   }
   .stree-row[aria-selected='true'] {
-    @apply bg-dark-650/60;
+    background-color: rgb(var(--stree-sel-blur));
   }
   [role='tree']:focus-within .stree-row[aria-selected='true'] {
-    @apply bg-dark-650;
+    background-color: rgb(var(--stree-sel));
   }
   [role='tree']:focus-visible .stree-row[data-active] {
-    box-shadow: inset 0 0 0 1.5px rgb(var(--color-rust-500) / 0.55);
+    box-shadow: inset 0 0 0 2px rgb(var(--stree-ring));
   }
   /* The active row carries the focus ring, so the tree itself needs no outline */
   [role='tree']:focus-visible:has(.stree-row[data-active]) {

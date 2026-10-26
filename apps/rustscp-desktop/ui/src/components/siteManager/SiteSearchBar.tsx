@@ -20,12 +20,14 @@ interface Props {
   autoFocus: boolean;
   /** ↓: focus the first result row */
   onArrowDown: () => void;
-  /** Enter: select the first site result; ⌘Enter (`connect`): connect it */
+  /** Enter: select the first site result; ⌘Enter (`connect`): connect it. With nothing typed: into the tree */
   onEnter: (connect: boolean) => void;
   /** The query has qualifiers (the filter button shows a dot) */
   filtersActive: boolean;
   /** Opens the filter menu under the button */
   onOpenFilters: (anchor: DOMRect, viaKeyboard: boolean) => void;
+  /** DOM id of the filter menu while it is open */
+  filtersMenuId?: string;
 }
 
 /**
@@ -33,7 +35,7 @@ interface Props {
  * handled by the dialog's escape chain (the Modal routes it there): with text it clears, empty it
  * moves focus to the tree.
  */
-export const SiteSearchBar: React.FC<Props> = ({ value, onChange, inputRef, total, autoFocus, onArrowDown, onEnter, filtersActive, onOpenFilters }) => {
+export const SiteSearchBar: React.FC<Props> = ({ value, onChange, inputRef, total, autoFocus, onArrowDown, onEnter, filtersActive, onOpenFilters, filtersMenuId }) => {
   const { t, i18n } = useTranslation();
   const placeholder = t('siteTree.searchPlaceholder', {
     count: total,
@@ -87,6 +89,8 @@ export const SiteSearchBar: React.FC<Props> = ({ value, onChange, inputRef, tota
         <button
           type="button"
           aria-haspopup="menu"
+          aria-expanded={!!filtersMenuId}
+          aria-controls={filtersMenuId}
           onClick={(e) => onOpenFilters(e.currentTarget.getBoundingClientRect(), e.detail === 0)}
           className="absolute right-1.5 top-1/2 -translate-y-1/2 w-5 h-5 rounded flex items-center justify-center text-ink-faint hover:text-ink hover:bg-dark-650/70"
           title={filtersLabel}

@@ -28,6 +28,8 @@ export interface ContextMenuProps {
   width?: number;
   /** Focus the first item at once (opened from the keyboard: Shift+F10, ContextMenu key, Enter on ⋯). */
   focusFirst?: boolean;
+  /** DOM id of the top-level menu, for the opener's `aria-controls` */
+  rootId?: string;
 }
 
 const SUBMENU_DELAY_MS = 150;
@@ -43,7 +45,7 @@ type Level = { entries: ContextMenuEntry[]; triggerId?: string };
  * While open it owns the keyboard: its root carries data-ui-modal, so Modal and every other
  * "top-most [data-ui-modal]" check step aside and one Escape closes only the menu.
  */
-export const ContextMenu: React.FC<ContextMenuProps> = ({ at, entries, ariaLabel, onClose, width = 240, focusFirst = false }) => {
+export const ContextMenu: React.FC<ContextMenuProps> = ({ at, entries, ariaLabel, onClose, width = 240, focusFirst = false, rootId }) => {
   const baseId = useId();
   const rootRef = useRef<HTMLDivElement>(null);
   // Whatever had focus when the menu opened gets it back when the menu closes.
@@ -431,7 +433,7 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({ at, entries, ariaLabel
     return (
       <MenuPanel
         key={depth === 0 ? 'root' : `sub-${openPath.slice(0, depth).join('/')}`}
-        id={levelDomId(baseId, depth)}
+        id={depth === 0 && rootId ? rootId : levelDomId(baseId, depth)}
         depth={depth}
         at={at}
         triggerId={level.triggerId}

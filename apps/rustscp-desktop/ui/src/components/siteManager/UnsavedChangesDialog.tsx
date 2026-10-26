@@ -55,9 +55,9 @@ export const UnsavedChangesDialog: React.FC<Props> = ({ name, onSave, onDontSave
           </Button>
         </>
       }
-    >
-      <p className="text-[13px] text-ink-muted leading-relaxed">{t('siteTree.unsavedBody', "Your changes are lost if you don't save them.")}</p>
-    </Modal>,
+      role="alertdialog"
+      description={<p className="text-[13px] text-ink-muted leading-relaxed">{t('siteTree.unsavedBody', "Your changes are lost if you don't save them.")}</p>}
+    />,
     document.body
   );
 };

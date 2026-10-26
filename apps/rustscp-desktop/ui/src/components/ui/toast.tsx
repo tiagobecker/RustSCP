@@ -161,6 +161,33 @@ function subscribe(l: () => void) {
   return () => listeners.delete(l);
 }
 
+/**
+ * Where the stack sits: `null` is the app's default (bottom right, above the status bar). A dialog
+ * whose footer would sit under the default spot moves the stack (px from the viewport's bottom and
+ * right edges) while it is open, and puts back what it found when it closes.
+ */
+export interface ToastPlacement {
+  bottom: number;
+  right: number;
+}
+
+let placement: ToastPlacement | null = null;
+const placementListeners = new Set<() => void>();
+
+/** Moves the toast stack (null: the default place). Returns the placement it replaced. */
+export function setToastPlacement(next: ToastPlacement | null): ToastPlacement | null {
+  const prev = placement;
+  if (prev === next || (prev && next && prev.bottom === next.bottom && prev.right === next.right)) return prev;
+  placement = next;
+  placementListeners.forEach((l) => l());
+  return prev;
+}
+
+function subscribePlacement(l: () => void) {
+  placementListeners.add(l);
+  return () => placementListeners.delete(l);
+}
+
 const ICONS = {
   success: CheckCircle2,
   error: AlertCircle,
@@ -177,10 +204,12 @@ const ICON_COLORS: Record<ToastKind, string> = {
 
 export const Toaster: React.FC = () => {
   const list = useSyncExternalStore(subscribe, () => items, () => items);
-  if (list.length === 0) return null;
+  const place = useSyncExternalStore(subscribePlacement, () => placement, () => placement);
+  // The live region stays mounted while empty, so the first toast is announced too
   return (
     <div
-      className="fixed bottom-14 right-4 z-[100] flex flex-col gap-2 w-[360px] max-w-[calc(100vw-2rem)] pointer-events-none"
+      className={`fixed z-[100] flex flex-col gap-2 w-[360px] max-w-[calc(100vw-2rem)] pointer-events-none ${place ? '' : 'bottom-14 right-4'}`}
+      style={place ? { bottom: place.bottom, right: place.right } : undefined}
       role="region"
       aria-live="polite"
       aria-label="Notifications"

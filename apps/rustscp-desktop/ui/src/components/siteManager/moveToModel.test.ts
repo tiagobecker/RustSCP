@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildMoveRows, firstMatch, initialPick, isPickable, nextPickable } from './moveToModel.ts';
+import { buildMoveRows, firstMatch, initialPick, isPickable, nextPickable, startPick } from './moveToModel.ts';
 import type { MoveRow, MoveRowsInput } from './moveToModel.ts';
 
 const FOLDERS = ['Clients/Acme/Web', 'Clients/Beta', 'Staging', 'São Paulo/Produção', 'Arquivo'];
@@ -55,5 +55,17 @@ describe('Move to… rows', () => {
     assert.equal(r[initialPick(r, 'Staging')].key, 'f:Staging');
     const beta = rows({ query: 'beta' });
     assert.equal(beta[firstMatch(beta)].key, 'f:Clients/Beta');
+  });
+
+  it('starts with nothing picked when moving (Move waits for a folder), the current folder when picking', () => {
+    const r = rows({ current: 'Clients', recents: ['Staging'] });
+    assert.equal(startPick(r, 'move', 'Clients'), -1);
+    assert.equal(startPick(r, 'move', ''), -1, 'never the top level by default');
+    const p = rows({ current: 'Staging', disableCurrent: false, recents: ['Arquivo'] });
+    assert.equal(p[startPick(p, 'pick', 'Staging')].key, 'f:Staging');
+    assert.equal(startPick(p, 'pick', null), -1);
+    // A search with no match highlights nothing (not the top level)
+    const none = rows({ query: 'zzz' });
+    assert.equal(firstMatch(none), -1);
   });
 });

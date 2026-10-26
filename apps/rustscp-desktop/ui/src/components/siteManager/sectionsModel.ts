@@ -6,10 +6,17 @@
  */
 import type { ConnectionConfig } from '../../types.ts';
 import type { FavoriteRef, SiteLayout, SiteTreeViewPatch, TreeModel } from './types.ts';
-import { LOCAL_ID, MAX_COLLAPSED, MAX_FAVORITES, folderKey, normalizeGroup, parseItemKey, siteKey } from './siteTreeModel.ts';
+import { LOCAL_ID, MAX_COLLAPSED, MAX_FAVORITES, RECENT_SHOWN, RECENT_SHOWN_FEW, folderKey, normalizeGroup, parseItemKey, siteKey } from './siteTreeModel.ts';
 
 /** Libraries with more saved sites than this open with their nested folders collapsed, once. */
 export const LARGE_LIBRARY_ABOVE = 300;
+
+/**
+ * Recent rows the sidebar lists: the first 3 until the header's "Show all" is picked (kept in the
+ * view options), then all of them (up to 8). Favorites and Recent never push "All connections"
+ * out of view on a first open.
+ */
+export const recentLimitFor = (allRecent: boolean): number => (allRecent ? RECENT_SHOWN : RECENT_SHOWN_FEW);
 
 /* -------------------------------------------------------------------------- */
 /* Favorites                                                                   */
@@ -49,6 +56,17 @@ export const allFavorites = (model: Pick<TreeModel, 'favoriteSites' | 'favoriteF
     if (ref.kind === 'site' ? !model.favoriteSites.has(ref.id) : !model.favoriteFolders.has(ref.path)) return false;
   }
   return any;
+};
+
+/**
+ * How many items "Add N to favorites" / "Remove N from favorites" changes: all of them when every
+ * one is a favorite (the entry removes them), else only those not yet favorites.
+ */
+export const favoriteChangeCount = (model: Pick<TreeModel, 'favoriteSites' | 'favoriteFolders'>, itemKeys: Iterable<string>): number => {
+  const refs = refsOf(itemKeys);
+  const isFav = (ref: FavoriteRef) => (ref.kind === 'site' ? model.favoriteSites.has(ref.id) : model.favoriteFolders.has(ref.path));
+  const added = refs.filter((r) => !isFav(r)).length;
+  return added === 0 ? refs.length : added;
 };
 
 export const sameFavorites = (a: readonly FavoriteRef[], b: readonly FavoriteRef[]): boolean =>

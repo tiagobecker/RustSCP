@@ -170,6 +170,8 @@ export interface ViewPrefs {
   showFavorites: boolean;
   showRecent: boolean;
   resultsAsList: boolean;
+  /** Recent lists all of its (up to 8) rows instead of the first 3 */
+  allRecent: boolean;
 }
 
 /** A folder of the tree. The root has `path === ''`. */
@@ -244,6 +246,8 @@ export interface SectionRow extends RowBase {
   expanded: boolean;
   /** Items in the section (All: saved connections, or matches while searching) */
   count: number;
+  /** Recent: rows it could list (more than `count` while only the first few show) */
+  total?: number;
 }
 
 export interface FolderRow extends RowBase {

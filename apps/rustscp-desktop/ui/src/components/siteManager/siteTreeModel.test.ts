@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import type { ConnectionConfig } from '../../types.ts';
 import type { FlattenState, SiteLayout, SiteTreeOp, TreeRow } from './types.ts';
 import {
+  MAX_COLLAPSED,
+  MAX_IDS_PER_CALL,
+  MAX_OPS_PER_CALL,
   SiteTreeOpError,
   applyOpsLocally,
   authKind,
@@ -21,7 +24,9 @@ import {
   needsPassword,
   normalizeFolderPathStrict,
   normalizeGroup,
+  matchFolderCasing,
   opsAreOptimistic,
+  opsWithinLimits,
   parentOf,
   parseViewPrefs,
   pickFreeName,
@@ -495,10 +500,39 @@ describe('applyOpsLocally (same cases as site_layout.rs)', () => {
   });
 
   it('limits ops and ids per call', () => {
-    const many: SiteTreeOp[] = Array.from({ length: 101 }, (_, i) => ({ op: 'create_folder', path: `F${i}` }));
+    const many: SiteTreeOp[] = Array.from({ length: MAX_OPS_PER_CALL + 1 }, (_, i) => ({ op: 'create_folder', path: `F${i}` }));
     assert.equal(errCode(() => run(library(), defaultLayout(), many)), 'site_tree.too_many');
-    const ids = Array.from({ length: 5001 }, () => 'solo');
+    const ids = Array.from({ length: MAX_IDS_PER_CALL + 1 }, () => 'solo');
     assert.equal(errCode(() => run(library(), defaultLayout(), [{ op: 'move_sites', ids, to: null }])), 'site_tree.too_many');
+    assert.equal(opsWithinLimits(many), false);
+    assert.equal(opsWithinLimits(many.slice(1)), true);
+  });
+
+  it('matches the backend limits: 6,000 ids and 150 folders pass, a doubling copy batch is refused', () => {
+    // Same values as site_layout.rs
+    assert.equal(MAX_OPS_PER_CALL, 2_000);
+    assert.equal(MAX_IDS_PER_CALL, 50_000);
+    assert.equal(MAX_COLLAPSED, 10_000);
+    const ids = Array.from({ length: 6_000 }, () => 'solo');
+    assert.doesNotThrow(() => run(library(), defaultLayout(), [{ op: 'move_sites', ids, to: 'Big' }]));
+    const folders: SiteTreeOp[] = Array.from({ length: 150 }, (_, i) => ({ op: 'create_folder', path: `Team/F${i}` }));
+    assert.equal(run(library(), defaultLayout(), folders).layout.folders.filter((f) => f.startsWith('Team/')).length, 150);
+    assert.equal(opsWithinLimits([{ op: 'move_sites', ids, to: null }, ...folders]), true);
+
+    // copy_folder carries one id but clones everything inside; copy + merge-rename doubles the
+    // folder every two ops, so the sites one batch creates count against the same cap
+    const start = [LOCAL, ...Array.from({ length: 1_000 }, (_, i) => site(`t${i}`, 'T'))];
+    const doubling = (rounds: number): SiteTreeOp[] =>
+      Array.from({ length: rounds }, (): SiteTreeOp[] => [
+        { op: 'copy_folder', path: 'T', to: null, name: 'c' },
+        { op: 'rename_folder', path: 'c', name: 'T', merge: true },
+      ]).flat();
+    let n = 0;
+    const newId = () => `copy-${++n}`;
+    assert.equal(opsWithinLimits(doubling(6)), true, 'twelve ops and twelve ids look small');
+    assert.equal(errCode(() => run(start, defaultLayout(), doubling(6), newId)), 'site_tree.too_many');
+    const ok = run(start, defaultLayout(), doubling(2), newId);
+    assert.equal(ok.created.length, 3_000);
   });
 
   it('favorites and labels', () => {
@@ -534,6 +568,19 @@ describe('helpers', () => {
     assert.equal(folderNameProblem('acme', 'Clients', folders, 'Clients/Acme'), null, 'case-only rename');
     assert.equal(folderNameProblem('New', 'Clients', folders), null);
     assert.deepEqual(folderNameProblem('y'.repeat(250), 'Clients', folders, 'Clients/Acme'), { code: 'too_long' }, 'the subtree counts');
+  });
+
+  it('matchFolderCasing files a typed folder under the existing spelling of each level', () => {
+    const folders = ['Infra', 'Infra/Web', 'Clients/Acme', 'clients-old'];
+    assert.equal(matchFolderCasing('infra', folders), 'Infra');
+    assert.equal(matchFolderCasing(' infra / WEB ', folders), 'Infra/Web');
+    assert.equal(matchFolderCasing('infra/new Thing', folders), 'Infra/new Thing', 'new levels keep the typed casing');
+    assert.equal(matchFolderCasing('CLIENTS/acme/x', folders), 'Clients/Acme/x', 'parents only known through a child count too');
+    assert.equal(matchFolderCasing('Other', folders), 'Other');
+    assert.equal(matchFolderCasing('', folders), '');
+    // Two spellings already there (older data): the first in code-unit order, like find_sibling_ci
+    assert.equal(matchFolderCasing('prod', ['prod', 'Prod']), 'prod', 'an exact match wins');
+    assert.equal(matchFolderCasing('PROD', ['prod', 'Prod']), 'Prod');
   });
 
   it('view prefs parse defensively and pick a density by library size', () => {

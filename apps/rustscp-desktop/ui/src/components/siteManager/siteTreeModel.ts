@@ -41,12 +41,15 @@ export const MAX_LABEL_NAME_LEN = 40;
 export const MAX_FAVORITES = 200;
 export const MAX_RECENTS = 50;
 export const MAX_LABELS = 12;
-export const MAX_COLLAPSED = 2_000;
-export const MAX_OPS_PER_CALL = 100;
-export const MAX_IDS_PER_CALL = 5_000;
+export const MAX_COLLAPSED = 10_000;
+export const MAX_OPS_PER_CALL = 2_000;
+/** Ids carried by one batch, and also sites one batch may create (copies) */
+export const MAX_IDS_PER_CALL = 50_000;
 export const MAX_LAYOUT_FOLDERS = 10_000;
 /** Recent rows shown in the sidebar */
 export const RECENT_SHOWN = 8;
+/** Recent rows shown until "Show all" is picked (the folder tree stays above the fold) */
+export const RECENT_SHOWN_FEW = 3;
 /** Connect N / Connect all: asks first above this many connections */
 export const CONNECT_ASK_ABOVE = 5;
 /** Connect N / Connect all: at most this many at once */
@@ -489,6 +492,7 @@ export const DEFAULT_VIEW_PREFS: ViewPrefs = {
   showFavorites: true,
   showRecent: true,
   resultsAsList: false,
+  allRecent: false,
 };
 
 const SORT_KEYS: readonly SortKey[] = ['name', 'address', 'protocol', 'last'];
@@ -507,7 +511,7 @@ export const parseViewPrefs = (raw: unknown): ViewPrefs => {
   if (!isRecord(v)) return out;
   if (SORT_KEYS.includes(v.sort as SortKey)) out.sort = v.sort as SortKey;
   if (v.density === 'compact' || v.density === 'comfortable') out.density = v.density;
-  for (const k of ['foldersOnTop', 'showAddress', 'showFavorites', 'showRecent', 'resultsAsList'] as const) {
+  for (const k of ['foldersOnTop', 'showAddress', 'showFavorites', 'showRecent', 'resultsAsList', 'allRecent'] as const) {
     if (typeof v[k] === 'boolean') out[k] = v[k] as boolean;
   }
   return out;
@@ -1117,7 +1121,9 @@ export function flattenRows(model: TreeModel, state: FlattenState): FlatRows {
   /* ------------------------------ browsing ------------------------------- */
   const favoriteExpanded = state.favoriteExpanded ?? new Set<string>();
   const showFav = state.showFavorites !== false && model.favorites.length > 0;
-  const recentRows = state.showRecent === false ? [] : model.recents.filter((r) => !model.favoriteSites.has(r.id)).slice(0, state.recentLimit ?? RECENT_SHOWN);
+  // Recent lists up to 8; until "Show all" only the first few (recentLimit), so the folder tree stays in view
+  const recentAll = state.showRecent === false ? [] : model.recents.filter((r) => !model.favoriteSites.has(r.id)).slice(0, RECENT_SHOWN);
+  const recentRows = recentAll.slice(0, Math.max(1, state.recentLimit ?? RECENT_SHOWN));
   const showRec = recentRows.length > 0;
   const topSize = 1 + (showFav ? 1 : 0) + (showRec ? 1 : 0);
   let topPos = 0;
@@ -1193,7 +1199,7 @@ export function flattenRows(model: TreeModel, state: FlattenState): FlatRows {
 
   if (showRec) {
     const expanded = !collapsedSections.has('rec');
-    rows.push({ kind: 'section', key: 'sec:rec', section: 'rec', sectionId: 'rec', depth: 0, level: 1, setsize: topSize, posinset: ++topPos, expanded, count: recentRows.length });
+    rows.push({ kind: 'section', key: 'sec:rec', section: 'rec', sectionId: 'rec', depth: 0, level: 1, setsize: topSize, posinset: ++topPos, expanded, count: recentRows.length, total: recentAll.length });
     if (expanded) {
       recentRows.forEach((r, i) => {
         const site = model.sitesById.get(r.id);
@@ -1292,6 +1298,35 @@ export const folderNameProblem = (
   if (charLength(target) + deepestSuffix > MAX_FOLDER_PATH_LEN) return { code: 'too_long' };
   if (existing !== null) return { code: 'exists', existing };
   return null;
+};
+
+/**
+ * A typed folder path with each level spelled like an existing folder at that level, matched
+ * ignoring case (Rust `find_sibling_ci`: the first match in code-unit order). Levels that do not
+ * exist yet keep the typed casing. Saving "infra/web" next to "Infra" files it under "Infra/web",
+ * never in a case-variant sibling the tree refuses to create.
+ */
+export const matchFolderCasing = (path: string, folders: Iterable<string>): string => {
+  const normalized = normalizeGroup(path);
+  if (!normalized) return '';
+  const all = new Set<string>();
+  for (const raw of folders) for (const p of folderChain(normalizeGroup(raw))) all.add(p);
+  let parent = '';
+  for (const seg of normalized.split('/')) {
+    const exact = joinPath(parent, seg);
+    if (all.has(exact)) {
+      parent = exact;
+      continue;
+    }
+    const lower = seg.toLowerCase();
+    let found: string | null = null;
+    for (const p of all) {
+      if (parentOf(p) !== parent || baseName(p).toLowerCase() !== lower) continue;
+      if (found === null || p < found) found = p;
+    }
+    parent = found ?? exact;
+  }
+  return parent;
 };
 
 /* -------------------------------------------------------------------------- */
@@ -1413,6 +1448,28 @@ const idCount = (o: SiteTreeOp): number => {
 export const checkOpLimits = (ops: readonly SiteTreeOp[]): void => {
   if (ops.length > MAX_OPS_PER_CALL) fail('site_tree.too_many', 'Too many changes at once');
   if (ops.reduce((n, o) => n + idCount(o), 0) > MAX_IDS_PER_CALL) fail('site_tree.too_many', 'Too many items at once');
+};
+
+/**
+ * True when a batch passes `checkOpLimits` (checked before a confirmation, so a batch the backend
+ * would refuse is never confirmed first). Copies are counted when they are made (`checkCreated`).
+ */
+export const opsWithinLimits = (ops: readonly SiteTreeOp[]): boolean => {
+  try {
+    checkOpLimits(ops);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Sites one batch creates (`copy_sites`, `copy_folder`) count against MAX_IDS_PER_CALL: a
+ * copy_folder carries one id but clones everything inside, so copy + merge-rename rounds could
+ * otherwise double the library on every pair of ops.
+ */
+const checkCreated = (created: readonly CreatedSite[]) => {
+  if (created.length > MAX_IDS_PER_CALL) fail('site_tree.too_many', 'Too many items at once');
 };
 
 const folderExists = (name: string, parent: string | null): never =>
@@ -1551,6 +1608,7 @@ function applyOne(sites: ConnectionConfig[], w: Work, op: SiteTreeOp, newId: (()
         const label = w.siteLabels.get(source.id);
         if (label !== undefined) w.siteLabels.set(id, label);
         created.push({ source_id: source.id, id });
+        checkCreated(created);
       }
       return [...sites, ...copies];
     }
@@ -1645,6 +1703,7 @@ function applyOne(sites: ConnectionConfig[], w: Work, op: SiteTreeOp, newId: (()
         const label = w.siteLabels.get(source.id);
         if (label !== undefined) w.siteLabels.set(id, label);
         created.push({ source_id: source.id, id });
+        checkCreated(created);
       }
       newFolders.forEach((f) => w.folders.add(f));
       for (const [p, label] of newFolderLabels) if (!w.folderLabels.has(p)) w.folderLabels.set(p, label);

@@ -55,6 +55,14 @@ export interface UndoToast {
   /** Toast title, e.g. "Deleted “web-01”" */
   title: string;
   token: string;
+  /** Runs instead of `undo(token)` when the toast's Undo is clicked (the sidebar refocuses the tree first) */
+  onUndo?: () => void;
+}
+
+/** What `undo` did: the token it used, and whether the backend restored the change. */
+export interface UndoOutcome {
+  token: string;
+  ok: boolean;
 }
 
 export interface SiteTreeController {
@@ -69,8 +77,11 @@ export interface SiteTreeController {
   setCollapsed: (next: (prev: ReadonlySet<string>) => ReadonlySet<string>) => void;
   /** Runs a batch of tree ops; resolves to the backend's result, or null after an error (already shown) */
   run: (ops: SiteTreeOp[], opts?: RunOptions) => Promise<SiteTreeResult | null>;
-  /** Undoes the newest change (or the one with `token`) */
-  undo: (token?: string) => Promise<void>;
+  /**
+   * Undoes the newest change (or the one with `token`). `announce` also reads the result ("Undone",
+   * "Can't undo anymore", the partial text) to screen readers. Resolves to null when there was nothing to undo.
+   */
+  undo: (token?: string, announce?: (text: string) => void) => Promise<UndoOutcome | null>;
   canUndo: boolean;
   /** Success toast with an Undo button for a change (10 s; hover holds it) */
   toastWithUndo: (toast: UndoToast) => void;
@@ -190,6 +201,8 @@ export function useSiteTree({ isOpen, savedSites, onSitesUpdated }: Props): Site
         return tr(key, "The Local site can't be moved, duplicated or deleted.");
       case 'siteTree.undoExpired':
         return tr(key, "Can't undo anymore");
+      case 'siteTree.errTooMany':
+        return tr(key, 'Too many items at once. Select fewer and try again.');
       case 'siteTree.errLayoutReadOnly':
         return tr(key, 'Folders, favorites and labels were saved by a newer RustSCP and are read-only here.');
       case 'siteTree.warnLayoutUnavailable':
@@ -303,13 +316,13 @@ export function useSiteTree({ isOpen, savedSites, onSitesUpdated }: Props): Site
   }, []);
 
   const undo = useCallback(
-    async (token?: string) => {
+    async (token?: string, announce?: (text: string) => void): Promise<UndoOutcome | null> => {
       const tok = token ?? undoStack.current[undoStack.current.length - 1];
-      if (!tok) return;
+      if (!tok) return null;
       dropToken(tok);
       flushView();
       const version = collapsedVersion.current;
-      await enqueue(async () => {
+      return enqueue(async (): Promise<UndoOutcome> => {
         const tr = tRef.current;
         try {
           const res = await undoSiteTreeOps(tok);
@@ -319,21 +332,32 @@ export function useSiteTree({ isOpen, savedSites, onSitesUpdated }: Props): Site
           showResultWarnings(res.warnings);
           const report = res.undo_report;
           if (report && report.skipped > 0) {
-            notify.info(
-              tr('siteTree.undonePartial', {
-                restored: report.restored,
-                total: report.restored + report.skipped,
-                skipped: report.skipped,
-                defaultValue: 'Restored {{restored}} of {{total}}; {{skipped}} changed since',
-              })
-            );
+            const text = tr('siteTree.undonePartial', {
+              restored: report.restored,
+              total: report.restored + report.skipped,
+              skipped: report.skipped,
+              defaultValue: 'Restored {{restored}} of {{total}}; {{skipped}} changed since',
+            });
+            notify.info(text);
+            announce?.(text);
           } else {
-            notify.success(tr('siteTree.undone', 'Undone'));
+            const text = tr('siteTree.undone', 'Undone');
+            notify.success(text);
+            announce?.(text);
           }
+          return { token: tok, ok: true };
         } catch (err) {
           const { code } = parseSiteTreeError(err);
-          if (code === 'site_tree.undo_expired') notify.info(tr('siteTree.undoExpired', "Can't undo anymore"));
-          else notify.error(tr('siteTree.opFailed', "Couldn't update connections"), errorText(err));
+          if (code === 'site_tree.undo_expired') {
+            const text = tr('siteTree.undoExpired', "Can't undo anymore");
+            notify.info(text);
+            announce?.(text);
+          } else {
+            const text = tr('siteTree.opFailed', "Couldn't update connections");
+            notify.error(text, errorText(err));
+            announce?.(text);
+          }
+          return { token: tok, ok: false };
         }
       });
     },
@@ -341,10 +365,10 @@ export function useSiteTree({ isOpen, savedSites, onSitesUpdated }: Props): Site
   );
 
   const toastWithUndo = useCallback(
-    ({ title, token }: UndoToast) => {
+    ({ title, token, onUndo }: UndoToast) => {
       const id = notify.success(title, undefined, {
         durationMs: 10_000,
-        action: { label: tRef.current('siteTree.undo', 'Undo'), onClick: () => void undo(token) },
+        action: { label: tRef.current('siteTree.undo', 'Undo'), onClick: () => (onUndo ? onUndo() : void undo(token)) },
       });
       undoToasts.current.set(token, id);
     },
@@ -402,6 +426,8 @@ export function useSiteTree({ isOpen, savedSites, onSitesUpdated }: Props): Site
   /** Loads the layout; `opening` (the dialog just opened) also runs the large-library first run. */
   const load = useCallback(async (opening: boolean) => {
     const gen = ++loadGen.current;
+    // Folders expanded or collapsed while this load runs (or not sent yet) win over what it reads
+    const versionAtStart = collapsedVersion.current;
     try {
       let resp = await getSiteLayout();
       if (gen !== loadGen.current) return;
@@ -435,7 +461,7 @@ export function useSiteTree({ isOpen, savedSites, onSitesUpdated }: Props): Site
         void enqueue(() => setSiteTreeView(patch).catch(() => undefined));
       }
       setLayout(l);
-      applyCollapsed(new Set(l.collapsed));
+      if (!viewDirty.current && collapsedVersion.current === versionAtStart) applyCollapsed(new Set(l.collapsed));
     } catch (err) {
       // The tree still works from the sites' folders; changes report their own errors
       console.warn('Could not load the connections layout:', err);

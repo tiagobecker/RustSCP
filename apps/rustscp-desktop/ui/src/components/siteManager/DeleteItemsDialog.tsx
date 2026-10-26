@@ -95,11 +95,12 @@ export const DeleteItemsDialog: React.FC<Props> = ({ request, onChoose, onCancel
         defaultValue_other: request.count === 1 ? 'It holds {{formatted}} connections' : 'They hold {{formatted}} connections',
       });
       if (request.subfolders > 0) {
-        holds += ` ${t('siteTree.inSubfolders', {
+        // "It holds 3 connections and 1 subfolder" (the connections may sit anywhere inside)
+        holds += ` ${t('siteTree.andSubfolders', {
           count: request.subfolders,
           formatted: nf.format(request.subfolders),
-          defaultValue_one: 'in 1 subfolder',
-          defaultValue_other: 'in {{formatted}} subfolders',
+          defaultValue_one: 'and 1 subfolder',
+          defaultValue_other: 'and {{formatted}} subfolders',
         })}`;
       }
     } else {
@@ -190,9 +191,9 @@ export const DeleteItemsDialog: React.FC<Props> = ({ request, onChoose, onCancel
       icon={request.kind === 'merge' || request.kind === 'copy' || request.kind === 'connect' ? undefined : <AlertTriangle className="w-[18px] h-[18px] text-red-600 dark:text-red-400" aria-hidden="true" />}
       initialFocusRef={primaryRef}
       footer={footer}
-    >
-      {body}
-    </Modal>,
+      role="alertdialog"
+      description={body}
+    />,
     document.body
   );
 };

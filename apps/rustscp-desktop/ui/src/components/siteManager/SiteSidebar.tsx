@@ -40,15 +40,17 @@ import {
   viewOptionsMenu,
 } from './siteMenus.tsx';
 import type { MenuActions, MenuContext, ViewMenuState } from './siteMenus.tsx';
-import { allFavorites, checkFavoriteDrop, favoriteKey, favoriteRefOf, insertFavorites, moveFavorite, sameFavorites, setFavorites } from './sectionsModel.ts';
+import { allFavorites, checkFavoriteDrop, favoriteChangeCount, favoriteKey, favoriteRefOf, insertFavorites, moveFavorite, recentLimitFor, sameFavorites, setFavorites } from './sectionsModel.ts';
 import { activeValues, addressFromQuery, canonicalValue, clearQualifiers, highlightTerms, matchContext, parseQuery, removeToken, searchTree, toggleQualifier } from './siteQuery.ts';
 import {
   CONNECT_ASK_ABOVE,
   CONNECT_MAX,
   LOCAL_ID,
   MAX_FAVORITES,
+  MAX_IDS_PER_CALL,
   MAX_LABELS,
   MAX_SITE_NAME_LEN,
+  RECENT_SHOWN_FEW,
   VIEW_PREFS_KEY,
   baseName,
   buildTree,
@@ -66,6 +68,7 @@ import {
   isInside,
   isLocalSite,
   joinPath,
+  opsWithinLimits,
   parentOf,
   parseItemKey,
   parseViewPrefs,
@@ -84,7 +87,8 @@ import { checkDrop, commonParent, dragPayload, planCopies } from './treeDragMode
 import type { CopyNames, DragPayload, DropSpot } from './treeDragModel.ts';
 import type { FavoriteRef, FolderNode, LabelDef, SectionId, SiteTreeOp, TreeRow, ViewPrefs } from './types.ts';
 import type { SiteTreeController } from './useSiteTree.ts';
-import { canonicalKey, isItemRow, paneFor, rangeKeys, selectedItems, useTreeSelection } from './useTreeSelection.ts';
+import { actionItems, canonicalKey, isItemRow, paneFor, rangeKeys, remapRowKey, sectionBounds, selectedItems, toggleItemKeys, useTreeSelection } from './useTreeSelection.ts';
+import type { SelectionState } from './useTreeSelection.ts';
 
 /** What LoginDialog can ask of the sidebar (the form header, imports). */
 export interface SiteSidebarApi {
@@ -98,6 +102,12 @@ export interface SiteSidebarApi {
   toggleFavorite: (itemKey: string) => void;
   /** The form header's label pill: the item's Label menu anchored to it */
   openLabelMenu: (itemKey: string, rect: DOMRect) => void;
+  /** Selects an item (`s:<id>`) in the tree, revealing it, without loading anything (the password gate) */
+  selectItem: (itemKey: string) => void;
+  /** Gives keyboard focus back to the tree (after an action whose button went away) */
+  focusTree: () => void;
+  /** ⌘Z: undoes the newest tree change, announcing the result; the selection follows an undone folder rename */
+  undo: () => void;
 }
 
 export interface SiteSidebarProps {
@@ -139,10 +149,21 @@ export interface SiteSidebarProps {
   onConnectSites: (sites: ConnectionConfig[]) => void;
   /** Export of a selection or a folder: the vault dialog for these site ids */
   onExport: (ids: string[]) => void;
+  /**
+   * A folder was renamed, moved, merged or deleted (or such a change undone): things filed under
+   * `from` now live under `to` ('' = the top level); `whole`: everything inside `from` went to `to`
+   * itself (its subfolders were deleted). The new connection's folder follows it.
+   */
+  onFolderRemap?: (from: string, to: string, whole?: boolean) => void;
+  /** Id for the sidebar's heading (it names the Connect dialog) */
+  headingId?: string;
 }
 
 /** The right pane follows the selection (spec §4); a form with unsaved edits always stays. */
 export type PaneMode = 'form' | 'folder' | 'selection';
+
+/** What a folder rename asked from the overview's name field led to. */
+export type FolderRenameResult = { kind: 'renamed' } | { kind: 'prompt' } | { kind: 'unchanged' } | { kind: 'error'; text: string };
 
 const EMPTY_SET: ReadonlySet<string> = new Set();
 const EMPTY_TERMS: readonly string[] = [];
@@ -246,11 +267,14 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   openSiteIds,
   onConnectSites,
   onExport,
+  onFolderRemap,
+  headingId,
 }) => {
   const { t, i18n } = useTranslation();
   const lang = i18n.language;
   const mac = useMemo(() => isMacPlatform(), []);
   const descId = useId();
+  const menuDomId = `${useId().replace(/[^a-zA-Z0-9_-]/g, '')}-menu`;
   const asideRef = useRef<HTMLElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const treeRef = useRef<SiteTreeHandle>(null);
@@ -322,12 +346,37 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   };
   /** The next form change must not move the selection (it follows a delete) */
   const suppressFollow = useRef(false);
+  /**
+   * A pane button started an action that may take the button away (Delete N, Delete folder…,
+   * Move to…): once its dialogs close, keyboard focus goes back to the tree instead of <body>.
+   */
+  const focusTreeAfter = useRef<{ at: number; sawDialog: boolean } | null>(null);
+  /** Folder renames and moves by undo token: undoing one maps the selection back */
+  const undoRemaps = useRef(new Map<string, Array<{ from: string; to: string }>>());
+  /** The selection when a drag started: a cancelled or refused drop puts it back */
+  const dragSnapshot = useRef<SelectionState | null>(null);
+  /** The focused row (and the selection's version) before a search started: it comes back when the search is cleared */
+  const preSearchActive = useRef<{ active: string | null; version: number } | null>(null);
+  const queryRef = useRef('');
+  const onFolderRemapRef = useRef(onFolderRemap);
+  onFolderRemapRef.current = onFolderRemap;
 
-  const setQuery = useCallback((q: string) => {
-    setQueryState(q);
-    // Folders collapsed during a search are forgotten when the query changes
-    setSearchCollapsed(EMPTY_SET);
-  }, []);
+  const setQuery = useCallback(
+    (q: string) => {
+      // Remember where the focus was before the search, to put it back when the search clears
+      if (!queryRef.current.trim() && q.trim()) {
+        const st = selection.stateRef.current;
+        preSearchActive.current = { active: st.active, version: st.version };
+      }
+      queryRef.current = q;
+      setQueryState(q);
+      // Folders collapsed during a search are forgotten when the query changes
+      setSearchCollapsed(EMPTY_SET);
+    },
+    // stateRef is stable
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  );
 
   const announce = useCallback((text: string) => {
     setLive('');
@@ -367,6 +416,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
         collapsedSections,
         showFavorites: prefs.showFavorites,
         showRecent: prefs.showRecent,
+        recentLimit: recentLimitFor(prefs.allRecent),
         favoriteExpanded,
         search,
         searchCollapsed,
@@ -375,7 +425,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
         address,
         favDropZone: dragging,
       }),
-    [model, tree.collapsed, collapsedSections, prefs.showFavorites, prefs.showRecent, favoriteExpanded, search, searchCollapsed, draft, newFolderParent, address, dragging]
+    [model, tree.collapsed, collapsedSections, prefs.showFavorites, prefs.showRecent, prefs.allRecent, favoriteExpanded, search, searchCollapsed, draft, newFolderParent, address, dragging]
   );
   const { rows, indexByKey } = flat;
   const nameTerms = useMemo(() => (searching ? highlightTerms(parsed, 'name') : EMPTY_TERMS), [parsed, searching]);
@@ -453,12 +503,8 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   useEffect(() => {
     // A selected Favorites or Recent row that went away (unfavorited, cleared, section hidden):
     // the item stays selected on its own row in All connections
-    const s = selection.stateRef.current;
-    if (s.keys.size === 1) {
-      const [only] = s.keys;
-      const item = canonicalKey(only);
-      if (item !== only && !indexByKey.has(only) && indexByKey.has(item)) selection.selectOnly(item);
-    }
+    // (the focus stays where it is when that row is still shown: the next favorite after ⌘D)
+    selection.followTwin((key) => indexByKey.has(key));
     selection.ensureActive(
       (key) => indexByKey.has(key),
       (key) => {
@@ -471,6 +517,27 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [indexByKey]);
+
+  // A search cleared: the focus goes back to the row it was on before (else a shown selected row),
+  // never to whatever row the search left it on. Runs after the fix-up above, so it wins.
+  const wasSearching = useRef(searching);
+  useEffect(() => {
+    const was = wasSearching.current;
+    wasSearching.current = searching;
+    if (!was || searching) return;
+    const before = preSearchActive.current;
+    preSearchActive.current = null;
+    const s = selection.stateRef.current;
+    // A result picked during the search keeps the focus with it
+    const picked = !before || s.version !== before.version;
+    let next: string | null = null;
+    if (!picked && before.active !== null && indexByKey.has(before.active)) next = before.active;
+    else if (s.active !== null && s.keys.has(s.active) && indexByKey.has(s.active)) next = s.active;
+    else for (const k of s.keys) if (next === null && indexByKey.has(k)) next = k;
+    if (next === null && before?.active && indexByKey.has(before.active)) next = before.active;
+    if (next !== null) selection.setActive(next, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searching, indexByKey]);
 
   // Reveal and rename requests that waited for their row
   useEffect(() => {
@@ -600,19 +667,27 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     pendingRename.current = itemKey;
   };
 
-  const closeEdit = () => {
+  /**
+   * Ends the inline rename or new-folder name. The tree takes focus back after Enter or Escape, or
+   * when the field lost focus to nothing or to the tree; a click into another field, the search or
+   * a button keeps the focus there.
+   */
+  const closeEdit = (refocus = true) => {
     editClosing.current = true;
     setRename(null);
     setNewFolder(null);
-    treeRef.current?.focus();
+    if (refocus) treeRef.current?.focus();
   };
 
-  const commitRename = (fromBlur: boolean) => {
+  /** After a blur to `next`: whether the tree should take the focus back. */
+  const refocusAfterBlur = (next: Element | null) => next === null || !!treeRef.current?.contains(next) || next === document.body;
+
+  const commitRename = (fromBlur: boolean, refocus = true) => {
     const r = rename;
     if (!r || editClosing.current) return;
     const value = r.value.trim();
     if (!value || value === r.original) {
-      closeEdit();
+      closeEdit(refocus);
       return;
     }
     let error: string | null = null;
@@ -626,11 +701,11 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     }
     if (error) {
       // Leaving the field with an invalid name reverts it
-      if (fromBlur) closeEdit();
+      if (fromBlur) closeEdit(refocus);
       else setRename({ ...r, error });
       return;
     }
-    closeEdit();
+    closeEdit(refocus);
     if (r.kind === 'site') {
       void tree.run([{ op: 'rename_site', id: r.target, name: value }]).then((res) => {
         if (res) announce(t('siteTree.a11yRenamed', { name: value, defaultValue: 'Renamed to “{{name}}”' }));
@@ -640,21 +715,65 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     }
   };
 
-  /** The selection (or keyboard focus) on folder `from` follows it to `to`. */
+  /** The selection, anchor and focus on folder `from` (or inside it) follow it to `to`. */
   const followFolder = (from: string, to: string) => {
     const s = selection.stateRef.current;
-    if (s.keys.has(folderKey(from))) selection.selectOnly(folderKey(to));
-    else if (s.active === folderKey(from)) selection.setActive(folderKey(to));
+    const map = (k: string | null) => (k === null ? null : remapRowKey(k, from, to));
+    const keys = [...s.keys].map((k) => remapRowKey(k, from, to));
+    const changed = keys.some((k) => !s.keys.has(k)) || map(s.active) !== s.active || map(s.anchor) !== s.anchor;
+    if (changed) selection.selectKeys(keys, map(s.active), map(s.anchor));
   };
 
   /**
-   * Renames a folder (inline rename and the folder overview). A name a sibling already has opens
-   * the Merge prompt. Returns the error to show, or null when the rename went ahead or the prompt opened.
+   * After folder changes ran: the new connection's folder follows them, and the ones undo can
+   * reverse exactly (a rename or a move, not a merge or a delete) are kept with the undo token.
    */
-  const requestFolderRename = (path: string, raw: string): string | null => {
+  const afterFolderChanges = (token: string | null | undefined, changes: Array<{ from: string; to: string; whole?: boolean; reversible?: boolean }>) => {
+    for (const c of changes) onFolderRemapRef.current?.(c.from, c.to, c.whole);
+    const back = changes.filter((c) => c.reversible).map(({ from, to }) => ({ from, to }));
+    if (token && back.length > 0) undoRemaps.current.set(token, back);
+  };
+
+  /** Undo (⌘Z, a toast's Undo): the result is announced; an undone folder rename or move takes the selection back. */
+  const undoTree = async (token?: string) => {
+    const before = selection.stateRef.current;
+    const outcome = await tree.undo(token, announce);
+    if (!outcome) return;
+    const remaps = undoRemaps.current.get(outcome.token);
+    undoRemaps.current.delete(outcome.token);
+    if (!outcome.ok || !remaps) return;
+    // From the selection as it was before the undo (unless the user changed it meanwhile): the
+    // fix-up that ran while the renamed folder was gone must not keep the focus elsewhere
+    const now = selection.stateRef.current;
+    const base = now.version === before.version ? before : now;
+    let keys = [...base.keys];
+    let active = base.active;
+    let anchor = base.anchor;
+    for (const r of [...remaps].reverse()) {
+      keys = keys.map((k) => remapRowKey(k, r.to, r.from));
+      active = active === null ? null : remapRowKey(active, r.to, r.from);
+      anchor = anchor === null ? null : remapRowKey(anchor, r.to, r.from);
+      onFolderRemapRef.current?.(r.to, r.from);
+    }
+    selection.selectKeys(keys, active, anchor, true);
+  };
+
+  /** A toast's Undo: its button goes away, so the focus goes to the tree first (⌘Z and Escape keep working). */
+  const undoFromToast = (token: string) => {
+    treeRef.current?.focus();
+    void undoTree(token);
+  };
+
+  const toastUndo = (title: string, token: string) => tree.toastWithUndo({ title, token, onUndo: () => undoFromToast(token) });
+
+  /**
+   * Renames a folder (inline rename and the folder overview). A name a sibling already has opens
+   * the Merge prompt. Says whether the rename went ahead, the prompt opened, or what is wrong.
+   */
+  const requestFolderRename = (path: string, raw: string): FolderRenameResult => {
     const node = model.folders.get(path);
     const value = raw.trim();
-    if (!node || !value || value === node.name) return null;
+    if (!node || !value || value === node.name) return { kind: 'unchanged' };
     const parent = parentOf(path);
     const problem = folderNameProblem(value, parent, folderPaths, path);
     const renamed = (name = value) => announce(t('siteTree.a11yRenamed', { name, defaultValue: 'Renamed to “{{name}}”' }));
@@ -667,19 +786,24 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
           if (choice !== 'merge') return;
           followFolder(path, existing);
           void tree.run([{ op: 'rename_folder', path, name: value, merge: true }], { errorParams: { name: value } }).then((res) => {
-            if (res) renamed(baseName(existing));
+            if (!res) return;
+            renamed(baseName(existing));
+            afterFolderChanges(res.undo_token, [{ from: path, to: existing }]);
           });
         },
       });
-      return null;
+      return { kind: 'prompt' };
     }
-    if (problem) return folderProblemText(problem, value);
+    if (problem) return { kind: 'error', text: folderProblemText(problem, value) };
     // The renamed folder stays selected under its new path
-    followFolder(path, joinPath(parent, value));
+    const to = joinPath(parent, value);
+    followFolder(path, to);
     void tree.run([{ op: 'rename_folder', path, name: value }], { errorParams: { name: value } }).then((res) => {
-      if (res) renamed();
+      if (!res) return;
+      renamed();
+      afterFolderChanges(res.undo_token, [{ from: path, to, reversible: true }]);
     });
-    return null;
+    return { kind: 'renamed' };
   };
 
   /* ------------------------------- new folder ------------------------------ */
@@ -695,22 +819,22 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     treeRef.current?.scrollToKey('newfolder');
   };
 
-  const commitNewFolder = (fromBlur: boolean) => {
+  const commitNewFolder = (fromBlur: boolean, refocus = true) => {
     const nf = newFolder;
     if (!nf || editClosing.current) return;
     const name = nf.value.trim();
     if (!name) {
-      closeEdit();
+      closeEdit(refocus);
       return;
     }
     const problem = folderNameProblem(name, nf.parent, folderPaths, null);
     if (problem) {
-      if (fromBlur) closeEdit();
+      if (fromBlur) closeEdit(refocus);
       else setNewFolder({ ...nf, error: folderProblemText(problem, name) });
       return;
     }
     const path = joinPath(nf.parent, name);
-    closeEdit();
+    closeEdit(refocus);
     selection.selectOnly(folderKey(path));
     treeRef.current?.scrollToKey(folderKey(path));
     void tree.run([{ op: 'create_folder', path }], { errorParams: { name } }).then((res) => {
@@ -729,8 +853,8 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
           ariaLabel: t('siteTree.a11yRename', { name, defaultValue: 'Rename {{name}}' }),
           onChange: (value) => setRename((r) => (r ? { ...r, value, error: null } : r)),
           onCommit: () => commitRename(false),
-          onCancel: closeEdit,
-          onBlur: () => commitRename(true),
+          onCancel: () => closeEdit(),
+          onBlur: (next) => commitRename(true, refocusAfterBlur(next)),
         },
       };
     }
@@ -743,8 +867,8 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
           ariaLabel: t('siteTree.a11yNewFolderName', 'New folder name'),
           onChange: (value) => setNewFolder((n) => (n ? { ...n, value, error: null } : n)),
           onCommit: () => commitNewFolder(false),
-          onCancel: closeEdit,
-          onBlur: () => commitNewFolder(true),
+          onCancel: () => closeEdit(),
+          onBlur: (next) => commitNewFolder(true, refocusAfterBlur(next)),
         },
       };
     }
@@ -822,6 +946,10 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
       : t('siteTree.copiedTop', { count, formatted, defaultValue_one: 'Copied 1 item to the top level', defaultValue_other: 'Copied {{formatted}} items to the top level' });
   };
 
+  /** A batch over the backend's limits: refused here, before any confirmation, with the reason. */
+  const refuseTooMany = () =>
+    notify.error(t('siteTree.opFailed', "Couldn't update connections"), t('siteTree.errTooMany', 'Too many items at once. Select fewer and try again.'));
+
   /**
    * Copies items as one batch: into `target` (an ⌥/Alt drop; above 50 connections it asks first),
    * or each next to itself when `target` is null (Duplicate, folders included). Copies run on the
@@ -833,6 +961,8 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     if (plan.intoSelf) return failed(t('siteTree.errIntoSelf', "A folder can't go inside itself."));
     if (plan.tooLong) return failed(t('siteTree.errPathTooLong', 'This path would be longer than 255 characters.'));
     if (plan.ops.length === 0) return;
+    // Copies count against the same cap as ids: refused before the "Copy N connections?" question
+    if (!opsWithinLimits(plan.ops) || plan.connections > MAX_IDS_PER_CALL) return refuseTooMany();
     if (target !== null && !confirmed && plan.connections > COPY_ASK_ABOVE) {
       setDeleteReq({
         request: { kind: 'copy', connections: plan.connections },
@@ -866,7 +996,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     scrollWhenShown(copies[0], true);
     if (target !== null) {
       const title = copiedTitle(count, firstName, target);
-      if (res.undo_token) tree.toastWithUndo({ title, token: res.undo_token });
+      if (res.undo_token) toastUndo(title, res.undo_token);
       announce(title);
     } else {
       announce(
@@ -902,24 +1032,47 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     const total = sites.length + top.length;
     if (total === 0) return;
 
-    // Where the selection goes: the row after the deleted block, else the one before it
+    const plannedOps: SiteTreeOp[] = [];
+    if (sites.length) plannedOps.push({ op: 'delete_sites', ids: sites.map((s) => s.id) });
+    for (const f of top) plannedOps.push({ op: 'delete_folder', path: f.path, keep_contents: true });
+    if (!opsWithinLimits(plannedOps)) {
+      refuseTooMany();
+      return;
+    }
+
+    // Where the selection goes: the row after the deleted block, else the one before it, in the
+    // focused row's section (deleting a favorite stays in Favorites), a sibling first
+    const doomedKeys = new Set([...sites.map((x) => siteKey(x.id)), ...top.map((f) => folderKey(f.path))]);
     const doomed = (row: TreeRow) => {
-      const c = canonicalKey(row.key);
-      if (sites.some((s) => c === siteKey(s.id)) || top.some((f) => c === folderKey(f.path))) return true;
+      if (doomedKeys.has(canonicalKey(row.key))) return true;
       const inside = rowFolderPath(row);
-      return row.kind !== 'section' && top.some((f) => isInside(inside, f.path) && inside !== '');
+      return row.kind !== 'section' && inside !== '' && top.some((f) => isInside(inside, f.path));
     };
-    let first = -1;
-    let last = -1;
-    rows.forEach((r, i) => {
-      if (doomed(r)) {
+    const usable = (r: TreeRow) => r.kind !== 'section' && r.kind !== 'newFolder' && r.kind !== 'favDrop' && r.kind !== 'address' && !doomed(r);
+    const focusIndex = (() => {
+      const active = selection.stateRef.current.active;
+      const i = active !== null ? indexByKey.get(active) ?? -1 : -1;
+      if (i >= 0 && doomed(rows[i])) return i;
+      return rows.findIndex(doomed);
+    })();
+    const pickNext = (from: number, to: number, focus: TreeRow | undefined): TreeRow | undefined => {
+      let first = -1;
+      let last = -1;
+      for (let i = from; i < to; i++) {
+        if (!doomed(rows[i])) continue;
         if (first < 0) first = i;
         last = i;
       }
-    });
-    const after = rows.slice(last + 1).find((r) => r.kind !== 'section' && r.kind !== 'newFolder' && !doomed(r));
-    const before = first > 0 ? [...rows.slice(0, first)].reverse().find((r) => r.kind !== 'newFolder' && !doomed(r)) : undefined;
-    const nextRow = after ?? before;
+      if (first < 0) return undefined;
+      const after = rows.slice(last + 1, to).filter(usable);
+      const before = rows.slice(from, first).filter(usable).reverse();
+      // A sibling of the focused row (same section, depth and folder) first
+      const sibling = (r: TreeRow) => !!focus && r.depth === focus.depth && rowFolderPath(r) === rowFolderPath(focus);
+      return after.find(sibling) ?? before.find(sibling) ?? after[0] ?? before[0];
+    };
+    const focusRow = focusIndex >= 0 ? rows[focusIndex] : undefined;
+    const [secStart, secEnd] = focusIndex >= 0 ? sectionBounds(rows, focusIndex) : [0, rows.length];
+    const nextRow = pickNext(secStart, secEnd, focusRow) ?? pickNext(0, rows.length, focusRow);
 
     const formSiteId = formKey.startsWith('s:') ? formKey.slice(2) : null;
 
@@ -933,6 +1086,8 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
         (sites.some((s) => s.id === formSiteId) ||
           (choice !== 'keep' && top.some((f) => isInside(model.siteFolder.get(formSiteId) ?? '', f.path) && (model.siteFolder.get(formSiteId) ?? '') !== '')));
       if (nextRow?.kind === 'site' && (formSiteGone || !formDirtyRef.current)) {
+        // On that row (a favorite stays in Favorites), then loaded
+        selection.selectOnly(nextRow.key);
         onSelectSite(nextRow.site, { force: true });
       } else if (nextRow) {
         if (formSiteGone) {
@@ -945,7 +1100,13 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
         selection.selectOnly(nextRow.key);
       }
       const res = await tree.run(ops);
-      if (!res?.undo_token) return;
+      if (!res) return;
+      // What was filed in a deleted folder now lives one level up (or went with it)
+      afterFolderChanges(
+        res.undo_token,
+        top.map((f) => ({ from: f.path, to: parentOf(f.path), whole: choice !== 'keep' }))
+      );
+      if (!res.undo_token) return;
       const nf = (n: number) => formatCount(lang, n);
       let title: string;
       if (total === 1 && sites.length === 1) title = t('siteTree.deletedOne', { name: sites[0].name, defaultValue: 'Deleted “{{name}}”' });
@@ -953,7 +1114,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
       else if (top.length === 0)
         title = t('siteTree.deleted', { count: total, formatted: nf(total), defaultValue_one: 'Deleted 1 connection', defaultValue_other: 'Deleted {{formatted}} connections' });
       else title = t('siteTree.deletedItems', { count: total, formatted: nf(total), defaultValue_one: 'Deleted 1 item', defaultValue_other: 'Deleted {{formatted}} items' });
-      tree.toastWithUndo({ title, token: res.undo_token });
+      toastUndo(title, res.undo_token);
       announce(t('siteTree.a11yDeletedUndo', { shortcut: shortcutLabels(mac).undo, defaultValue: 'Deleted. Press {{shortcut}} to undo.' }));
     };
 
@@ -988,13 +1149,28 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
 
   /**
    * The items a keyboard action covers: a multi-selection as a whole (even when the focused row is
-   * outside it, as after ⌘A while searching or a ⌘-click that took the row out), else the focused row.
+   * outside it, as after ⌘A while searching or a ⌘-click that took the row out), the focused row
+   * when it is the selected one, else the selection (the focus may have wandered off it).
    */
-  const itemsFor = (row: TreeRow | null | undefined): string[] => {
-    const items = selectedItems(selection.stateRef.current.keys);
-    if (items.length > 1) return items;
-    if (!row || !isItemRow(row)) return [];
-    return [canonicalKey(row.key)];
+  const itemsFor = (row: TreeRow | null | undefined): string[] => actionItems(selection.stateRef.current.keys, row);
+
+  /**
+   * The selection after items landed somewhere (a drop, Move to…, Paste, a drop on Favorites).
+   * The pane never shows a form for a site other than the highlighted one: one site loads like a
+   * click (when the form has no unsaved edits); with unsaved edits the selection stays on the
+   * form's item; several items or a folder get their pane.
+   */
+  const settleSelection = (rowKeys: string[]) => {
+    const items = selectedItems(rowKeys);
+    if (formDirtyRef.current && !(items.length === 1 && items[0] === formKey)) {
+      selection.selectOnly(formKey);
+      return;
+    }
+    selection.selectKeys(rowKeys, rowKeys[0], rowKeys[0]);
+    if (items.length === 1 && items[0].startsWith('s:') && items[0] !== formKey) {
+      const site = model.sitesById.get(items[0].slice(2));
+      if (site) onSelectSite(site);
+    }
   };
 
   /** Sets a multi-selection; when it comes down to one site, that site loads (if the form has no unsaved edits). */
@@ -1007,12 +1183,10 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     }
   };
 
-  /** ⌘-click: adds or removes one item (non-item rows such as the draft drop out). */
+  /** ⌘-click: adds or removes one item, on any of its rows (non-item rows such as the draft drop out). */
   const toggleSelect = (row: TreeRow) => {
     if (!isItemRow(row)) return;
-    const base = [...selection.stateRef.current.keys].filter((k) => /^[sf]:/.test(canonicalKey(k)));
-    const next = base.includes(row.key) ? base.filter((k) => k !== row.key) : [...base, row.key];
-    applySelection(next, row.key, row.key);
+    applySelection(toggleItemKeys(selection.stateRef.current.keys, row.key), row.key, row.key);
   };
 
   /** Shift-click and Shift+arrows: the anchor…row range of one section. */
@@ -1068,6 +1242,12 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     const { looseSites, folders } = resolveItems(model, keys);
     const count = looseSites.length + folders.length;
     if (count === 0) return;
+    // The move would be one move_sites plus one move_folder per folder: refused before the dialog when too big
+    const estimate: SiteTreeOp[] = [{ op: 'move_sites', ids: looseSites.map((x) => x.id), to: null }, ...folders.map((f): SiteTreeOp => ({ op: 'move_folder', path: f.path, to: null }))];
+    if (!opsWithinLimits(estimate)) {
+      refuseTooMany();
+      return;
+    }
     const parents = new Set<string>([...looseSites.map((s) => model.siteFolder.get(s.id) ?? ''), ...folders.map((f) => parentOf(f.path))]);
     const name = count === 1 ? looseSites[0]?.name ?? folders[0].name : null;
     setMoveReq({
@@ -1104,6 +1284,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     const failed = (text: string) => notify.error(t('siteTree.opFailed', "Couldn't update connections"), text);
     if (plan.intoSelf) return failed(t('siteTree.errIntoSelf', "A folder can't go inside itself."));
     if (plan.tooLong) return failed(t('siteTree.errPathTooLong', 'This path would be longer than 255 characters.'));
+    if (!opsWithinLimits(plan.ops)) return refuseTooMany();
     if (plan.clashes.length > 0 && !merge) {
       const sites = plan.clashes.reduce((n, c) => n + (model.folders.get(c.path)?.count ?? 0), 0);
       setDeleteReq({
@@ -1120,13 +1301,18 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     const moved = [...plan.sites.map((s) => siteKey(s.id)), ...plan.folders.map((f) => folderKey(f.to))];
     expandChain(target);
     if (moved.length > 0) {
-      selection.selectKeys(moved, moved[0], moved[0]);
+      settleSelection(moved);
       scrollWhenShown(moved[0], false);
     }
     void tree.run(plan.ops).then((res) => {
-      if (!res?.undo_token) return;
+      if (!res) return;
+      afterFolderChanges(
+        res.undo_token,
+        plan.folders.map((f) => ({ from: f.from, to: f.to, reversible: !f.merges }))
+      );
+      if (!res.undo_token) return;
       const title = movedTitle(plan, target);
-      tree.toastWithUndo({ title, token: res.undo_token });
+      toastUndo(title, res.undo_token);
       announce(title);
     });
   };
@@ -1303,7 +1489,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     const added = next.length - before.length;
     if (collapsedSections.has('fav')) setCollapsedSections((prev) => new Set([...prev].filter((s) => s !== 'fav')));
     const keys = payload.keys.map((k) => `fav:${k}`);
-    selection.selectKeys(keys, keys[0], keys[0]);
+    settleSelection(keys);
     scrollWhenShown(keys[0], false);
     writeFavorites(next, () => announce(added > 0 ? favoriteText(true, added) : t('siteTree.favReordered', 'Favorites reordered')));
   };
@@ -1317,6 +1503,14 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   const clearRecent = () => {
     tree.updateView({ clear_recents: true });
     announce(t('siteTree.a11yRecentCleared', 'Recent cleared'));
+  };
+
+  /** Recent's "Show all (8)" / "Show fewer" (kept in the view options). */
+  const toggleAllRecent = () => {
+    const all = !prefsRef.current.allRecent;
+    setView({ allRecent: all });
+    if (collapsedSections.has('rec')) setCollapsedSections((prev) => new Set([...prev].filter((x) => x !== 'rec')));
+    announce(all ? t('siteTree.a11yRecentAll', 'Showing all recent connections') : t('siteTree.a11yRecentFew', 'Showing the 3 most recent connections'));
   };
 
   /** "Show in folder": the item's own row in All connections, revealed, selected and focused. */
@@ -1367,6 +1561,10 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
       return;
     }
     if (!plan) return;
+    if (!opsWithinLimits(plan.ops)) {
+      refuseTooMany();
+      return;
+    }
     const name = plan.labelId ? plan.created?.name ?? model.labels.get(plan.labelId)?.name ?? '' : null;
     void tree.run(plan.ops).then((res) => {
       if (!res) return;
@@ -1392,7 +1590,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     void tree.run([{ op: 'set_label_defs', labels }]).then((res) => {
       if (!res?.undo_token) return;
       const title = t('siteTree.labelsSaved', 'Labels updated');
-      tree.toastWithUndo({ title, token: res.undo_token });
+      toastUndo(title, res.undo_token);
       announce(title);
     });
   };
@@ -1470,6 +1668,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     showInFolder,
     removeRecent,
     clearRecent,
+    toggleAllRecent,
     hideSection,
     setView,
     labelSubmenu,
@@ -1494,9 +1693,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     let sites = 0;
     let folders = 0;
     let hasAddress = false;
-    let favoriteCount = 0;
     for (const k of keys) {
-      if (favoriteRefOf(k)) favoriteCount++;
       const ref = parseItemKey(k);
       if (ref?.kind === 'folder') folders++;
       else if (ref?.kind === 'site') {
@@ -1514,7 +1711,8 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
           sites,
           folders,
           hasAddress,
-          favoriteCount,
+          // Adding counts only the items not yet favorites
+          favoriteCount: favoriteChangeCount(model, keys),
           allFavorite: allFavorites(model, keys),
           connectSites: connectCount(keys),
           exportCount: sitesOfItems(model, keys).length,
@@ -1541,7 +1739,9 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     if (row?.kind === 'section' && row.sectionId !== 'all') {
       // H: the Favorites or Recent header
       const name = row.sectionId === 'fav' ? t('siteTree.sectionFavorites', 'Favorites') : t('siteTree.sectionRecent', 'Recent');
-      openMenu(at, sectionMenu(row.sectionId, menuCtx), name, focusFirst);
+      const total = row.total ?? row.count;
+      const recent = row.sectionId !== 'rec' ? null : total > row.count ? { more: true, total } : total > RECENT_SHOWN_FEW ? { more: false, total } : null;
+      openMenu(at, sectionMenu(row.sectionId, menuCtx, recent), name, focusFirst);
       return;
     }
     if (!row || row.kind === 'section') {
@@ -1736,12 +1936,40 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     dragExpand,
     dragHover,
     drop: dropItems,
-    dragActive: setDragging,
+    dragActive: (on, dropped) => {
+      setDragging(on);
+      if (on) {
+        dragSnapshot.current = selection.stateRef.current;
+        return;
+      }
+      // A cancelled or refused drag leaves the selection, its anchor and the focus as they were
+      const snap = dragSnapshot.current;
+      dragSnapshot.current = null;
+      if (dropped || !snap) return;
+      const cur = selection.stateRef.current;
+      if (cur.version !== snap.version || cur.active !== snap.active || cur.anchor !== snap.anchor) selection.selectKeys([...snap.keys], snap.active, snap.anchor);
+    },
     canFavorite: (payload, index) => checkFavoriteDrop(model.favorites, payload.keys, index) === 'ok',
     dropFavorite: dropFavorites,
-    toggleFavorite: (row, onlyRow) => toggleFavorites(onlyRow ? (isItemRow(row) ? [canonicalKey(row.key)] : []) : itemsFor(row)),
+    toggleFavorite: (row, onlyRow) => {
+      const items = onlyRow ? (isItemRow(row) ? [canonicalKey(row.key)] : []) : itemsFor(row);
+      // Unfavoriting from the focused Favorites row: the focus stays in Favorites, on the next one
+      if (items.length > 0 && allFavorites(model, items) && row.section === 'fav' && row.depth === 0 && selection.stateRef.current.active === row.key) {
+        const gone = new Set(items);
+        const favRows = rows.filter((r) => r.section === 'fav' && r.depth === 0 && isItemRow(r));
+        const at = favRows.findIndex((r) => r.key === row.key);
+        const keep = (r: TreeRow) => !gone.has(canonicalKey(r.key));
+        const next = favRows.slice(at + 1).find(keep) ?? favRows.slice(0, Math.max(0, at)).reverse().find(keep);
+        if (next) {
+          if (!formDirtyRef.current) activate(next, 'key');
+          selection.setActive(next.key, true);
+        }
+      }
+      toggleFavorites(items);
+    },
     reorderFavorite,
     clearRecent,
+    toggleAllRecent: () => toggleAllRecent(),
     revealCrumb: (path) => {
       const key = folderKey(path);
       selection.selectOnly(key);
@@ -1796,6 +2024,26 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     };
   }, [escapeLayers]);
 
+  // A pane action whose button went away (Delete N, Delete folder…, Move to…): once its dialogs
+  // are closed, the focus goes to the tree, never <body> (where ⌘Z and Escape would be lost)
+  useEffect(() => {
+    const pending = focusTreeAfter.current;
+    if (!pending) return;
+    if (deleteReq || moveReq || labelsOpen) {
+      pending.sawDialog = true;
+      return;
+    }
+    focusTreeAfter.current = null;
+    // An action that changed nothing (refused at once) leaves the focus where it is
+    if (!pending.sawDialog && Date.now() - pending.at > 1000) return;
+    const el = document.activeElement;
+    if (!el || el === document.body || !el.isConnected || !asideRef.current?.contains(el)) treeRef.current?.focus();
+  });
+  const fromPane = (action: () => void) => () => {
+    focusTreeAfter.current = { at: Date.now(), sawDialog: false };
+    action();
+  };
+
   /* ------------------------------ imperative api ------------------------------ */
 
   apiRef.current = {
@@ -1833,6 +2081,21 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     },
     toggleFavorite: (itemKey) => toggleFavorites([itemKey]),
     openLabelMenu: (itemKey, rect) => openMenu({ rect, placement: 'below' }, labelSubmenu([itemKey]), t('siteTree.label', 'Label'), false),
+    selectItem: (itemKey) => {
+      const ref = parseItemKey(itemKey);
+      if (!ref) return;
+      if (!indexByKey.has(itemKey)) {
+        // Revealed in All connections (a search that hides it is cleared)
+        if (searching) setQuery('');
+        if (collapsedSections.has('all')) setCollapsedSections((prev) => new Set([...prev].filter((x) => x !== 'all')));
+        if (ref.kind === 'site') expandChain(model.siteFolder.get(ref.id) ?? '');
+        else expandChain(ref.path, false);
+      }
+      selection.selectOnly(itemKey);
+      treeRef.current?.scrollToKey(itemKey);
+    },
+    focusTree: () => treeRef.current?.focus(),
+    undo: () => void undoTree(),
   };
   useEffect(
     () => () => {
@@ -1856,6 +2119,17 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   };
 
   const onSearchEnter = (connect: boolean) => {
+    if (parsedNow.isEmpty) {
+      // Nothing typed: Enter only moves into the tree (onto the selected row); ⌘Enter connects nothing
+      if (connect) return;
+      const s = selection.stateRef.current;
+      let key: string | null = s.active !== null && s.keys.has(s.active) && indexByKey.has(s.active) ? s.active : null;
+      for (const k of s.keys) if (key === null && indexByKey.has(k)) key = k;
+      key = key ?? rows[0]?.key ?? null;
+      if (key !== null) selection.setActive(key, true);
+      treeRef.current?.focus();
+      return;
+    }
     const row = firstSiteRow();
     if (!row) {
       // Nothing matches but the text is an address: open the filled-in form (never connect)
@@ -1874,9 +2148,13 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
 
   /* ------------------------------ sidebar keys ------------------------------ */
 
-  // ⌘N / ⇧⌘N / ⌃⌘N anywhere in the sidebar (the tree handles its own keys first)
+  // ⌘N / ⇧⌘N / ⌃⌘N anywhere in the sidebar (the tree handles its own keys first). Not from the
+  // inline name fields, and not from what React bubbles up out of portals (the panes, dialogs, menus).
   const onAsideKeyDown = (e: React.KeyboardEvent) => {
     if (e.defaultPrevented) return;
+    const target = e.target as HTMLElement;
+    if (!e.currentTarget.contains(target)) return;
+    if (target !== searchRef.current && target.closest?.('input, textarea, [contenteditable="true"]')) return;
     const lower = e.key.toLowerCase();
     const withSelection = mac ? e.metaKey && e.ctrlKey && !e.altKey : e.ctrlKey && e.altKey && !e.metaKey;
     // Not in the search field: Ctrl+Alt is AltGr on many Windows layouts (AltGr+N types a letter)
@@ -1945,8 +2223,9 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     // "Export selected (N)…" while sites are selected (the folders' contents count)
     const keys = selectedItems(selection.stateRef.current.keys);
     const exportSelected = { keys, count: keys.some((k) => k.startsWith('s:') || k.startsWith('f:')) ? sitesOfItems(model, keys).length : 0 };
-    openMenu({ rect: btn.getBoundingClientRect(), placement: 'above' }, importExportEntries(menuCtx, exportSelected), t('siteTree.importExportMenu', 'Import & export'), false);
+    openMenu({ rect: btn.getBoundingClientRect(), placement: 'above' }, importExportEntries(menuCtx, exportSelected), importExportLabel, false);
   };
+  const importExportLabel = t('siteTree.importExportMenu', 'Import & export');
   const overlayTop = rows.length * rowHeight + 8;
 
   const selectedCount = useMemo(() => selectedItems(selection.keys).length, [selection.keys]);
@@ -1991,8 +2270,9 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
           node={node}
           model={model}
           onRename={requestFolderRename}
-          onMove={() => node && openMove([folderKey(node.path)])}
-          onDelete={() => node && deleteItems([folderKey(node.path)])}
+          onMove={fromPane(() => node && openMove([folderKey(node.path)]))}
+          onDelete={fromPane(() => node && deleteItems([folderKey(node.path)]))}
+          onFocusTree={() => treeRef.current?.focus()}
           onNewFolder={() => startNewFolder(node?.path ?? '')}
           onNewConnection={() => onNewConnection(node?.path ?? '')}
           onReveal={(path) => {
@@ -2029,11 +2309,12 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
       paneContent = (
         <SelectionPane
           items={items}
-          onMove={() => openMove(pane.items)}
-          onDelete={() => deleteItems(pane.items)}
+          onMove={fromPane(() => openMove(pane.items))}
+          onDelete={fromPane(() => deleteItems(pane.items))}
           allFavorite={allFavorites(model, pane.items)}
+          favoriteCount={favoriteChangeCount(model, pane.items)}
           onFavorite={() => toggleFavorites(pane.items)}
-          onClose={reduceSelection}
+          onClose={fromPane(reduceSelection)}
           connectCount={connectCount(pane.items)}
           onConnect={() => connectItems(pane.items)}
           exportCount={sitesOfItems(model, pane.items).length}
@@ -2102,6 +2383,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
           onEnter={onSearchEnter}
           filtersActive={parsedNow.hasQualifiers}
           onOpenFilters={openFilters}
+          filtersMenuId={menu?.entries === 'filter' ? menuDomId : undefined}
         />
         <FilterPills
           parsed={parsedNow}
@@ -2114,7 +2396,9 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
       </div>
 
       <div className="order-1 h-12 shrink-0 px-3 pt-3 pb-2 flex items-center gap-1">
-        <h2 className="flex-1 min-w-0 truncate text-[15px] font-semibold text-ink">{t('loginDialog.title', 'Connections')}</h2>
+        <h2 id={headingId} className="flex-1 min-w-0 truncate text-[15px] font-semibold text-ink">
+          {t('loginDialog.title', 'Connections')}
+        </h2>
         <button
           type="button"
           className="ui-icon-btn ui-icon-btn-sm"
@@ -2141,6 +2425,8 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
           title={t('siteTree.viewOptions', 'View options')}
           aria-label={t('siteTree.viewOptions', 'View options')}
           aria-haspopup="menu"
+          aria-expanded={menu?.entries === 'view'}
+          aria-controls={menu?.entries === 'view' ? menuDomId : undefined}
           onClick={(e) => openMenu({ rect: e.currentTarget.getBoundingClientRect(), placement: 'below' }, 'view', t('siteTree.viewOptions', 'View options'), e.detail === 0)}
         >
           <SlidersHorizontal className="w-4 h-4" />
@@ -2165,6 +2451,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
           describedById={descId}
           cutKeys={cutKeys}
           openSiteIds={openIds}
+          searching={searching}
         />
         {onlyLocal && (
           <div className="absolute inset-x-3 flex flex-col items-center gap-1 text-center" style={{ top: overlayTop }}>
@@ -2221,12 +2508,20 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
         <div className="w-px h-full group-hover/resize:bg-line-strong" />
       </div>
 
-      <div className="order-4 h-6 shrink-0 px-3 flex items-center text-[11.5px] text-ink-faint tabular-nums truncate">
+      <div className="order-4 h-6 shrink-0 px-3 flex items-center text-[11.5px] text-ink-muted tabular-nums truncate">
         <span className="truncate">{status}</span>
       </div>
 
       <div className="order-5 h-11 shrink-0 border-t border-line px-2 flex items-center">
-        <Button variant="ghost" size="sm" icon={<ArrowDownUp className="w-3.5 h-3.5" />} aria-haspopup="menu" onClick={(e) => footerMenu(e.currentTarget)}>
+        <Button
+          variant="ghost"
+          size="sm"
+          icon={<ArrowDownUp className="w-3.5 h-3.5" />}
+          aria-haspopup="menu"
+          aria-expanded={menu?.label === importExportLabel}
+          aria-controls={menu?.label === importExportLabel ? menuDomId : undefined}
+          onClick={(e) => footerMenu(e.currentTarget)}
+        >
           {t('siteTree.importExportMenu', 'Import & export')}
           <ChevronDown className="w-3.5 h-3.5 text-ink-faint" aria-hidden />
         </Button>
@@ -2243,14 +2538,25 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
         <ContextMenu
           at={menu.at}
           entries={menu.entries === 'filter' ? filterEntries() : menu.entries === 'view' ? viewOptionsMenu(menuCtx, expandState, viewState) : menu.entries}
-          // pt-BR labels run long ("Usadas nos últimos 30 dias" plus a count, "Mostrar resultados da busca em lista")
-          width={menu.entries === 'filter' ? 268 : menu.entries === 'view' ? 284 : undefined}
+          // 280px like the file menus: pt-BR labels and the shortcut column fit ("Nova pasta com seleção  ⌃⌘N")
+          width={menu.entries === 'view' ? 296 : 280}
           ariaLabel={menu.label}
           focusFirst={menu.focusFirst}
+          rootId={menuDomId}
           onClose={() => setMenu(null)}
         />
       )}
-      {deleteReq && <DeleteItemsDialog request={deleteReq.request} onChoose={deleteReq.run} onCancel={() => setDeleteReq(null)} />}
+      {deleteReq && (
+        <DeleteItemsDialog
+          request={deleteReq.request}
+          onChoose={deleteReq.run}
+          onCancel={() => {
+            // The pane's button is still there: the dialog gives focus back to it
+            focusTreeAfter.current = null;
+            setDeleteReq(null);
+          }}
+        />
+      )}
       {moveReq && (
         <MoveToDialog
           mode="move"
@@ -2262,7 +2568,10 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
             setMoveReq(null);
             runMove(moveReq.keys, target, false);
           }}
-          onCancel={() => setMoveReq(null)}
+          onCancel={() => {
+            focusTreeAfter.current = null;
+            setMoveReq(null);
+          }}
         />
       )}
       {labelsOpen && <LabelsDialog labels={labelList(model)} usage={labelUsage(model)} onSave={saveLabels} onCancel={() => setLabelsOpen(false)} />}

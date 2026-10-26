@@ -7,7 +7,7 @@ import { Button } from '../ui/controls.tsx';
 import { plainTextInputProps } from '../../utils/inputHardening.ts';
 import { useVirtualRows } from '../../utils/useVirtualRows.ts';
 import { Highlight } from './SiteTreeRow.tsx';
-import { allFolderPaths, buildMoveRows, firstMatch, initialPick, isPickable, nextPickable } from './moveToModel.ts';
+import { allFolderPaths, buildMoveRows, firstMatch, isPickable, nextPickable, startPick } from './moveToModel.ts';
 import type { MoveRow } from './moveToModel.ts';
 import { baseName, fold, folderNameProblem, joinPath, parentOf, pickFreeName } from './siteTreeModel.ts';
 
@@ -62,20 +62,22 @@ export const MoveToDialog: React.FC<Props> = ({ mode, title, folders, current, m
     [known, query, recents, current, mode, movingList, creating?.parent]
   );
 
+  // Nothing is picked at first in move mode: Move waits for a folder (never the top level by default)
   const [pickKey, setPickKey] = useState<string | null>(() => {
-    const i = initialPick(rows, mode === 'pick' ? current : null);
+    const i = startPick(rows, mode, current);
     return i >= 0 ? rows[i].key : null;
   });
   const pickIndex = pickKey === null ? -1 : rows.findIndex((r) => r.key === pickKey);
 
-  // A new search highlights its first match
+  // A new search highlights its first match (none when nothing matches); clearing it keeps the pick
   const lastQuery = useRef(query);
   useEffect(() => {
     if (lastQuery.current === query) return;
     lastQuery.current = query;
-    const i = query.trim() ? firstMatch(rows) : pickIndex >= 0 ? pickIndex : initialPick(rows);
+    if (!query.trim()) return;
+    const i = firstMatch(rows);
     setPickKey(i >= 0 ? rows[i].key : null);
-  }, [query, rows, pickIndex]);
+  }, [query, rows]);
 
   const { scrollRef, onScroll, range, totalHeight, isPinnedOutside, scrollToIndex } = useVirtualRows({ count: rows.length, rowHeight: ROW_H, pinIndex: pickIndex });
   useEffect(() => {
@@ -202,11 +204,17 @@ export const MoveToDialog: React.FC<Props> = ({ mode, title, folders, current, m
     const picked = i === pickIndex;
     const isTop = row.kind === 'top';
     const label = isTop ? t('siteTree.topLevel', 'Top level') : row.name;
+    // "Acme, in Clients, current": the badge and the parent are read as separate parts
+    const parent = row.kind === 'folder' && !row.recent ? parentOf(row.path) : '';
+    const optionLabel = [label, parent ? t('siteTree.inParent', { parent: parent.split('/').join(' / '), defaultValue: 'in {{parent}}' }) : null, row.current ? t('siteTree.current', 'current') : null]
+      .filter(Boolean)
+      .join(', ');
     return (
       <div
         key={row.key}
         id={optionId(i)}
         role="option"
+        aria-label={optionLabel}
         aria-selected={picked}
         aria-disabled={row.disabled || undefined}
         title={isTop ? undefined : row.path}

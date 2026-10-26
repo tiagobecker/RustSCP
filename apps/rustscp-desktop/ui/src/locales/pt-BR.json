@@ -1,7 +1,8 @@
 {
   "app": {
     "title": "RustSCP",
-    "subtitle": "Next-Gen Remote Workspace & AI Gateway"
+    "subtitle": "Next-Gen Remote Workspace & AI Gateway",
+    "close": "Fechar"
   },
   "nav": {
     "quickConnect": "Conexão Rápida",
@@ -445,7 +446,7 @@
     "moveTo": "Mover para…",
     "moveNTo_one": "Mover 1 item para…",
     "moveNTo_other": "Mover {{formatted}} itens para…",
-    "newFolderWithSelection": "Nova pasta com a seleção",
+    "newFolderWithSelection": "Nova pasta com seleção",
     "newFolderWithN_one": "Nova pasta com 1 item",
     "newFolderWithN_other": "Nova pasta com {{formatted}} itens",
     "copyAddress": "Copiar endereço",
@@ -483,7 +484,7 @@
     "showAddress": "Mostrar endereço do servidor",
     "showFavorites": "Mostrar favoritos",
     "showRecent": "Mostrar recentes",
-    "resultsAsList": "Mostrar resultados da busca em lista",
+    "resultsAsList": "Resultados em lista",
     "filterShow": "Mostrar",
     "filterFavorites": "Favoritos",
     "filterRecent": "Usadas nos últimos 30 dias",
@@ -526,8 +527,8 @@
     "inSubfolders_one": "em 1 subpasta",
     "inSubfolders_other": "em {{formatted}} subpastas",
     "keepConnections": "Manter conexões",
-    "keepHint": "Manter conexões as move para “{{parent}}”.",
-    "keepHintTop": "Manter conexões as move para o nível principal.",
+    "keepHint": "As conexões vão para “{{parent}}”.",
+    "keepHintTop": "As conexões vão para o nível principal.",
     "deleteEverything": "Excluir tudo",
     "mergeTitle": "Mesclar pastas?",
     "mergeBody": "“{{name}}” já existe em “{{parent}}”. Mover as {{formatted}} conexões para ela?",
@@ -634,7 +635,7 @@
     "a11yUserAt": "{{user}} em {{host}}",
     "a11yInstructions": "Enter conecta, F2 renomeia, Shift+F10 abre as ações",
     "resizeSidebar": "Redimensionar a lista de conexões",
-    "keepHintUp": "Manter conexões as move um nível acima.",
+    "keepHintUp": "As conexões sobem um nível.",
     "removeFilter": "Remover filtro “{{name}}”",
     "allFolders": "Todas as pastas",
     "folderName": "Nome da pasta",
@@ -716,6 +717,22 @@
     "includeSubfolders": "Incluir subpastas",
     "colAddress": "Endereço",
     "sortByColumn": "Ordenar por {{column}}",
-    "tableEmpty": "Nada aqui ainda."
+    "tableEmpty": "Nada aqui ainda.",
+    "errTooMany": "Itens demais de uma vez. Selecione menos e tente de novo.",
+    "showAllRecent": "Mostrar todas ({{formatted}})",
+    "showFewerRecent": "Mostrar menos",
+    "a11yRecentAll": "Mostrando todas as conexões recentes",
+    "a11yRecentFew": "Mostrando as 3 conexões mais recentes",
+    "a11yCutMark": "recortada",
+    "a11yFolderMatches_one": "{{name}}, pasta, 1 resultado",
+    "a11yFolderMatches_other": "{{name}}, pasta, {{formatted}} resultados",
+    "a11yDraftUnnamed": "Nova conexão, ainda não salva",
+    "clearSelection": "Limpar seleção",
+    "andSubfolders_one": "e 1 subpasta",
+    "andSubfolders_other": "e {{formatted}} subpastas",
+    "inParent": "em {{parent}}",
+    "a11ySorted": "Ordenado por {{column}}, {{direction}}",
+    "ascending": "crescente",
+    "descending": "decrescente"
   }
 }

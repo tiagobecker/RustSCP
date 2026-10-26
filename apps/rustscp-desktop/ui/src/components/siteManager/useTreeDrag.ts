@@ -45,8 +45,12 @@ export interface TreeDragHost {
   hover: (spot: DropSpot | null, valid: boolean, copy: boolean) => void;
   /** A valid drop: move (or copy) the items into `folder`; `springOpened` lists folders spring-loading opened */
   drop: (payload: DragPayload, folder: string, copy: boolean, springOpened: string[]) => void;
-  /** A drag started (true) or ended (false): an empty Favorites section shows its drop zone meanwhile */
-  active: (on: boolean) => void;
+  /**
+   * A drag started (true) or ended (false): an empty Favorites section shows its drop zone
+   * meanwhile. `dropped` tells an accepted drop from a cancelled or refused one (the owner then
+   * puts the selection back as it was).
+   */
+  active: (on: boolean, dropped?: boolean) => void;
   /** Whether a drop on Favorites at `index` would change the list */
   canFavorite: (payload: DragPayload, index: number) => boolean;
   /** A valid drop on Favorites: the items join (or move to) position `index` */
@@ -126,6 +130,8 @@ export function useTreeDrag(opts: {
   const stRef = useRef<DragState | null>(null);
   const ghostEl = useRef<HTMLElement | null>(null);
   const suppressClick = useRef(false);
+  /** After a drag cancelled while the button is still down: swallows the click its release makes */
+  const releaseGuard = useRef<((e: PointerEvent) => void) | null>(null);
   const mac = useRef(isMacPlatform()).current;
 
   const publish = (next: TreeDragView) => {
@@ -258,8 +264,13 @@ export function useTreeDrag(opts: {
     key: (e: KeyboardEvent) => impl.current.key(e),
   }).current;
 
-  /** Ends the drag (no drop). Returns the folders spring-loading opened, for the caller to fold back. */
-  const end = (): { wasActive: boolean; springOpened: string[] } => {
+  const dropReleaseGuard = () => {
+    if (releaseGuard.current) window.removeEventListener('pointerup', releaseGuard.current, true);
+    releaseGuard.current = null;
+  };
+
+  /** Ends the drag (`dropped`: it ended in an accepted drop). Returns the folders spring-loading opened, for the caller to fold back. */
+  const end = (dropped = false): { wasActive: boolean; springOpened: string[] } => {
     const st = stRef.current;
     stRef.current = null;
     window.removeEventListener('pointermove', listeners.move, true);
@@ -280,7 +291,7 @@ export function useTreeDrag(opts: {
     setCursor(null);
     publish(IDLE);
     hostRef.current.hover(null, false, false);
-    hostRef.current.active(false);
+    hostRef.current.active(false, dropped);
     return { wasActive: true, springOpened: st.springOpened };
   };
 
@@ -288,6 +299,20 @@ export function useTreeDrag(opts: {
   const abort = (): boolean => {
     const { wasActive, springOpened } = end();
     if (springOpened.length) hostRef.current.setExpanded(springOpened, false);
+    if (wasActive) {
+      // Escape (or a lost window) ended it while the button is down: the click of the release
+      // later must not select the row under the pointer
+      dropReleaseGuard();
+      const guard = () => {
+        dropReleaseGuard();
+        suppressClick.current = true;
+        window.setTimeout(() => {
+          suppressClick.current = false;
+        }, 0);
+      };
+      releaseGuard.current = guard;
+      window.addEventListener('pointerup', guard, true);
+    }
     return wasActive;
   };
 
@@ -348,7 +373,7 @@ export function useTreeDrag(opts: {
       const { spot, valid } = spotAt(st, st.x, st.y);
       const copy = st.alt;
       const payload = st.payload;
-      const { springOpened } = end();
+      const { springOpened } = end(valid && !!spot);
       // The click that follows this pointerup must not select or open anything
       suppressClick.current = true;
       window.setTimeout(() => {
@@ -388,6 +413,11 @@ export function useTreeDrag(opts: {
 
   const onPointerDown = useCallback(
     (e: React.PointerEvent<HTMLElement>) => {
+      // A new press: a guard left by a cancelled drag (released outside the window) is stale
+      if (releaseGuard.current) {
+        window.removeEventListener('pointerup', releaseGuard.current, true);
+        releaseGuard.current = null;
+      }
       if (e.button !== 0 || e.pointerType === 'touch') return;
       // Control-click opens the context menu on macOS
       if (mac && e.ctrlKey) return;
@@ -447,7 +477,14 @@ export function useTreeDrag(opts: {
   }, []);
 
   // The tree unmounting mid-drag (the dialog closed) cleans up after itself
-  useEffect(() => () => void impl.current.abort(), []);
+  useEffect(
+    () => () => {
+      impl.current.abort();
+      dropReleaseGuard();
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  );
 
   return { view, onPointerDown, cancel, consumeClick, ghostRef };
 }

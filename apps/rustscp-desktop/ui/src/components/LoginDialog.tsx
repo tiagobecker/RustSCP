@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import {
   Eye,
   EyeOff,
@@ -26,10 +26,11 @@ import { SiteSidebar } from './siteManager/SiteSidebar.tsx';
 import type { PaneMode, SiteSidebarApi } from './siteManager/SiteSidebar.tsx';
 import { UnsavedChangesDialog } from './siteManager/UnsavedChangesDialog.tsx';
 import { parseAddressInput } from './siteManager/siteQuery.ts';
-import { folderChain, naturalCompare, needsPassword, normalizeGroup } from './siteManager/siteTreeModel.ts';
+import { folderChain, matchFolderCasing, naturalCompare, needsPassword, normalizeGroup } from './siteManager/siteTreeModel.ts';
 import { useSiteTree } from './siteManager/useSiteTree.ts';
 import { LABEL_DOT_CLASS, layoutSiteLabel } from './siteManager/labelsModel.ts';
-import { notify } from './ui/toast.tsx';
+import { notify, setToastPlacement } from './ui/toast.tsx';
+import type { ToastPlacement } from './ui/toast.tsx';
 
 interface LoginDialogProps {
   isOpen: boolean;
@@ -283,6 +284,62 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   const [bulkConnect, setBulkConnect] = useState<{ index: number; total: number; name: string } | null>(null);
 
   const siteTree = useSiteTree({ isOpen, savedSites, onSitesUpdated });
+  // The dialog's content (toast placement, the top-most check for ⌘Z) and the sidebar heading that names it
+  const rootRef = useRef<HTMLDivElement>(null);
+  const headingId = useId();
+
+  // While the dialog is open, toasts (the 10 s Undo above all) sit just above its footer, never on
+  // Cancel / Save / Connect or the panes' buttons; the app's own placement comes back on close
+  useEffect(() => {
+    if (!isOpen) return;
+    let replaced: ToastPlacement | null | undefined;
+    const place = () => {
+      const root = rootRef.current;
+      if (!root) return;
+      const box = root.getBoundingClientRect();
+      const footers = [...root.querySelectorAll<HTMLElement>('[data-dialog-footer]')].map((el) => el.getBoundingClientRect()).filter((r) => r.height > 0);
+      const top = footers.length ? Math.min(...footers.map((r) => r.top)) : box.bottom - 62;
+      const right = footers.length ? Math.max(...footers.map((r) => r.right)) : box.right;
+      const prev = setToastPlacement({ bottom: Math.round(window.innerHeight - top + 8), right: Math.max(8, Math.round(window.innerWidth - right + 12)) });
+      if (replaced === undefined) replaced = prev;
+    };
+    const raf = requestAnimationFrame(place);
+    // Again once the opening animation (a small scale) is over
+    const settle = window.setTimeout(place, 220);
+    window.addEventListener('resize', place);
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(place) : null;
+    if (rootRef.current) ro?.observe(rootRef.current);
+    return () => {
+      cancelAnimationFrame(raf);
+      window.clearTimeout(settle);
+      window.removeEventListener('resize', place);
+      ro?.disconnect();
+      setToastPlacement(replaced ?? null);
+    };
+  }, [isOpen]);
+
+  // ⌘Z (Ctrl+Z) undoes the last tree change wherever the focus is while this dialog is the
+  // top-most one (even on <body> after a button went away), but never inside a text field
+  const undoRef = useRef<() => void>(() => {});
+  undoRef.current = () => {
+    if (sidebarApiRef.current) sidebarApiRef.current.undo();
+    else void siteTree.undo();
+  };
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.isComposing) return;
+      const mod = isMacPlatform() ? e.metaKey : e.ctrlKey;
+      if (!mod || e.shiftKey || e.altKey || e.key.toLowerCase() !== 'z' || isTextTarget(e.target)) return;
+      const panel = rootRef.current?.closest('[data-ui-modal]');
+      const dialogs = document.querySelectorAll('[data-ui-modal]');
+      if (!panel || dialogs[dialogs.length - 1] !== panel) return;
+      e.preventDefault();
+      undoRef.current();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isOpen]);
 
   // Every folder in use, parents included, plus the folders kept in the layout: suggestions for the Folder field
   const knownFolders = useMemo(() => {
@@ -328,12 +385,32 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   if (!isOpen) return null;
 
   /** After an import ("View connections"): clears the search, expands the imported folders and selects the first one. */
-  const showImportedConnections = (folders: string[]) => {
+  const showImportedConnections = async (folders: string[]) => {
     // Undo cannot reach across an import
     siteTree.forgetUndo();
-    void siteTree.reload();
+    // The reloaded layout first, so its collapsed set cannot fold the imported folders again
+    await siteTree.reload();
     sidebarApiRef.current?.revealImported(folders.map((f) => normalizeGroup(f)).filter(Boolean));
   };
+
+  /**
+   * A folder change in the tree (rename, move, merge, delete, or its undo): a new connection filed
+   * in that folder follows it (the header and the draft row too), without marking the form edited.
+   */
+  const followFolderRemap = (from: string, to: string, whole?: boolean) => {
+    if (selectedSiteId !== 'new') return;
+    const current = normalizeGroup(group);
+    if (!current || !(current === from || current.startsWith(`${from}/`))) return;
+    const rest = current.slice(from.length).replace(/^\//, '');
+    setGroup(whole || !rest ? to : to ? `${to}/${rest}` : rest);
+  };
+
+  /** Keyboard focus back to the tree when the button that had it went away (Connect N ended, its Cancel). */
+  const refocusIfLost = () =>
+    window.setTimeout(() => {
+      const el = document.activeElement;
+      if (!el || el === document.body || !el.isConnected) sidebarApiRef.current?.focusTree();
+    }, 0);
 
   /** Expands the folders above a site so it stays visible in the list. */
   const revealFolder = (rawGroup?: string | null) => {
@@ -372,6 +449,8 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   };
 
   const handleSelectSite = (site: ConnectionConfig) => {
+    // A password hint belongs to the site it was shown for (gatePassword sets it again)
+    setPasswordGateId(null);
     setSelectedSiteId(site.id);
     setSiteName(site.name);
     setGroup(site.id === 'local' ? '' : normalizeGroup(site.group));
@@ -414,6 +493,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   };
 
   const resetForm = () => {
+    setPasswordGateId(null);
     setSelectedSiteId('new');
     setSiteName('');
     setGroup('');
@@ -520,8 +600,9 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
       auth: buildAuth(),
       remote_root: remoteRoot.trim(),
       tls_fingerprint: protocol === 'ftps' && tlsFingerprint.trim() ? tlsFingerprint.trim() : null,
-      // The built-in Local site always stays at the top level
-      group: selectedSiteId === 'local' ? null : normalizeGroup(group) || null,
+      // The built-in Local site always stays at the top level. Each level takes the casing of an
+      // existing folder ("infra" goes into "Infra"): the tree never holds case-variant siblings
+      group: selectedSiteId === 'local' ? null : matchFolderCasing(normalizeGroup(group), knownFolders) || null,
     };
   };
 
@@ -572,6 +653,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
     if (attemptTokenRef.current) attemptTokenRef.current.cancelled = true;
     connectAttemptIdRef.current++;
     setIsConnecting(false);
+    if (bulkConnect) refocusIfLost();
     setBulkConnect(null);
     setErrorMessage(t('loginDialog.cancelledMsg', 'Connection attempt cancelled. You can adjust the details and try again.'));
   };
@@ -609,9 +691,14 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
     else guardDirty(() => handleSelectSite(site));
   };
 
-  /** Password gate: the site is shown with its Password field focused instead of an attempt that would fail. */
+  /**
+   * Password gate: the site is shown with its Password field focused instead of an attempt that
+   * would fail. It is selected in the tree too, so the form (not a folder overview or the selection
+   * panel) is what shows before the field takes focus.
+   */
   const gatePassword = (id: string) => {
     setPasswordGateId(id);
+    sidebarApiRef.current?.selectItem(`s:${id}`);
     setTimeout(() => passwordRef.current?.focus(), 40);
   };
 
@@ -689,6 +776,9 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
     if (opened > 0) {
       resetForm();
       onClose();
+    } else {
+      // The dialog stays: the progress bar (and the focus it may have had) went away
+      refocusIfLost();
     }
   };
 
@@ -708,14 +798,6 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
 
   /** "Change…" in a new connection's header: Move to… in pick mode sets the folder it will be saved in. */
   const changeFolder = () => setPickingFolder(true);
-
-  // ⌘Z anywhere in the dialog outside text fields undoes the last tree change
-  const onDialogKeyDown = (e: React.KeyboardEvent) => {
-    const mod = isMacPlatform() ? e.metaKey : e.ctrlKey;
-    if (!mod || e.shiftKey || e.altKey || e.key.toLowerCase() !== 'z' || isTextTarget(e.target)) return;
-    e.preventDefault();
-    void siteTree.undo();
-  };
 
   const handleSave = async (): Promise<boolean> => {
     const invalid = validate();
@@ -790,8 +872,8 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   ];
 
   return (
-    <Modal isOpen={isOpen} onClose={handleEscape} size="3xl" padded={false} className="h-[min(700px,calc(100vh-2rem))]" dismissOnBackdrop={false}>
-      <div className="flex h-full min-h-0" onKeyDown={onDialogKeyDown}>
+    <Modal isOpen={isOpen} onClose={handleEscape} size="3xl" padded={false} className="h-[min(700px,calc(100vh-2rem))]" dismissOnBackdrop={false} labelledBy={headingId}>
+      <div ref={rootRef} className="flex h-full min-h-0">
         {/* Saved connections */}
         <SiteSidebar
           tree={siteTree}
@@ -821,6 +903,8 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
           onPaneModeChange={setPaneMode}
           openSiteIds={openSiteIds}
           onConnectSites={connectSitesFromTree}
+          onFolderRemap={followFolderRemap}
+          headingId={headingId}
           onExport={(ids) => {
             setVaultExportIds(ids);
             setVaultInitialTab('export');
@@ -842,20 +926,23 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
                     <span className="shrink-0">{t('loginDialog.editing', 'Editing')}</span>
                   )}
                   {normalizedGroup && (
-                    <span className="min-w-0 truncate" title={normalizedGroup}>
-                      {isNew ? '\u00a0' : '\u00a0·\u00a0'}
-                      {folderChain(normalizedGroup).map((path, i) => (
-                        <React.Fragment key={path}>
-                          {i > 0 && ' / '}
-                          <button
-                            type="button"
-                            className="hover:text-ink hover:underline underline-offset-2"
-                            onClick={() => sidebarApiRef.current?.revealFolder(path, { select: true, focus: true })}
-                          >
-                            {path.slice(path.lastIndexOf('/') + 1)}
-                          </button>
-                        </React.Fragment>
-                      ))}
+                    // Cut from the left when it does not fit, so the nearest folder stays readable
+                    <span className="min-w-0 truncate [direction:rtl] text-left" title={normalizedGroup.split('/').join(' / ')}>
+                      <span dir="ltr" className="[unicode-bidi:isolate]">
+                        {isNew ? '\u00a0' : '\u00a0·\u00a0'}
+                        {folderChain(normalizedGroup).map((path, i) => (
+                          <React.Fragment key={path}>
+                            {i > 0 && ' / '}
+                            <button
+                              type="button"
+                              className="hover:text-ink hover:underline underline-offset-2"
+                              onClick={() => sidebarApiRef.current?.revealFolder(path, { select: true, focus: true })}
+                            >
+                              {path.slice(path.lastIndexOf('/') + 1)}
+                            </button>
+                          </React.Fragment>
+                        ))}
+                      </span>
                     </span>
                   )}
                   {labelInfo && (
@@ -871,7 +958,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
                           : t('siteTree.changeLabel', 'Change label')
                       }
                     >
-                      <span aria-hidden className={`w-1.5 h-1.5 rounded-full ${LABEL_DOT_CLASS[labelInfo.def.color]}`} />
+                      <span aria-hidden className={`w-1.5 h-1.5 rounded-[1.5px] ${LABEL_DOT_CLASS[labelInfo.def.color]}`} />
                       <span className="max-w-[160px] truncate">{labelInfo.def.name}</span>
                     </button>
                   )}
@@ -1031,11 +1118,12 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
                             : undefined
                         }
                       >
-                        {(id) => (
+                        {(id, describedBy) => (
                           <div className="relative">
                             <TextInput
                               id={id}
                               ref={passwordRef}
+                              aria-describedby={describedBy}
                               mono
                               type={showPassword ? 'text' : 'password'}
                               value={password}
@@ -1200,7 +1288,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
           </div>
 
           {/* Footer */}
-          <div className="flex items-center gap-2 px-5 py-3.5 border-t border-line shrink-0 select-none">
+          <div data-dialog-footer="" className="flex items-center gap-2 px-5 py-3.5 border-t border-line shrink-0 select-none">
             <div className="flex-1 min-w-0 flex items-center gap-2 text-[12.5px]">
               {isConnecting ? (
                 <span className="flex items-center gap-2 text-ink-muted truncate">
@@ -1279,7 +1367,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
           initialTab={vaultInitialTab}
           exportSiteIds={vaultExportIds}
           onClose={() => setIsVaultModalOpen(false)}
-          onViewConnections={showImportedConnections}
+          onViewConnections={(folders) => void showImportedConnections(folders)}
           siteCount={savedSites.filter((s) => s.id !== 'local').length}
           onSitesUpdated={(newSites) => {
             if (onSitesUpdated) onSitesUpdated(newSites);

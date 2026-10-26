@@ -16,8 +16,10 @@ interface Props {
   onDelete: () => void;
   /** Every selected item is a favorite already (the button removes them) */
   allFavorite: boolean;
+  /** Items the favorites button changes (adding: only those not yet favorites) */
+  favoriteCount: number;
   onFavorite: () => void;
-  /** Reduces the selection to the focused row */
+  /** "Clear selection": reduces the selection to the focused row */
   onClose: () => void;
   /** Selected sites Connect N opens (folders' contents are not) */
   connectCount: number;
@@ -33,7 +35,7 @@ interface Props {
 const LISTED = 8;
 
 /** The right pane while 2 or more items are selected: what they are, and what can be done to all of them. */
-export const SelectionPane: React.FC<Props> = ({ items, onMove, onDelete, allFavorite, onFavorite, onClose, connectCount, onConnect, exportCount, onExport, onLabel }) => {
+export const SelectionPane: React.FC<Props> = ({ items, onMove, onDelete, allFavorite, favoriteCount, onFavorite, onClose, connectCount, onConnect, exportCount, onExport, onLabel }) => {
   const { t, i18n } = useTranslation();
   const lang = i18n.language;
   const nf = (n: number) => formatCount(lang, n);
@@ -95,8 +97,8 @@ export const SelectionPane: React.FC<Props> = ({ items, onMove, onDelete, allFav
             onClick={onFavorite}
           >
             {allFavorite
-              ? t('siteTree.removeFavoritesN', { count: items.length, formatted: nf(items.length), defaultValue_one: 'Remove 1 from favorites', defaultValue_other: 'Remove {{formatted}} from favorites' })
-              : t('siteTree.addFavoritesN', { count: items.length, formatted: nf(items.length), defaultValue_one: 'Add 1 to favorites', defaultValue_other: 'Add {{formatted}} to favorites' })}
+              ? t('siteTree.removeFavoritesN', { count: favoriteCount, formatted: nf(favoriteCount), defaultValue_one: 'Remove 1 from favorites', defaultValue_other: 'Remove {{formatted}} from favorites' })
+              : t('siteTree.addFavoritesN', { count: favoriteCount, formatted: nf(favoriteCount), defaultValue_one: 'Add 1 to favorites', defaultValue_other: 'Add {{formatted}} to favorites' })}
           </Button>
           <Button className="justify-start" icon={<Tag className="w-3.5 h-3.5 text-ink-muted" />} aria-haspopup="menu" onClick={(e) => onLabel(e.currentTarget.getBoundingClientRect())}>
             <span className="flex-1 text-left">{t('siteTree.label', 'Label')}</span>
@@ -111,10 +113,11 @@ export const SelectionPane: React.FC<Props> = ({ items, onMove, onDelete, allFav
         </div>
       </div>
 
-      <div className="flex items-center gap-2 px-5 py-3.5 border-t border-line shrink-0 select-none">
+      <div data-dialog-footer="" className="flex items-center gap-2 px-5 py-3.5 border-t border-line shrink-0 select-none">
         <div className="flex-1" />
+        {/* Shrinks the selection; the dialog's own Close is elsewhere */}
         <Button variant="ghost" onClick={onClose}>
-          {t('siteTree.close', 'Close')}
+          {t('siteTree.clearSelection', 'Clear selection')}
         </Button>
         <Button variant={connectCount > 0 ? 'secondary' : 'primary'} icon={<FolderInput className="w-3.5 h-3.5" />} onClick={onMove} disabled={movable === 0}>
           {t('siteTree.moveTo', 'Move to…')}

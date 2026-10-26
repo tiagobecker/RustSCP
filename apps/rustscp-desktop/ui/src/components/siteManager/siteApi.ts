@@ -63,7 +63,7 @@ export const SITE_TREE_ERROR_KEYS: Readonly<Record<SiteTreeErrorCode, string>> =
   'site_tree.path_too_long': 'siteTree.errPathTooLong',
   'site_tree.local_immutable': 'siteTree.errLocal',
   'site_tree.not_found': 'siteTree.opFailed',
-  'site_tree.too_many': 'siteTree.opFailed',
+  'site_tree.too_many': 'siteTree.errTooMany',
   'site_tree.undo_expired': 'siteTree.undoExpired',
   'site_tree.layout_read_only': 'siteTree.errLayoutReadOnly',
   'site_tree.layout_unavailable': 'siteTree.warnLayoutUnavailable',

@@ -1,7 +1,8 @@
 {
   "app": {
     "title": "RustSCP",
-    "subtitle": "Next-Gen Remote Workspace & AI Gateway"
+    "subtitle": "Next-Gen Remote Workspace & AI Gateway",
+    "close": "Close"
   },
   "nav": {
     "quickConnect": "Quick Connect",
@@ -716,6 +717,22 @@
     "includeSubfolders": "Include subfolders",
     "colAddress": "Address",
     "sortByColumn": "Sort by {{column}}",
-    "tableEmpty": "Nothing here yet."
+    "tableEmpty": "Nothing here yet.",
+    "errTooMany": "Too many items at once. Select fewer and try again.",
+    "showAllRecent": "Show all ({{formatted}})",
+    "showFewerRecent": "Show fewer",
+    "a11yRecentAll": "Showing all recent connections",
+    "a11yRecentFew": "Showing the 3 most recent connections",
+    "a11yCutMark": "cut",
+    "a11yFolderMatches_one": "{{name}}, folder, 1 result",
+    "a11yFolderMatches_other": "{{name}}, folder, {{formatted}} results",
+    "a11yDraftUnnamed": "New connection, not saved yet",
+    "clearSelection": "Clear selection",
+    "andSubfolders_one": "and 1 subfolder",
+    "andSubfolders_other": "and {{formatted}} subfolders",
+    "inParent": "in {{parent}}",
+    "a11ySorted": "Sorted by {{column}}, {{direction}}",
+    "ascending": "ascending",
+    "descending": "descending"
   }
 }

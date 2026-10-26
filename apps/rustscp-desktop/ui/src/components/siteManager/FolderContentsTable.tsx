@@ -51,6 +51,8 @@ export const FolderContentsTable: React.FC<Props> = ({ model, path, name, openSi
     });
   };
   const [activeKey, setActiveKey] = useState<string | null>(null);
+  /** "Sorted by Name, ascending", read once a header button changes the sort */
+  const [sortNote, setSortNote] = useState('');
 
   const rows = useMemo(() => folderTableRows(model, path, view), [model, path, view]);
   // Like the tree, a dot shows only where the label differs from the one this folder passes down
@@ -65,7 +67,17 @@ export const FolderContentsTable: React.FC<Props> = ({ model, path, name, openSi
     if (el) el.scrollTop = 0;
   }, [path, scrollRef]);
 
-  const sortBy = (sort: TableSort) => setView(sort === view.sort ? { dir: view.dir === 'asc' ? 'desc' : 'asc' } : { sort, dir: defaultDir(sort) });
+  const sortBy = (sort: TableSort, label: string) => {
+    const dir: SortDir = sort === view.sort ? (view.dir === 'asc' ? 'desc' : 'asc') : defaultDir(sort);
+    setView(sort === view.sort ? { dir } : { sort, dir });
+    setSortNote(
+      t('siteTree.a11ySorted', {
+        column: label,
+        direction: dir === 'asc' ? t('siteTree.ascending', 'ascending') : t('siteTree.descending', 'descending'),
+        defaultValue: 'Sorted by {{column}}, {{direction}}',
+      })
+    );
+  };
 
   const open = (row: TableRow) => {
     if (row.kind === 'site') onConnect(row.site);
@@ -152,7 +164,7 @@ export const FolderContentsTable: React.FC<Props> = ({ model, path, name, openSi
         <>
           <Folder aria-hidden className="w-4 h-4 shrink-0 text-ink-faint" />
           <span className="truncate font-medium">{node.name}</span>
-          {label && <span aria-hidden title={label.name} className={`w-1.5 h-1.5 rounded-full shrink-0 ${LABEL_DOT_CLASS[label.color]}`} />}
+          {label && <span aria-hidden title={label.name} className={`w-1.5 h-1.5 rounded-[1.5px] shrink-0 ${LABEL_DOT_CLASS[label.color]}`} />}
           {label && <span className="sr-only">{`, ${t('siteTree.a11yLabel', { name: label.name, defaultValue: 'label {{name}}' })}`}</span>}
         </>
       );
@@ -180,7 +192,7 @@ export const FolderContentsTable: React.FC<Props> = ({ model, path, name, openSi
             )}
           </span>
           <span className="truncate">{site.name}</span>
-          {label && <span aria-hidden title={label.name} className={`w-1.5 h-1.5 rounded-full shrink-0 ${LABEL_DOT_CLASS[label.color]}`} />}
+          {label && <span aria-hidden title={label.name} className={`w-1.5 h-1.5 rounded-[1.5px] shrink-0 ${LABEL_DOT_CLASS[label.color]}`} />}
           {/* The dots' meaning for screen readers (never colour alone) */}
           <span className="sr-only">
             {[labelName ? t('siteTree.a11yLabel', { name: labelName, defaultValue: 'label {{name}}' }) : '', openSiteIds.has(site.id) ? t('siteTree.a11yConnected', 'connected') : '']
@@ -242,6 +254,9 @@ export const FolderContentsTable: React.FC<Props> = ({ model, path, name, openSi
           {t('siteTree.includeSubfolders', 'Include subfolders')}
         </label>
       </div>
+      <span role="status" aria-live="polite" className="sr-only">
+        {sortNote}
+      </span>
       <div
         role="grid"
         tabIndex={0}
@@ -266,11 +281,11 @@ export const FolderContentsTable: React.FC<Props> = ({ model, path, name, openSi
                 aria-sort={sorted ? (view.dir === 'asc' ? 'ascending' : 'descending') : 'none'}
                 className={cx('min-w-0 flex', ci === 3 && 'justify-end')}
               >
+                {/* Tabbable, so the sort is reachable without a pointer (a click keeps the grid's focus) */}
                 <button
                   type="button"
-                  tabIndex={-1}
                   onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => sortBy(c.id)}
+                  onClick={() => sortBy(c.id, c.label)}
                   title={t('siteTree.sortByColumn', { column: c.label, defaultValue: 'Sort by {{column}}' })}
                   className={cx('min-w-0 flex items-center gap-1 hover:text-ink', sorted && 'text-ink-muted font-medium')}
                 >

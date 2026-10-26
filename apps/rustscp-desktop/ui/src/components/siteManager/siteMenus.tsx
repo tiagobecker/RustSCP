@@ -88,6 +88,8 @@ export interface MenuActions {
   removeRecent: (id: string) => void;
   /** Empties Recent */
   clearRecent: () => void;
+  /** Recent: lists all of its rows, or the first few again */
+  toggleAllRecent?: () => void;
   /** Hides the Favorites or Recent section (View options shows it again) */
   hideSection: (section: 'fav' | 'rec') => void;
   /** Changes view options (sort, folders on top, row size, sections…) */
@@ -176,8 +178,8 @@ const labelSubmenuEntry = (ctx: MenuContext, keys: string[]): ContextMenuEntry =
 const tooManyTitle = (ctx: MenuContext, n: number): string | undefined =>
   n > CONNECT_MAX ? ctx.t('siteTree.connectTooMany', { max: CONNECT_MAX, defaultValue: 'You can open up to {{max}} connections at once.' }) : undefined;
 
-/** A small coloured dot (label menus and the filter menu). */
-export const labelDot = (color: LabelColor) => <span aria-hidden className={`w-2 h-2 rounded-full ${LABEL_DOT_CLASS[color]}`} />;
+/** A label's coloured mark (label menus and the filter menu): a rounded square, like in the tree. */
+export const labelDot = (color: LabelColor) => <span aria-hidden className={`w-2 h-2 rounded-[2px] ${LABEL_DOT_CLASS[color]}`} />;
 
 /** What a Label ▸ submenu shows. */
 export interface LabelMenuState {
@@ -344,7 +346,7 @@ export interface MultiSummary {
   folders: number;
   /** Some selected site has an address to copy */
   hasAddress: boolean;
-  /** Items that can be favorites (sites, Local included, and folders) */
+  /** Items the favorites entry changes: all of them when removing, only those not yet favorites when adding */
   favoriteCount: number;
   /** Every one of them is a favorite already (the entry removes them) */
   allFavorite: boolean;
@@ -695,10 +697,26 @@ export function recentMenu(site: ConnectionConfig, ctx: MenuContext, opts: { fav
   ];
 }
 
-/** H. The Favorites or Recent header: hide the section (View options brings it back); Recent can also be cleared. */
-export function sectionMenu(section: 'fav' | 'rec', ctx: MenuContext): ContextMenuEntry[] {
+/**
+ * H. The Favorites or Recent header: hide the section (View options brings it back); Recent can also
+ * be cleared, and list all of its rows or the first few again (`recent`, when that applies).
+ */
+export function sectionMenu(section: 'fav' | 'rec', ctx: MenuContext, recent?: { more: boolean; total: number } | null): ContextMenuEntry[] {
   const { t, actions: a } = ctx;
-  const entries: ContextMenuEntry[] = [{ kind: 'item', id: 'hide-section', label: t('siteTree.hideSection', 'Hide section'), icon: icon(EyeOff), onSelect: () => a.hideSection(section) }];
+  const entries: ContextMenuEntry[] = [];
+  const toggle = a.toggleAllRecent;
+  if (section === 'rec' && recent && toggle) {
+    entries.push({
+      kind: 'item',
+      id: 'recent-more',
+      label: recent.more
+        ? t('siteTree.showAllRecent', { formatted: formatCount(ctx.lang ?? '', recent.total), defaultValue: 'Show all ({{formatted}})' })
+        : t('siteTree.showFewerRecent', 'Show fewer'),
+      icon: icon(recent.more ? ChevronsUpDown : ChevronsDownUp),
+      onSelect: () => toggle(),
+    });
+  }
+  entries.push({ kind: 'item', id: 'hide-section', label: t('siteTree.hideSection', 'Hide section'), icon: icon(EyeOff), onSelect: () => a.hideSection(section) });
   if (section === 'rec') entries.push({ kind: 'item', id: 'clear-recent', label: t('siteTree.clearRecent', 'Clear recent'), icon: icon(History), onSelect: () => a.clearRecent() });
   return entries;
 }

@@ -7,13 +7,14 @@ import { Button } from '../ui/controls.tsx';
 import { FolderContentsTable } from './FolderContentsTable.tsx';
 import { folderChain, formatCount, protocolBreakdown, sitesInside } from './siteTreeModel.ts';
 import type { ConnectionConfig, FolderNode, TreeModel } from './types.ts';
+import type { FolderRenameResult } from './SiteSidebar.tsx';
 
 interface Props {
   /** The folder; null for the root overview ("All connections") */
   node: FolderNode | null;
   model: TreeModel;
-  /** Renames the folder: an error text, or null when the rename went ahead (or the merge prompt opened) */
-  onRename: (path: string, name: string) => string | null;
+  /** Renames the folder: what happened (renamed, the merge prompt opened, or the error to show) */
+  onRename: (path: string, name: string) => FolderRenameResult;
   onMove: () => void;
   onDelete: () => void;
   onNewFolder: () => void;
@@ -22,8 +23,10 @@ interface Props {
   onReveal: (path: string) => void;
   /** Closes the Connect dialog */
   onClose: () => void;
-  /** Escape layer of the dialog: reverts an edited name */
+  /** Escape layer of the dialog: reverts an edited name, or leaves the name field */
   escapeRef: MutableRefObject<(() => boolean) | null>;
+  /** Escape in the unchanged name field: keyboard focus back to the tree */
+  onFocusTree: () => void;
   /** Sites with an open tab (the contents table's dots) */
   openSiteIds: ReadonlySet<string>;
   /** The contents table: a click shows the item in the tree (this overview stays) */
@@ -69,12 +72,15 @@ export const FolderPane: React.FC<Props> = ({
   onReveal,
   onClose,
   escapeRef,
+  onFocusTree,
   openSiteIds,
   onRevealItem,
   onConnect,
 }) => {
   const { t } = useTranslation();
   const inputRef = useRef<HTMLInputElement>(null);
+  /** The field is left by Escape: its blur commits nothing */
+  const skipBlurCommit = useRef(false);
   const [name, setName] = useState(node?.name ?? '');
   const [error, setError] = useState<string | null>(null);
   const stats = useFolderStats(model, node);
@@ -85,10 +91,17 @@ export const FolderPane: React.FC<Props> = ({
     setError(null);
   }, [node?.path, node?.name]);
 
+  // Escape in the name field is the field's: an edit is reverted, else the focus goes back to the
+  // tree. Only a later Escape closes the dialog (as with F2 + Escape in the tree).
   escapeRef.current = () => {
-    if (!node || document.activeElement !== inputRef.current || name === node.name) return false;
-    setName(node.name);
-    setError(null);
+    if (!node || document.activeElement !== inputRef.current) return false;
+    if (name !== node.name) {
+      setName(node.name);
+      setError(null);
+      return true;
+    }
+    skipBlurCommit.current = true;
+    onFocusTree();
     return true;
   };
   useEffect(
@@ -100,19 +113,27 @@ export const FolderPane: React.FC<Props> = ({
 
   const commit = (fromBlur: boolean) => {
     if (!node) return;
+    if (fromBlur && skipBlurCommit.current) {
+      skipBlurCommit.current = false;
+      return;
+    }
     const value = name.trim();
     if (!value || value === node.name) {
       setName(node.name);
       setError(null);
       return;
     }
-    const problem = onRename(node.path, value);
-    if (!problem) setError(null);
-    else if (fromBlur) {
+    const result = onRename(node.path, value);
+    if (result.kind !== 'error') {
+      setError(null);
+      // The merge prompt is open: the field shows the folder's name again, so leaving it does not
+      // ask a second time (a Merge renames the folder, and the field follows)
+      if (result.kind === 'prompt') setName(node.name);
+    } else if (fromBlur) {
       // Leaving the field with an invalid name reverts it
       setName(node.name);
       setError(null);
-    } else setError(problem);
+    } else setError(result.text);
   };
 
   const ancestors = node ? folderChain(node.path).slice(0, -1) : [];
@@ -207,7 +228,7 @@ export const FolderPane: React.FC<Props> = ({
         </div>
       </div>
 
-      <div className="flex items-center gap-2 px-5 py-3.5 border-t border-line shrink-0 select-none">
+      <div data-dialog-footer="" className="flex items-center gap-2 px-5 py-3.5 border-t border-line shrink-0 select-none">
         <div className="flex-1" />
         <Button variant="ghost" onClick={onClose}>
           {t('siteTree.close', 'Close')}

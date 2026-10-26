@@ -6,17 +6,19 @@ import {
   allFavorites,
   applyRecentsPatch,
   checkFavoriteDrop,
+  favoriteChangeCount,
   favoriteKey,
   favoriteRefOf,
   insertFavorites,
   largeLibraryFirstRun,
   legacyMigrationPatch,
   moveFavorite,
+  recentLimitFor,
   recordRecent,
   sameFavorites,
   setFavorites,
 } from './sectionsModel.ts';
-import { MAX_FAVORITES, buildTree, defaultLayout } from './siteTreeModel.ts';
+import { MAX_FAVORITES, RECENT_SHOWN, RECENT_SHOWN_FEW, buildTree, defaultLayout, flattenRows } from './siteTreeModel.ts';
 
 const site = (id: string, group: string | null = null): ConnectionConfig => ({
   id,
@@ -56,6 +58,13 @@ describe('favorites', () => {
     assert.deepEqual(keys(setFavorites(FAVS, ['s:a', 'f:Clients', 's:nope'], false)), ['s:b']);
   });
 
+  it('counts what "Add N to favorites" adds: only items not yet favorites', () => {
+    const model = buildTree([LOCAL, site('a', 'Clients'), site('b'), site('c')], { ...defaultLayout(), favorites: FAVS });
+    assert.equal(favoriteChangeCount(model, ['s:a', 's:b', 's:c']), 1, 'a and b are favorites already');
+    assert.equal(favoriteChangeCount(model, ['s:a', 'f:Clients', 'fav:s:a']), 2, 'all favorites: removing counts them all');
+    assert.equal(favoriteChangeCount(model, ['s:c', 's:local', 'sec:all']), 2);
+  });
+
   it('knows when every item is a favorite', () => {
     const model = buildTree([LOCAL, site('a', 'Clients'), site('b')], { ...defaultLayout(), favorites: FAVS });
     assert.equal(allFavorites(model, ['s:a', 'f:Clients']), true);
@@ -92,6 +101,42 @@ describe('favorites', () => {
     assert.equal(checkFavoriteDrop(full, ['s:one-more'], 0), 'too_many');
     assert.equal(checkFavoriteDrop(full, ['s:s5'], 0), 'ok', 'reordering a full list is fine');
     assert.equal(sameFavorites(FAVS, [...FAVS]), true);
+  });
+});
+
+describe('Recent keeps the folder tree in view', () => {
+  const ids = ['r1', 'r2', 'r3', 'r4', 'r5', 'r6', 'r7', 'r8', 'r9'];
+  const sites = [LOCAL, ...ids.map((id) => site(id, 'Team')), site('fav1'), site('fav2')];
+  const layout = {
+    ...defaultLayout(),
+    favorites: [{ kind: 'site', id: 'fav1' }, { kind: 'site', id: 'fav2' }, { kind: 'site', id: 'r1' }] as FavoriteRef[],
+    recents: ids.map((id, i) => ({ id, at: 100 - i, count: 1 })),
+  };
+  const model = buildTree(sites, layout);
+  const flat = (allRecent: boolean) => flattenRows(model, { collapsed: new Set(), recentLimit: recentLimitFor(allRecent) }).rows;
+
+  it('lists the first 3 recent rows until "Show all", with the total for the header', () => {
+    assert.equal(recentLimitFor(false), RECENT_SHOWN_FEW);
+    assert.equal(recentLimitFor(true), RECENT_SHOWN);
+    const rows = flat(false);
+    const header = rows.find((r) => r.key === 'sec:rec');
+    // r1 is a favorite (not repeated in Recent): r2…r9, of which 8 can show
+    assert.deepEqual(rows.filter((r) => r.section === 'rec' && r.kind === 'site').map((r) => r.key), ['rec:r2', 'rec:r3', 'rec:r4']);
+    assert.equal(header?.kind === 'section' && header.count, 3);
+    assert.equal(header?.kind === 'section' && header.total, 8);
+    // "All connections" comes right after: 1 + 3 favorites, 1 + 3 recent
+    assert.equal(rows.findIndex((r) => r.key === 'sec:all'), 8);
+  });
+
+  it('shows all 8 once asked, and none of them is lost either way', () => {
+    const rows = flat(true);
+    assert.deepEqual(
+      rows.filter((r) => r.section === 'rec' && r.kind === 'site').map((r) => r.key),
+      ['rec:r2', 'rec:r3', 'rec:r4', 'rec:r5', 'rec:r6', 'rec:r7', 'rec:r8', 'rec:r9']
+    );
+    const header = rows.find((r) => r.key === 'sec:rec');
+    assert.equal(header?.kind === 'section' && header.count, 8);
+    assert.equal(header?.kind === 'section' && header.total, 8);
   });
 });
 

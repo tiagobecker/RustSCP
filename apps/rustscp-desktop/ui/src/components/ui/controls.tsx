@@ -105,12 +105,18 @@ export interface FieldProps {
   hint?: React.ReactNode;
   error?: React.ReactNode;
   className?: string;
-  children: (id: string) => React.ReactNode;
+  /**
+   * Gets the generated id (for htmlFor wiring) and, while a hint or an error shows, the id of that
+   * text, for the control's `aria-describedby`.
+   */
+  children: (id: string, describedBy?: string) => React.ReactNode;
 }
 
 /** Label + control + hint. Children receive the generated id for htmlFor wiring. */
 export const Field: React.FC<FieldProps> = ({ label, hint, error, className, children }) => {
   const id = useId();
+  const noteId = `${id}-note`;
+  const note = error || hint;
   return (
     <div className={className}>
       {label && (
@@ -118,8 +124,16 @@ export const Field: React.FC<FieldProps> = ({ label, hint, error, className, chi
           {label}
         </label>
       )}
-      {children(id)}
-      {error ? <span className="ui-hint text-red-600 dark:text-red-400">{error}</span> : hint ? <span className="ui-hint">{hint}</span> : null}
+      {children(id, note ? noteId : undefined)}
+      {error ? (
+        <span id={noteId} className="ui-hint text-red-600 dark:text-red-400">
+          {error}
+        </span>
+      ) : hint ? (
+        <span id={noteId} className="ui-hint">
+          {hint}
+        </span>
+      ) : null}
     </div>
   );
 };

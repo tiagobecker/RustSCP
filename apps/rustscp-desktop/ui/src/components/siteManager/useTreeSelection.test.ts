@@ -1,8 +1,20 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ConnectionConfig } from '../../types.ts';
-import { buildTree, flattenRows } from './siteTreeModel.ts';
-import { canonicalItems, canonicalKey, firstChildIndex, moveIndex, parentIndex, rangeKeys, sectionBounds } from './useTreeSelection.ts';
+import { buildTree, defaultLayout, flattenRows } from './siteTreeModel.ts';
+import {
+  actionItems,
+  canonicalItems,
+  canonicalKey,
+  clampToSection,
+  firstChildIndex,
+  moveIndex,
+  parentIndex,
+  rangeKeys,
+  remapRowKey,
+  sectionBounds,
+  toggleItemKeys,
+} from './useTreeSelection.ts';
 
 const site = (id: string, group: string | null): ConnectionConfig => ({
   id,
@@ -99,3 +111,45 @@ describe('multi-selection helpers', () => {
 function defaultLayoutForTest() {
   return { version: 1, folders: [], favorites: [], recents: [], labels: [], site_labels: {}, folder_labels: {}, collapsed: [], migrated_local_storage: false, large_library_collapsed: false };
 }
+
+describe('actions follow the selection, not a wandering focus', () => {
+  const rows = rowsFor();
+  const row = (key: string) => rows.find((r) => r.key === key);
+
+  it('uses the focused row only when it is the selected one (or nothing is selected)', () => {
+    assert.deepEqual(actionItems(new Set(['s:a']), row('s:a')), ['s:a']);
+    // The focus moved (a twisty click, a cleared search) but s:a is still what was picked
+    assert.deepEqual(actionItems(new Set(['s:a']), row('s:c')), ['s:a']);
+    assert.deepEqual(actionItems(new Set(['s:a']), row('sec:all')), ['s:a']);
+    assert.deepEqual(actionItems(new Set(['draft']), row('s:c')), ['s:c'], 'no item selected: the focused row');
+    assert.deepEqual(actionItems(new Set(['s:a', 'f:Prod/Web']), row('s:c')), ['s:a', 'f:Prod/Web']);
+    assert.deepEqual(actionItems(new Set(), row('sec:all')), []);
+  });
+
+  it('⌘-click on a twin row takes the item out everywhere', () => {
+    assert.deepEqual(toggleItemKeys(['fav:s:a', 's:c'], 's:a'), ['s:c']);
+    assert.deepEqual(toggleItemKeys(['rec:a', 'fav:s:a', 'f:Prod'], 'fav:s:a'), ['f:Prod']);
+    assert.deepEqual(toggleItemKeys(['s:c', 'draft'], 'rec:a'), ['s:c', 'rec:a'], 'non-items drop out; a new item is added on its row');
+  });
+
+  it('maps keys through a folder rename and back (undo)', () => {
+    assert.equal(remapRowKey('f:Prod/Web', 'Prod', 'Live'), 'f:Live/Web');
+    assert.equal(remapRowKey('fav:f:Prod', 'Prod', 'Live'), 'fav:f:Live');
+    assert.equal(remapRowKey('fav:f:Prod\u001ff:Prod/Web', 'Prod', 'Live'), 'fav:f:Live\u001ff:Live/Web');
+    assert.equal(remapRowKey('f:Production', 'Prod', 'Live'), 'f:Production', 'only the folder and what is inside it');
+    assert.equal(remapRowKey('s:a', 'Prod', 'Live'), 's:a');
+    assert.equal(remapRowKey(remapRowKey('f:Prod/Web', 'Prod', 'Live'), 'Live', 'Prod'), 'f:Prod/Web');
+  });
+
+  it('keeps Shift ranges inside the anchor\'s section, off its header', () => {
+    const model = buildTree([local, site('a', 'Prod'), site('c', null)], { ...defaultLayout(), favorites: [{ kind: 'site', id: 'c' }, { kind: 'site', id: 'a' }] });
+    const all = flattenRows(model, { collapsed: new Set() }).rows;
+    const favC = all.findIndex((r) => r.key === 'fav:s:c');
+    const favA = all.findIndex((r) => r.key === 'fav:s:a');
+    // Shift+End from a favorite stops at the last favorite; Shift+Home at the first, never the header
+    assert.equal(clampToSection(all, favC, all.length - 1), favA);
+    assert.equal(clampToSection(all, favA, 0), favC);
+    assert.equal(clampToSection(all, -1, 3), 3);
+  });
+});
+

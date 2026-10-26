@@ -104,7 +104,7 @@ export const LabelsDialog: React.FC<Props> = ({ labels, usage, onSave, onCancel 
         kind: 'radio',
         id: `color-${c}`,
         label: t(LABEL_COLOR_NAMES[c][0], LABEL_COLOR_NAMES[c][1]),
-        icon: <span aria-hidden className={`w-2.5 h-2.5 rounded-full ${LABEL_DOT_CLASS[c]}`} />,
+        icon: <span aria-hidden className={`w-2.5 h-2.5 rounded-[2px] ${LABEL_DOT_CLASS[c]}`} />,
         checked: rows[index]?.color === c,
         onSelect: () => update(index, { color: c }),
       })
@@ -153,7 +153,7 @@ export const LabelsDialog: React.FC<Props> = ({ labels, usage, onSave, onCancel 
                         title={colorName}
                         onClick={(e) => setColorMenu({ index: i, rect: e.currentTarget.getBoundingClientRect() })}
                       >
-                        <span aria-hidden className={`w-3 h-3 rounded-full ${LABEL_DOT_CLASS[row.color]}`} />
+                        <span aria-hidden className={`w-3 h-3 rounded-[2.5px] ${LABEL_DOT_CLASS[row.color]}`} />
                         <ChevronDown aria-hidden className="w-3 h-3 text-ink-faint" />
                       </button>
                       <input

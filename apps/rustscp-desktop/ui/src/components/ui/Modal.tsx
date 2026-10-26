@@ -1,5 +1,6 @@
 import React, { useEffect, useId, useRef } from 'react';
 import { X } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
 
 export interface ModalProps {
   isOpen: boolean;
@@ -22,6 +23,12 @@ export interface ModalProps {
   children?: React.ReactNode;
   /** Optional ref of the element to focus on open; otherwise the first input */
   initialFocusRef?: React.RefObject<HTMLElement | null>;
+  /** Shown first in the body and read as the dialog's description (aria-describedby) */
+  description?: React.ReactNode;
+  /** `alertdialog` for confirmations of destructive actions (default `dialog`) */
+  role?: 'dialog' | 'alertdialog';
+  /** Id of an element inside the dialog that names it, when there is no `title` */
+  labelledBy?: string;
 }
 
 const SIZES: Record<NonNullable<ModalProps['size']>, string> = {
@@ -54,9 +61,14 @@ export const Modal: React.FC<ModalProps> = ({
   bodyClassName = '',
   children,
   initialFocusRef,
+  description,
+  role = 'dialog',
+  labelledBy,
 }) => {
+  const { t } = useTranslation();
   const panelRef = useRef<HTMLDivElement>(null);
   const titleId = useId();
+  const descId = useId();
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
 
@@ -123,9 +135,10 @@ export const Modal: React.FC<ModalProps> = ({
       <div
         ref={panelRef}
         data-ui-modal=""
-        role="dialog"
+        role={role}
         aria-modal="true"
-        aria-labelledby={title ? titleId : undefined}
+        aria-labelledby={title ? titleId : labelledBy}
+        aria-describedby={description ? descId : undefined}
         tabIndex={-1}
         className={`w-full ${SIZES[size]} max-h-[calc(100vh-2rem)] flex flex-col overflow-hidden rounded-2xl bg-surface-raised text-ink shadow-modal animate-pop ${className}`}
       >
@@ -141,12 +154,15 @@ export const Modal: React.FC<ModalProps> = ({
               {subtitle && <p className="text-[12.5px] text-ink-faint mt-0.5 leading-snug">{subtitle}</p>}
             </div>
             {headerActions}
-            <button type="button" onClick={onClose} className="ui-icon-btn ui-icon-btn-sm -mr-1.5" aria-label="Close">
+            <button type="button" onClick={onClose} className="ui-icon-btn ui-icon-btn-sm -mr-1.5" aria-label={t('app.close', 'Close')}>
               <X className="w-4 h-4" />
             </button>
           </div>
         )}
-        <div className={`flex-1 min-h-0 overflow-y-auto ${padded ? 'px-5 pb-5' : ''} ${bodyClassName}`}>{children}</div>
+        <div className={`flex-1 min-h-0 overflow-y-auto ${padded ? 'px-5 pb-5' : ''} ${bodyClassName}`}>
+          {description && <div id={descId}>{description}</div>}
+          {children}
+        </div>
         {footer && (
           <div className="flex items-center justify-end gap-2 px-5 py-3.5 border-t border-line shrink-0 select-none">{footer}</div>
         )}
