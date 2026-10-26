@@ -514,6 +514,20 @@ export const effectiveDensity = (prefs: Pick<ViewPrefs, 'density'>, savedSiteCou
 
 export const rowHeightFor = (density: Density): number => (density === 'compact' ? COMPACT_ROW_H : COMFORTABLE_ROW_H);
 
+/** Left padding of a row at `depth` (spec §3): 12px per level for six levels, then 6px per level. */
+export const rowIndent = (depth: number): number => 6 + Math.min(depth, 6) * 12 + Math.max(0, depth - 6) * 6;
+
+const numberFormats = new Map<string, Intl.NumberFormat>();
+/** `n` formatted for the UI language ("2,014" / "2.014"); formatters are cached per language. */
+export const formatCount = (lang: string, n: number): string => {
+  let nf = numberFormats.get(lang);
+  if (!nf) {
+    nf = new Intl.NumberFormat(lang || undefined);
+    numberFormats.set(lang, nf);
+  }
+  return nf.format(n);
+};
+
 /* -------------------------------------------------------------------------- */
 /* Tree                                                                        */
 /* -------------------------------------------------------------------------- */

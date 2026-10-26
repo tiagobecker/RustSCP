@@ -1,27 +1,15 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Server,
-  Cloud,
-  HardDrive,
-  Trash2,
   Eye,
   EyeOff,
   Check,
-  Plus,
+  Ellipsis,
   Folder,
   FolderOpen,
-  FolderInput,
-  ChevronRight,
-  ChevronsDownUp,
-  ChevronsUpDown,
   AlertCircle,
-  Search,
-  ArrowDownUp,
   KeyRound,
   Loader2,
   X,
-  Share2,
-  FileKey2,
 } from 'lucide-react';
 import { ConnectionConfig, Protocol } from '../types.ts';
 import { VaultModal, VaultTab } from './VaultModal.tsx';
@@ -31,6 +19,13 @@ import { Modal } from './ui/Modal.tsx';
 import { Button, Disclosure, Field, Segmented, TextInput } from './ui/controls.tsx';
 import { plainTextInputProps } from '../utils/inputHardening.ts';
 import { STORED_SECRET, isStoredSecret } from '../utils/secrets.ts';
+import { isMacPlatform } from './fileListUtils.ts';
+import { SiteSidebar } from './siteManager/SiteSidebar.tsx';
+import type { SiteSidebarApi } from './siteManager/SiteSidebar.tsx';
+import { UnsavedChangesDialog } from './siteManager/UnsavedChangesDialog.tsx';
+import { parseAddressInput } from './siteManager/siteQuery.ts';
+import { folderChain, naturalCompare, normalizeGroup } from './siteManager/siteTreeModel.ts';
+import { useSiteTree } from './siteManager/useSiteTree.ts';
 
 interface LoginDialogProps {
   isOpen: boolean;
@@ -64,103 +59,17 @@ const isSha256Fingerprint = (text: string) => {
   return /^[0-9a-f]{64}$/.test(digits);
 };
 
-const ProtocolIcon: React.FC<{ protocol: Protocol; className?: string }> = ({ protocol, className = 'w-4 h-4' }) => {
-  if (protocol === 's3') return <Cloud className={className} />;
-  if (protocol === 'local') return <HardDrive className={className} />;
-  return <Server className={className} />;
-};
-
 /* -------------------------------------------------------------------------- */
 /* Site folders                                                                */
 /* -------------------------------------------------------------------------- */
 
-/** Folder paths are '/'-separated; blank segments and the spaces around them are dropped. */
-const normalizeGroup = (raw?: string | null): string =>
-  (raw ?? '')
-    .split('/')
-    .map((segment) => segment.trim())
-    .filter(Boolean)
-    .join('/');
+// The connections tree lives in ./siteManager (SiteSidebar); folder paths use its model's
+// normalizeGroup / folderChain. The collapsed folders moved from localStorage into the
+// encrypted site layout (useSiteTree migrates them once).
 
-const naturalCompare = (a: string, b: string) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
-
-/** Folder path plus every parent path ("A/B/C" → "A", "A/B", "A/B/C"). */
-const folderChain = (group: string): string[] => {
-  const parts = group ? group.split('/') : [];
-  return parts.map((_, i) => parts.slice(0, i + 1).join('/'));
-};
-
-interface FolderNode {
-  name: string;
-  path: string;
-  folders: FolderNode[];
-  sites: ConnectionConfig[];
-  /** Sites in this folder and all of its subfolders */
-  count: number;
-}
-
-/** Builds the folder tree (sorted, Local pinned first at the top level). Maps keep folder names away from object prototypes. */
-const buildSiteTree = (sites: ConnectionConfig[]): FolderNode => {
-  const root: FolderNode = { name: '', path: '', folders: [], sites: [], count: 0 };
-  const byPath = new Map<string, FolderNode>([['', root]]);
-  for (const site of sites) {
-    let node = root;
-    const group = site.id === 'local' ? '' : normalizeGroup(site.group);
-    for (const path of folderChain(group)) {
-      let child = byPath.get(path);
-      if (!child) {
-        child = { name: path.slice(path.lastIndexOf('/') + 1), path, folders: [], sites: [], count: 0 };
-        byPath.set(path, child);
-        node.folders.push(child);
-      }
-      node = child;
-    }
-    node.sites.push(site);
-  }
-  const finish = (node: FolderNode): number => {
-    node.folders.sort((a, b) => naturalCompare(a.name, b.name));
-    node.sites.sort((a, b) => {
-      if (a.id === 'local') return -1;
-      if (b.id === 'local') return 1;
-      return naturalCompare(a.name, b.name) || naturalCompare(a.host, b.host);
-    });
-    node.count = node.sites.length + node.folders.reduce((n, f) => n + finish(f), 0);
-    return node.count;
-  };
-  finish(root);
-  return root;
-};
-
-const collectFolderPaths = (node: FolderNode, out: string[] = []): string[] => {
-  for (const f of node.folders) {
-    out.push(f.path);
-    collectFolderPaths(f, out);
-  }
-  return out;
-};
-
-type TreeRow = { kind: 'folder'; node: FolderNode; depth: number; expanded: boolean } | { kind: 'site'; site: ConnectionConfig; depth: number };
-
-/** Per-viewer list of collapsed folder paths. A convenience only: the list works without it. */
-const COLLAPSED_FOLDERS_KEY = 'rustscp_site_folders_collapsed';
-const MAX_REMEMBERED_FOLDERS = 2000;
-
-const loadCollapsedFolders = (): Set<string> => {
-  try {
-    const parsed: unknown = JSON.parse(localStorage.getItem(COLLAPSED_FOLDERS_KEY) || '[]');
-    if (!Array.isArray(parsed)) return new Set();
-    return new Set(parsed.filter((p): p is string => typeof p === 'string' && p.length > 0 && p.length <= 1024).slice(0, MAX_REMEMBERED_FOLDERS));
-  } catch {
-    return new Set();
-  }
-};
-
-const saveCollapsedFolders = (paths: Set<string>) => {
-  try {
-    localStorage.setItem(COLLAPSED_FOLDERS_KEY, JSON.stringify([...paths].slice(-MAX_REMEMBERED_FOLDERS)));
-  } catch {
-    /* storage unavailable (private window, blocked site data): the state just is not remembered */
-  }
+const isTextTarget = (target: EventTarget | null) => {
+  const el = target as HTMLElement | null;
+  return !!el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName));
 };
 
 /** Max folder suggestions listed under the Folder field */
@@ -297,7 +206,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   savedSites,
   onConnect,
   onSaveSite,
-  onDeleteSite,
+  // onDeleteSite stays in the props (App passes it); deletes now go through the tree's undoable ops
   onSitesUpdated,
   onShareSite,
   onOpenSharedConnection,
@@ -312,12 +221,6 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   const [siteName, setSiteName] = useState<string>('');
   const [group, setGroup] = useState<string>('');
   const [folderSuggestOpen, setFolderSuggestOpen] = useState(false);
-  const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(loadCollapsedFolders);
-  // Folders collapsed while a filter is active; forgotten when the filter changes
-  const [filterCollapsed, setFilterCollapsed] = useState<Set<string>>(() => new Set());
-  // Folders just imported (WinSCP "View connections"): the list scrolls to the first one once it renders
-  const [revealFolders, setRevealFolders] = useState<Set<string> | null>(null);
-  const siteListRef = useRef<HTMLDivElement>(null);
   const [host, setHost] = useState<string>('');
   const [port, setPort] = useState<string>('22');
   const [username, setUsername] = useState<string>('');
@@ -337,119 +240,99 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   const [isSaving, setIsSaving] = useState<boolean>(false);
   const [saveSuccess, setSaveSuccess] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string>('');
-  const [filter, setFilter] = useState('');
-  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
-  // True once the user edits the form; Escape then no longer discards the draft
+  // The trash button's two-click confirm is gone (deletes have Undo now); the setter calls stay until WP9
+  const [, setPendingDeleteId] = useState<string | null>(null);
+  // True once the user edits the form; Escape then asks before discarding the draft
   const [isDirty, setIsDirty] = useState(false);
+  // The action waiting on the Unsaved-changes dialog
+  const [unsavedAction, setUnsavedAction] = useState<(() => void) | null>(null);
 
   const connectAttemptIdRef = useRef<number>(0);
   const attemptTokenRef = useRef<{ cancelled: boolean } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const hostRef = useRef<HTMLInputElement>(null);
+  const siteNameRef = useRef<HTMLInputElement>(null);
+  const formScrollRef = useRef<HTMLDivElement>(null);
+  const sidebarApiRef = useRef<SiteSidebarApi | null>(null);
+  // Escape layers registered by the sidebar (inline rename, search); each returns true when it used the key
+  const escapeLayersRef = useRef<Array<() => boolean>>([]);
+  // Name and folder of the open site as the form loaded them: a tree change to them updates the form
+  const formOriginRef = useRef<{ id: string; name: string; group: string } | null>(null);
+  // resetForm is declared below the early return; effects reach it through this ref
+  const resetFormRef = useRef<() => void>(() => {});
 
-  const filterQuery = filter.trim().toLowerCase();
-  const isFiltering = filterQuery.length > 0;
+  const siteTree = useSiteTree({ isOpen, savedSites, onSitesUpdated });
 
-  // The filter matches name, server, user and folder
-  const matchingSites = useMemo(() => {
-    if (!filterQuery) return savedSites;
-    return savedSites.filter((s) => `${s.name} ${s.host} ${s.username} ${normalizeGroup(s.group)}`.toLowerCase().includes(filterQuery));
-  }, [savedSites, filterQuery]);
-
-  const siteTree = useMemo(() => buildSiteTree(matchingSites), [matchingSites]);
-  const treeFolderPaths = useMemo(() => collectFolderPaths(siteTree), [siteTree]);
-
-  // Every folder in use, parents included: suggestions for the Folder field
+  // Every folder in use, parents included, plus the folders kept in the layout: suggestions for the Folder field
   const knownFolders = useMemo(() => {
     const set = new Set<string>();
     for (const s of savedSites) {
       if (s.id === 'local') continue;
       for (const path of folderChain(normalizeGroup(s.group))) set.add(path);
     }
+    for (const f of siteTree.layout.folders) {
+      const p = normalizeGroup(f);
+      if (p) set.add(p);
+    }
     return [...set].sort(naturalCompare);
-  }, [savedSites]);
+  }, [savedSites, siteTree.layout.folders]);
 
-  // While filtering, every folder with a match starts expanded (the viewer's saved state is left alone)
-  const treeRows = useMemo(() => {
-    const rows: TreeRow[] = [];
-    const isExpanded = (path: string) => (isFiltering ? !filterCollapsed.has(path) : !collapsedFolders.has(path));
-    const walk = (node: FolderNode, depth: number) => {
-      const pinned = depth === 0 ? node.sites.filter((s) => s.id === 'local') : [];
-      for (const site of pinned) rows.push({ kind: 'site', site, depth });
-      for (const folder of node.folders) {
-        const expanded = isExpanded(folder.path);
-        rows.push({ kind: 'folder', node: folder, depth, expanded });
-        if (expanded) walk(folder, depth + 1);
+  // A tree change (rename, move, delete, undo) to the site open in the form updates its name and
+  // folder there, keeping the dirty flag; a deleted site resets the form
+  useEffect(() => {
+    const id = selectedSiteId;
+    if (id === 'new') {
+      formOriginRef.current = null;
+      return;
+    }
+    const site = savedSites.find((s) => s.id === id);
+    const origin = formOriginRef.current;
+    if (!site) {
+      if (origin?.id === id && !isConnecting) {
+        formOriginRef.current = null;
+        resetFormRef.current();
       }
-      for (const site of node.sites) if (!pinned.includes(site)) rows.push({ kind: 'site', site, depth });
-    };
-    walk(siteTree, 0);
-    return rows;
-  }, [siteTree, isFiltering, filterCollapsed, collapsedFolders]);
-
-  useEffect(() => {
-    saveCollapsedFolders(collapsedFolders);
-  }, [collapsedFolders]);
-
-  useEffect(() => {
-    if (!revealFolders) return;
-    setRevealFolders(null);
-    const list = siteListRef.current;
-    if (!list) return;
-    // Rows are in tree order, so the first match is the top-most imported folder
-    const row = Array.from(list.querySelectorAll<HTMLElement>('[data-folder-path]')).find((el) => revealFolders.has(el.dataset.folderPath ?? ''));
-    // Scrolls the list only, never the dialog around it
-    if (row) list.scrollTop += row.getBoundingClientRect().top - list.getBoundingClientRect().top - 4;
-  }, [revealFolders, treeRows]);
+      return;
+    }
+    const siteGroup = id === 'local' ? '' : normalizeGroup(site.group);
+    if (origin && origin.id === id) {
+      if (site.name !== origin.name) setSiteName(site.name);
+      if (siteGroup !== origin.group) setGroup(siteGroup);
+    }
+    formOriginRef.current = { id, name: site.name, group: siteGroup };
+    // Only tree changes (savedSites) and a new open site matter here
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [savedSites, selectedSiteId]);
 
   if (!isOpen) return null;
 
-  const anyFolderExpanded = treeFolderPaths.some((p) => (isFiltering ? !filterCollapsed.has(p) : !collapsedFolders.has(p)));
-
-  const setFoldersCollapsed = (paths: string[], collapse: boolean) => {
-    const update = (prev: Set<string>) => {
-      const next = new Set(prev);
-      for (const p of paths) {
-        if (collapse) next.add(p);
-        else next.delete(p);
-      }
-      return next;
-    };
-    if (isFiltering) setFilterCollapsed(update);
-    else setCollapsedFolders(update);
-  };
-
-  /** Option/Alt-click also toggles every subfolder, like Finder. */
-  const toggleFolder = (node: FolderNode, expanded: boolean, withSubfolders: boolean) => {
-    setFoldersCollapsed(withSubfolders ? [node.path, ...collectFolderPaths(node)] : [node.path], expanded);
-  };
-
-  /** After a WinSCP import: clears the filter, expands the imported folders and scrolls to the first one. */
+  /** After an import ("View connections"): clears the search, expands the imported folders and selects the first one. */
   const showImportedConnections = (folders: string[]) => {
-    setFilter('');
-    setFilterCollapsed(new Set());
-    const paths = new Set<string>();
-    for (const folder of folders) for (const path of folderChain(normalizeGroup(folder))) paths.add(path);
-    if (paths.size === 0) return;
-    setCollapsedFolders((prev) => {
-      if (![...paths].some((p) => prev.has(p))) return prev;
-      const next = new Set(prev);
-      paths.forEach((p) => next.delete(p));
-      return next;
-    });
-    setRevealFolders(paths);
+    // Undo cannot reach across an import
+    siteTree.forgetUndo();
+    void siteTree.reload();
+    sidebarApiRef.current?.revealImported(folders.map((f) => normalizeGroup(f)).filter(Boolean));
   };
 
   /** Expands the folders above a site so it stays visible in the list. */
   const revealFolder = (rawGroup?: string | null) => {
     const chain = folderChain(normalizeGroup(rawGroup));
     if (!chain.length) return;
-    setCollapsedFolders((prev) => {
+    siteTree.setCollapsed((prev) => {
       if (!chain.some((p) => prev.has(p))) return prev;
       const next = new Set(prev);
       chain.forEach((p) => next.delete(p));
       return next;
     });
+  };
+
+  /** Runs `action` now, or after the Unsaved-changes dialog when the form has unsaved edits. */
+  const guardDirty = (action: () => void) => {
+    if (!isDirty) {
+      action();
+      return;
+    }
+    setUnsavedAction(() => action);
   };
 
   const handleProtocolChange = (p: Protocol) => {
@@ -533,24 +416,27 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
     setIsDirty(false);
   };
 
-  const handleNewSite = () => {
+  resetFormRef.current = resetForm;
+
+  /** New connection form; `folder` is where it will be saved (the tree's selection). */
+  const handleNewSite = (folder?: string) => {
     resetForm();
+    if (folder) setGroup(normalizeGroup(folder));
     setTimeout(() => hostRef.current?.focus(), 30);
   };
 
   /** Accepts pasted `user@host:port`, `sftp://user@host:2222/path` or `s3://endpoint` and splits it into fields. */
   const splitHostInput = (raw: string) => {
-    const value = raw.trim();
-    const m = value.match(/^(?:(sftp|scp|ftps|ftpes|ftp|s3|https?):\/\/)?(?:([^@\s/]+)@)?([^:/\s]+)(?::(\d{1,5}))?(\/[^\s]*)?$/i);
-    if (!m || !(m[1] || m[2] || m[4] || m[5])) return;
-    const [, scheme, user, h, p, path] = m;
+    // Same address rules as the search field's "New connection to…" (siteQuery.ADDRESS_RE)
+    const parsed = parseAddressInput(raw);
+    if (!parsed) return;
     // ftpes:// is WinSCP's name for explicit FTPS, the only FTPS mode RustSCP speaks.
-    if (scheme && !/^https?$/i.test(scheme)) handleProtocolChange((/^ftpes$/i.test(scheme) ? 'ftps' : scheme.toLowerCase()) as Protocol);
-    if (/^https?$/i.test(scheme || '')) return; // S3 endpoints keep their URL form
-    setHost(h);
-    if (user && !username) setUsername(user);
-    if (p) setPort(p);
-    if (path && path !== '/' && !remoteRoot) setRemoteRoot(path);
+    if (parsed.protocol) handleProtocolChange(parsed.protocol);
+    if (parsed.httpEndpoint) return; // S3 endpoints keep their URL form
+    setHost(parsed.host);
+    if (parsed.user && !username) setUsername(parsed.user);
+    if (parsed.port) setPort(parsed.port);
+    if (parsed.path && parsed.path !== '/' && !remoteRoot) setRemoteRoot(parsed.path);
   };
 
   const buildAuth = (): ConnectionConfig['auth'] => {
@@ -612,6 +498,8 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
     setIsConnecting(true);
     try {
       await onConnect(cfg, token);
+      // Saved connections opened from here count as recent (the backend ignores anything else)
+      if (!token.cancelled && cfg.id !== 'local' && savedSites.some((s) => s.id === cfg.id)) siteTree.recordConnected(cfg.id);
       if (connectAttemptIdRef.current === currentAttempt) {
         resetForm();
         onClose();
@@ -646,27 +534,87 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
     onClose();
   };
 
-  // Escape (the only dismiss path the Modal shell has here, since backdrop clicks are off):
-  // close only when no typed draft would be lost; with a draft it just stops a running attempt.
-  // Close/Cancel buttons still call handleClose directly.
+  // Escape (the only dismiss path the Modal shell has here, since backdrop clicks are off) runs
+  // the first step that applies: the sidebar's layers (inline rename, search), the folder
+  // suggestions, a running attempt, then closing (asking first when the form has unsaved edits).
   const handleEscape = () => {
-    // First Escape just closes the folder suggestions
+    for (const layer of escapeLayersRef.current) if (layer()) return;
+    // Next Escape just closes the folder suggestions
     if (folderSuggestOpen) {
       setFolderSuggestOpen(false);
       return;
     }
-    if (!isDirty) {
-      handleClose();
+    if (isConnecting) {
+      handleCancelConnect();
       return;
     }
-    if (isConnecting) handleCancelConnect();
+    guardDirty(handleClose);
   };
 
-  const handleSave = async () => {
+  /* --------------------------- tree → form wiring --------------------------- */
+
+  /** A site picked in the tree loads into the form (asking first about unsaved edits unless `force`). */
+  const selectSiteFromTree = (site: ConnectionConfig, opts?: { force?: boolean }) => {
+    if (site.id === selectedSiteId) return;
+    if (opts?.force) handleSelectSite(site);
+    else guardDirty(() => handleSelectSite(site));
+  };
+
+  /** Enter / double-click / Connect on a tree site. The open site connects with the form's values. */
+  const connectSiteFromTree = (site: ConnectionConfig) => {
+    if (site.id === selectedSiteId) {
+      if (isDirty) handleConnect();
+      else runConnect(site);
+      return;
+    }
+    guardDirty(() => {
+      handleSelectSite(site);
+      runConnect(site);
+    });
+  };
+
+  const focusFirstField = (local: boolean) =>
+    setTimeout(() => (local ? siteNameRef.current : hostRef.current ?? siteNameRef.current)?.focus(), 40);
+
+  const editSiteFromTree = (site: ConnectionConfig) => {
+    if (site.id === selectedSiteId) {
+      focusFirstField(site.id === 'local' || site.protocol === 'local');
+      return;
+    }
+    guardDirty(() => {
+      handleSelectSite(site);
+      focusFirstField(site.id === 'local' || site.protocol === 'local');
+    });
+  };
+
+  /** "Change…" in the header: opens the Advanced section and puts the caret in the Folder field. */
+  const changeFolder = () => {
+    const form = formScrollRef.current;
+    if (!form) return;
+    const focusFolder = () => form.querySelector<HTMLInputElement>('input[role="combobox"]')?.focus();
+    if (form.querySelector('input[role="combobox"]')) {
+      focusFolder();
+      return;
+    }
+    const advanced = t('loginDialog.advancedTab');
+    const toggle = Array.from(form.querySelectorAll<HTMLButtonElement>('button[aria-expanded="false"]')).find((b) => b.textContent?.trim() === advanced);
+    toggle?.click();
+    setTimeout(focusFolder, 40);
+  };
+
+  // ⌘Z anywhere in the dialog outside text fields undoes the last tree change
+  const onDialogKeyDown = (e: React.KeyboardEvent) => {
+    const mod = isMacPlatform() ? e.metaKey : e.ctrlKey;
+    if (!mod || e.shiftKey || e.altKey || e.key.toLowerCase() !== 'z' || isTextTarget(e.target)) return;
+    e.preventDefault();
+    void siteTree.undo();
+  };
+
+  const handleSave = async (): Promise<boolean> => {
     const invalid = validate();
     if (invalid) {
       setErrorMessage(invalid);
-      return;
+      return false;
     }
     setErrorMessage('');
     setIsSaving(true);
@@ -680,25 +628,12 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
       setIsDirty(false);
       setSaveSuccess(true);
       setTimeout(() => setSaveSuccess(false), 2000);
+      return true;
     } catch (err: any) {
       setErrorMessage(String(err?.message ?? err));
+      return false;
     } finally {
       setIsSaving(false);
-    }
-  };
-
-  const handleDelete = async (id: string) => {
-    if (pendingDeleteId !== id) {
-      setPendingDeleteId(id);
-      setTimeout(() => setPendingDeleteId((cur) => (cur === id ? null : cur)), 3000);
-      return;
-    }
-    setPendingDeleteId(null);
-    try {
-      await onDeleteSite(id);
-      if (selectedSiteId === id) handleNewSite();
-    } catch (err: any) {
-      setErrorMessage(String(err?.message ?? err));
     }
   };
 
@@ -739,226 +674,73 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   ];
 
   return (
-    <Modal isOpen={isOpen} onClose={handleEscape} size="2xl" padded={false} className="h-[min(600px,calc(100vh-2rem))]" dismissOnBackdrop={false}>
-      <div className="flex h-full min-h-0">
-        {/* Saved sites */}
-        <aside className="w-64 shrink-0 bg-dark-850 border-r border-line flex flex-col select-none">
-          <div className="px-4 pt-4 pb-2 flex items-center gap-1">
-            <h2 className="flex-1 min-w-0 truncate text-[15px] font-semibold text-ink">{t('loginDialog.title', 'Site Manager')}</h2>
-            {treeFolderPaths.length > 0 && (
-              <button
-                type="button"
-                onClick={() => setFoldersCollapsed(treeFolderPaths, anyFolderExpanded)}
-                className="ui-icon-btn ui-icon-btn-sm"
-                title={anyFolderExpanded ? t('loginDialog.collapseFolders', 'Collapse all folders') : t('loginDialog.expandFolders', 'Expand all folders')}
-                aria-label={anyFolderExpanded ? t('loginDialog.collapseFolders', 'Collapse all folders') : t('loginDialog.expandFolders', 'Expand all folders')}
-              >
-                {anyFolderExpanded ? <ChevronsDownUp className="w-4 h-4" /> : <ChevronsUpDown className="w-4 h-4" />}
-              </button>
-            )}
-            <button type="button" onClick={handleNewSite} className="ui-icon-btn ui-icon-btn-sm" title={t('loginDialog.newConnection')} aria-label={t('loginDialog.newConnection')}>
-              <Plus className="w-4 h-4" />
-            </button>
-          </div>
-
-          {savedSites.length > 6 && (
-            <div className="px-3 pb-2">
-              <div className="relative">
-                <Search className="w-3.5 h-3.5 text-ink-faint absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-                <input
-                  {...plainTextInputProps}
-                  value={filter}
-                  onChange={(e) => {
-                    setFilter(e.target.value);
-                    setFilterCollapsed(new Set());
-                  }}
-                  placeholder={t('loginDialog.filter', 'Filter')}
-                  aria-label={t('loginDialog.filterHint', 'Filter by name, server, user or folder')}
-                  title={t('loginDialog.filterHint', 'Filter by name, server, user or folder')}
-                  className="ui-input h-7 pl-7 pr-7 text-[12.5px]"
-                />
-                {filter && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setFilter('');
-                      setFilterCollapsed(new Set());
-                    }}
-                    className="absolute right-1 top-1/2 -translate-y-1/2 ui-icon-btn !w-5 !h-5 !rounded"
-                    title={t('loginDialog.clearFilter', 'Clear filter')}
-                    aria-label={t('loginDialog.clearFilter', 'Clear filter')}
-                  >
-                    <X className="w-3 h-3" />
-                  </button>
-                )}
-              </div>
-            </div>
-          )}
-
-          <div ref={siteListRef} className="flex-1 overflow-y-auto px-2 pb-2 space-y-0.5">
-            <button
-              type="button"
-              onClick={handleNewSite}
-              className={`w-full flex items-center gap-2.5 px-2.5 h-9 rounded-lg text-[13px] transition-colors ${
-                isNew ? 'bg-dark-650 text-ink font-medium' : 'text-ink-muted hover:text-ink hover:bg-dark-650/50'
-              }`}
-            >
-              <Plus className="w-4 h-4 shrink-0" />
-              <span className="truncate">{t('loginDialog.newConnection')}</span>
-            </button>
-
-            {treeRows.map((row) => {
-              if (row.kind === 'folder') {
-                const { node, depth, expanded } = row;
-                return (
-                  <button
-                    key={`folder:${node.path}`}
-                    type="button"
-                    data-folder-path={node.path}
-                    aria-expanded={expanded}
-                    onClick={(e) => toggleFolder(node, expanded, e.altKey)}
-                    onKeyDown={(e) => {
-                      if ((e.key === 'ArrowRight' && !expanded) || (e.key === 'ArrowLeft' && expanded)) {
-                        e.preventDefault();
-                        toggleFolder(node, expanded, e.altKey);
-                      }
-                    }}
-                    className="w-full flex items-center gap-1.5 h-8 pr-2.5 rounded-lg text-[13px] text-ink-muted hover:text-ink hover:bg-dark-650/50 transition-colors"
-                    style={{ paddingLeft: 4 + depth * 14 }}
-                    title={node.path}
-                  >
-                    <ChevronRight className={`w-3.5 h-3.5 shrink-0 text-ink-faint transition-transform ${expanded ? 'rotate-90' : ''}`} />
-                    {expanded ? <FolderOpen className="w-4 h-4 shrink-0 text-ink-faint" /> : <Folder className="w-4 h-4 shrink-0 text-ink-faint" />}
-                    <span className="flex-1 min-w-0 truncate text-left">{node.name}</span>
-                    <span className="shrink-0 text-[11px] text-ink-faint tabular-nums">{node.count}</span>
-                  </button>
-                );
-              }
-              const { site, depth } = row;
-              const selected = selectedSiteId === site.id;
-              const confirming = pendingDeleteId === site.id;
-              return (
-                <div
-                  key={site.id}
-                  role="button"
-                  tabIndex={0}
-                  onClick={() => handleSelectSite(site)}
-                  onDoubleClick={() => {
-                    handleSelectSite(site);
-                    runConnect(site);
-                  }}
-                  onKeyDown={(e) => e.key === 'Enter' && handleSelectSite(site)}
-                  className={`group flex items-center gap-2.5 pr-2.5 h-11 rounded-lg cursor-pointer transition-colors ${
-                    selected ? 'bg-dark-650 text-ink' : 'text-ink hover:bg-dark-650/50'
-                  }`}
-                  style={{ paddingLeft: 10 + depth * 14 }}
-                  title={t('loginDialog.doubleClickHint', 'Double-click to connect')}
-                >
-                  <ProtocolIcon protocol={site.protocol} className={`w-4 h-4 shrink-0 ${selected ? 'text-rust-500' : 'text-ink-faint'}`} />
-                  <div className="flex-1 min-w-0">
-                    <div className={`text-[13px] truncate ${selected ? 'font-medium' : ''}`}>{site.name}</div>
-                    {site.protocol !== 'local' && (
-                      <div className="text-[11px] text-ink-faint truncate">
-                        {site.username ? `${site.username}@` : ''}
-                        {site.host}
-                      </div>
-                    )}
-                  </div>
-                  {site.id !== 'local' && onShareSite && !confirming && (
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onShareSite(site);
-                      }}
-                      title={t('loginDialog.shareSite', 'Share connection…')}
-                      aria-label={t('loginDialog.shareSite', 'Share connection…')}
-                      className="shrink-0 w-6 h-6 rounded-md flex items-center justify-center text-ink-faint hover:text-ink hover:bg-dark-600/60 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-all"
-                    >
-                      <Share2 className="w-3.5 h-3.5" />
-                    </button>
-                  )}
-                  {site.id !== 'local' && (
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleDelete(site.id);
-                      }}
-                      title={confirming ? t('loginDialog.confirmDelete', 'Click again to delete') : t('dualPane.delete')}
-                      aria-label={t('dualPane.delete')}
-                      className={`shrink-0 h-6 rounded-md flex items-center justify-center transition-all ${
-                        confirming
-                          ? 'px-2 bg-red-600 text-white text-[11px] font-medium opacity-100'
-                          : 'w-6 text-ink-faint hover:text-red-600 dark:hover:text-red-400 hover:bg-dark-600/60 opacity-0 group-hover:opacity-100 focus:opacity-100'
-                      }`}
-                    >
-                      {confirming ? t('loginDialog.deleteShort', 'Delete') : <Trash2 className="w-3.5 h-3.5" />}
-                    </button>
-                  )}
-                </div>
-              );
-            })}
-            {isFiltering && matchingSites.length === 0 && (
-              <div className="px-3 py-6 text-center text-[12px] text-ink-faint">{t('loginDialog.noMatches', 'No matching sites')}</div>
-            )}
-          </div>
-
-          <div className="p-2 border-t border-line space-y-0.5">
-            <button
-              type="button"
-              onClick={() => {
-                setVaultInitialTab(undefined);
-                setIsVaultModalOpen(true);
-              }}
-              className="w-full flex items-center gap-2 px-2.5 h-8 rounded-lg text-[12.5px] text-ink-muted hover:text-ink hover:bg-dark-650/50 transition-colors"
-              title={t('loginDialog.vaultHint', 'Encrypted (AES-256) export/import for macOS, Windows and Linux')}
-            >
-              <ArrowDownUp className="w-3.5 h-3.5" />
-              {t('loginDialog.importExport', 'Import / Export…')}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setVaultInitialTab('winscp');
-                setIsVaultModalOpen(true);
-              }}
-              className="w-full flex items-center gap-2 px-2.5 h-8 rounded-lg text-[12.5px] text-ink-muted hover:text-ink hover:bg-dark-650/50 transition-colors"
-              title={t('loginDialog.winscpHint', 'Bring over your WinSCP sites, folders and saved passwords')}
-            >
-              <FolderInput className="w-3.5 h-3.5" />
-              {t('loginDialog.importWinscp', 'Import from WinSCP…')}
-            </button>
-            {onOpenSharedConnection && (
-              <button
-                type="button"
-                onClick={onOpenSharedConnection}
-                className="w-full flex items-center gap-2 px-2.5 h-8 rounded-lg text-[12.5px] text-ink-muted hover:text-ink hover:bg-dark-650/50 transition-colors"
-                title={t('loginDialog.openSharedHint', 'Open a .rustscp file someone sent you')}
-              >
-                <FileKey2 className="w-3.5 h-3.5" />
-                {t('loginDialog.openShared', 'Open shared connection…')}
-              </button>
-            )}
-          </div>
-        </aside>
+    <Modal isOpen={isOpen} onClose={handleEscape} size="3xl" padded={false} className="h-[min(700px,calc(100vh-2rem))]" dismissOnBackdrop={false}>
+      <div className="flex h-full min-h-0" onKeyDown={onDialogKeyDown}>
+        {/* Saved connections */}
+        <SiteSidebar
+          tree={siteTree}
+          savedSites={savedSites}
+          formKey={isNew ? 'draft' : `s:${selectedSiteId}`}
+          draftFolder={isNew ? normalizeGroup(group) : null}
+          draftName={isNew ? siteName.trim() : ''}
+          formDirty={isDirty}
+          onSelectSite={selectSiteFromTree}
+          onConnectSite={connectSiteFromTree}
+          onNewConnection={(folder) => guardDirty(() => handleNewSite(folder))}
+          onEditSite={editSiteFromTree}
+          onFocusDraft={() => setTimeout(() => (hostRef.current ?? siteNameRef.current)?.focus(), 0)}
+          onShareSite={onShareSite}
+          onOpenVault={(tab) => {
+            setVaultInitialTab(tab);
+            setIsVaultModalOpen(true);
+          }}
+          onOpenSharedConnection={onOpenSharedConnection}
+          escapeLayers={escapeLayersRef}
+          apiRef={sidebarApiRef}
+        />
 
         {/* Connection form */}
         <div className="flex-1 min-w-0 flex flex-col">
-          <div className="flex-1 overflow-y-auto px-7 pt-5 pb-6" onKeyDown={onFormKeyDown} data-form-scroll>
-            <div className="flex items-center justify-between mb-5">
-              <div className="min-w-0">
-                <div className="text-[12px] text-ink-faint truncate">
-                  {isNew ? t('loginDialog.newConnection') : t('loginDialog.editing', 'Editing')}
+          <div ref={formScrollRef} className="flex-1 overflow-y-auto px-7 pt-5 pb-6" onKeyDown={onFormKeyDown} data-form-scroll>
+            <div className="flex items-center justify-between gap-1 mb-5">
+              <div className="min-w-0 flex-1">
+                <div className="h-[18px] text-[12px] text-ink-faint flex items-center min-w-0 whitespace-nowrap overflow-hidden">
+                  {isNew ? (
+                    <span className="shrink-0">
+                      {normalizedGroup ? t('siteTree.inFolderPrefix', 'New connection · in') : t('siteTree.atTopLevel', 'New connection · at the top level')}
+                    </span>
+                  ) : (
+                    <span className="shrink-0">{t('loginDialog.editing', 'Editing')}</span>
+                  )}
                   {normalizedGroup && (
-                    <span title={normalizedGroup}>
-                      {' · '}
-                      {normalizedGroup.split('/').join(' / ')}
+                    <span className="min-w-0 truncate" title={normalizedGroup}>
+                      {isNew ? '\u00a0' : '\u00a0·\u00a0'}
+                      {folderChain(normalizedGroup).map((path, i) => (
+                        <React.Fragment key={path}>
+                          {i > 0 && ' / '}
+                          <button
+                            type="button"
+                            className="hover:text-ink hover:underline underline-offset-2"
+                            onClick={() => sidebarApiRef.current?.revealFolder(path, { select: true, focus: true })}
+                          >
+                            {path.slice(path.lastIndexOf('/') + 1)}
+                          </button>
+                        </React.Fragment>
+                      ))}
+                    </span>
+                  )}
+                  {isNew && (
+                    <span className="shrink-0">
+                      {'\u00a0·\u00a0'}
+                      <button type="button" className="text-ink-muted hover:text-ink hover:underline underline-offset-2" onClick={changeFolder}>
+                        {t('siteTree.change', 'Change…')}
+                      </button>
                     </span>
                   )}
                 </div>
                 <input
                   {...plainTextInputProps}
+                  ref={siteNameRef}
                   value={siteName}
                   onChange={(e) => {
                     setSiteName(e.target.value);
@@ -969,7 +751,19 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
                   className="w-full h-9 bg-transparent text-[17px] font-semibold text-ink placeholder:text-ink-faint outline-none rounded-md -ml-1 px-1 hover:bg-dark-650/40 focus:bg-dark-650/40 transition-colors"
                 />
               </div>
-              <button type="button" onClick={handleClose} className="ui-icon-btn ui-icon-btn-sm self-start" aria-label={t('loginDialog.cancel')}>
+              {!isNew && (
+                <button
+                  type="button"
+                  onClick={(e) => sidebarApiRef.current?.openItemMenu(`s:${selectedSiteId}`, e.currentTarget.getBoundingClientRect())}
+                  className="ui-icon-btn ui-icon-btn-sm self-start"
+                  aria-label={t('siteTree.moreActions', 'More actions')}
+                  title={t('siteTree.moreActions', 'More actions')}
+                  aria-haspopup="menu"
+                >
+                  <Ellipsis className="w-4 h-4" />
+                </button>
+              )}
+              <button type="button" onClick={() => guardDirty(handleClose)} className="ui-icon-btn ui-icon-btn-sm self-start" aria-label={t('loginDialog.cancel')}>
                 <X className="w-4 h-4" />
               </button>
             </div>
@@ -1266,7 +1060,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
               </Button>
             ) : (
               <>
-                <Button variant="ghost" onClick={handleClose}>
+                <Button variant="ghost" onClick={() => guardDirty(handleClose)}>
                   {t('loginDialog.cancel')}
                 </Button>
                 <Button variant="secondary" onClick={handleSave} loading={isSaving}>
@@ -1292,7 +1086,30 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
             if (onSitesUpdated) onSitesUpdated(newSites);
             // A replace import can remove the site being edited: never save it back by accident
             if (selectedSiteId !== 'new' && !newSites.some((s) => s.id === selectedSiteId)) resetForm();
+            // Undo cannot reach across an import; imported folders join the layout
+            siteTree.forgetUndo();
+            void siteTree.reload();
           }}
+        />
+      )}
+
+      {unsavedAction && (
+        <UnsavedChangesDialog
+          name={isNew ? null : siteName.trim() || savedSites.find((s) => s.id === selectedSiteId)?.name || null}
+          onSave={async () => {
+            const action = unsavedAction;
+            const ok = await handleSave();
+            setUnsavedAction(null);
+            if (ok) action();
+            return ok;
+          }}
+          onDontSave={() => {
+            const action = unsavedAction;
+            setUnsavedAction(null);
+            setIsDirty(false);
+            action();
+          }}
+          onCancel={() => setUnsavedAction(null)}
         />
       )}
     </Modal>
