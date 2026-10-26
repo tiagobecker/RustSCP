@@ -21,6 +21,8 @@ export interface ActiveSession {
   id: string;
   config: ConnectionConfig;
   currentPath: string;
+  /** SFTP compatibility mode: the sftp-server started as a command (get_session_compat). Shown as a badge. */
+  compat?: string;
 }
 
 interface SessionTabsProps {
@@ -435,6 +437,18 @@ export const SessionTabs: React.FC<SessionTabsProps> = ({
             <ProtocolIcon protocol={sess.config.protocol} />
           </span>
           <span className="truncate">{sess.config.name}</span>
+          {sess.compat && (
+            <span
+              className="shrink-0 text-[10.5px] leading-4 px-1.5 rounded-full bg-surface-sunken text-ink-faint ring-1 ring-inset ring-line"
+              title={t(
+                'sessionTabs.compatTip',
+                "This server refuses the standard SFTP subsystem, so RustSCP started {{path}} as a command. Everything works; ask the server admin to fix the 'Subsystem sftp' line in sshd_config.",
+                { path: sess.compat }
+              )}
+            >
+              {t('sessionTabs.compat', 'Compatibility')}
+            </span>
+          )}
 
           {onMoveTab && paneId && (
             <button

@@ -14,7 +14,7 @@
 //! [`ConnectionConfig`]s, whose `Debug` output redacts them.
 
 use crate::types::{
-    normalize_site_group, AuthMethod, ConnectionConfig, CoreError, CoreResult, Protocol,
+    normalize_site_group, AuthMethod, ConnectionConfig, CoreError, CoreResult, Protocol, SftpMode,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -683,6 +683,7 @@ fn parse_with_env(content: &str, env: &KeyPathEnv<'_>) -> CoreResult<WinScpImpor
             auth,
             remote_root,
             tls_fingerprint: None,
+            sftp_mode: SftpMode::Auto,
             group,
         });
     }

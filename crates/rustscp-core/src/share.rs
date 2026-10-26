@@ -524,6 +524,7 @@ mod tests {
     use super::*;
     use crate::embedded_key::tests::OPENSSH_ED25519;
     use crate::ppk::tests::{PASSPHRASE, V3_ENCRYPTED};
+    use crate::types::SftpMode;
 
     const FAST: u32 = vault::MIN_PASSWORD_KDF_ITERATIONS;
 
@@ -538,6 +539,7 @@ mod tests {
             auth,
             remote_root: "/var/www".into(),
             tls_fingerprint: None,
+            sftp_mode: SftpMode::Auto,
             group: Some("Clientes/ACME".into()),
         }
     }

@@ -236,7 +236,9 @@
     "close": "Close",
     "noTabs": "No connection",
     "connections": "Connections",
-    "newConnection": "New connection"
+    "newConnection": "New connection",
+    "compat": "Compatibility",
+    "compatTip": "This server refuses the standard SFTP subsystem, so RustSCP started {{path}} as a command. Everything works; ask the server admin to fix the 'Subsystem sftp' line in sshd_config."
   },
   "filePanel": {
     "dropFilesPrompt": "Drop items here to transfer",
@@ -313,6 +315,10 @@
     "tlsFingerprint": "Trusted certificate (SHA-256)",
     "tlsFingerprintHint": "Only for a server with a self-signed certificate. Certificates your system trusts are always accepted. If the connection reports an untrusted certificate, compare its fingerprint with the server's and paste it here.",
     "errFingerprint": "The trusted certificate must be a SHA-256 fingerprint (64 hexadecimal digits).",
+    "sftpMode": "SFTP compatibility",
+    "sftpModeHint": "If the server refuses or breaks the SFTP subsystem, RustSCP starts sftp-server as a command instead. Choose Subsystem only to never do that.",
+    "sftpModeAuto": "Automatic (recommended)",
+    "sftpModeSubsystemOnly": "Subsystem only",
     "folder": "Folder",
     "folderHint": "Groups this connection in the site list. Use / for subfolders; leave empty for the top level.",
     "folderPlaceholder": "e.g. Production/Web",

@@ -1459,9 +1459,10 @@ fn merge_winscp_sites(
 /// plus the imported ones. "merge" updates a saved site with the same id (or else the
 /// same name, folder, user, host and port) in place, keeping its id, and adds the rest;
 /// each saved site takes at most one imported site, so no imported site is lost. A merged
-/// site that still reaches the same endpoint keeps the credentials and trusted FTPS
-/// certificate saved in RustSCP that the file does not carry; one the file points at
-/// another host, user, port or protocol keeps none of them (and is counted).
+/// site that still reaches the same endpoint keeps the credentials, trusted FTPS
+/// certificate and SFTP compatibility setting saved in RustSCP that the file does not
+/// carry; one the file points at another host, user, port or protocol keeps none of them
+/// (and is counted).
 fn merge_winscp_sites_counted(
     saved: &[ConnectionConfig],
     imported: Vec<ConnectionConfig>,
@@ -1524,6 +1525,8 @@ fn merge_winscp_sites_counted(
         site.id = old.id.clone();
         if same_winscp_endpoint(old, &site) {
             keep_saved_credentials(&mut site, old);
+            // WinSCP has no such setting: the site keeps how RustSCP starts SFTP on it.
+            site.sftp_mode = old.sftp_mode;
         } else if keep_saved_credentials(&mut site.clone(), old) {
             // The site now names another endpoint: what RustSCP saved for the old one
             // stays out, and the site asks for its password again.
@@ -1683,6 +1686,19 @@ pub async fn get_session_default_path(
     let vfs = get_vfs(&state, &session_id).await?;
 
     vfs.get_default_path().await.map_err(|e| e.to_string())
+}
+
+/// How the session reaches the server when it is not the standard way: for SFTP, the
+/// `sftp-server` started as a command because the server refused the SFTP subsystem.
+/// `None` for every other session. The UI shows it as a badge on the session's tab.
+#[tauri::command]
+pub async fn get_session_compat(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<String>, String> {
+    let vfs = get_vfs(&state, &session_id).await?;
+
+    Ok(vfs.compatibility_mode())
 }
 
 #[tauri::command]
@@ -6809,7 +6825,7 @@ pub async fn invalidate_directory_cache(
 #[cfg(test)]
 mod security_tests {
     use super::*;
-    use rustscp_core::AuthMethod;
+    use rustscp_core::{AuthMethod, SftpMode};
 
     const NASTY: &[&str] = &[
         "",
@@ -6843,6 +6859,7 @@ mod security_tests {
             auth,
             remote_root: "/".to_string(),
             tls_fingerprint: None,
+            sftp_mode: SftpMode::Auto,
             group: None,
         }
     }
@@ -7702,6 +7719,7 @@ mod security_tests {
 #[cfg(test)]
 mod correctness_tests {
     use super::*;
+    use rustscp_core::SftpMode;
 
     /// Unique scratch directory under the system temp dir, removed on drop.
     struct Scratch(std::path::PathBuf);
@@ -8957,6 +8975,7 @@ mod correctness_tests {
             auth: rustscp_core::AuthMethod::None,
             remote_root: "/".to_string(),
             tls_fingerprint: None,
+            sftp_mode: SftpMode::Auto,
             group: None,
         };
         let a = sftp("Example.com", 22, "deploy");
@@ -9154,7 +9173,7 @@ mod correctness_tests {
 #[cfg(test)]
 mod winscp_and_move_tests {
     use super::*;
-    use rustscp_core::AuthMethod;
+    use rustscp_core::{AuthMethod, SftpMode};
 
     /// WinSCP's password obfuscation (EncryptPassword in Security.cpp) without the
     /// random shift and padding, for test files.
@@ -9191,6 +9210,7 @@ mod winscp_and_move_tests {
             auth,
             remote_root: "/".to_string(),
             tls_fingerprint: None,
+            sftp_mode: SftpMode::Auto,
             group: None,
         }
     }
@@ -9220,6 +9240,7 @@ mod winscp_and_move_tests {
         assert_eq!(saved.len(), 2);
         assert!(matches!(&saved[1].auth, AuthMethod::Password(p) if p == "CorpSecret!"));
         saved[1].tls_fingerprint = Some("ab:cd".to_string());
+        saved[1].sftp_mode = SftpMode::SubsystemOnly;
 
         // 2nd import: another file (shared, crafted, or master-password protected) with the
         // same session name, another host over plain FTP, and no password.
@@ -9237,6 +9258,7 @@ mod winscp_and_move_tests {
         assert_eq!(site.protocol, Protocol::Ftp);
         assert!(matches!(site.auth, AuthMethod::None), "{:?}", site.auth);
         assert_eq!(site.tls_fingerprint, None);
+        assert_eq!(site.sftp_mode, SftpMode::Auto);
         let json = serde_json::to_string(&merge.sites).unwrap();
         assert!(!json.contains("CorpSecret!"));
 
@@ -9248,6 +9270,7 @@ mod winscp_and_move_tests {
         );
         assert_eq!(again.endpoint_changed, 0);
         assert_eq!(again.sites[1].tls_fingerprint.as_deref(), Some("ab:cd"));
+        assert_eq!(again.sites[1].sftp_mode, SftpMode::SubsystemOnly);
     }
 
     #[test]

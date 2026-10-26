@@ -571,6 +571,25 @@ export const App: React.FC = () => {
     if (sess.config.protocol !== 'local') saveLastRemotePath(sess.config, path);
   };
 
+  // Whether an SFTP session runs in compatibility mode (sftp-server started as a command) is asked
+  // once per session, after a listing succeeds, and shown as a badge on its tab. The token drops an
+  // answer that arrives after the session closed or reconnected under the same id.
+  const compatAskedRef = useRef<Map<string, object>>(new Map());
+  const checkSessionCompat = (sid: string) => {
+    const sess = sessionById(sid);
+    if (!sess || (sess.config.protocol !== 'sftp' && sess.config.protocol !== 'scp') || compatAskedRef.current.has(sid)) return;
+    const token = {};
+    compatAskedRef.current.set(sid, token);
+    invokeTauri<string | null>('get_session_compat', { sessionId: sid })
+      .then((compat) => {
+        if (typeof compat !== 'string' || !compat || compatAskedRef.current.get(sid) !== token) return;
+        setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, compat } : s)));
+      })
+      .catch(() => {
+        // no answer: the tab simply shows no badge
+      });
+  };
+
   const clearPane = (pane: PaneId) => {
     const api = panes[pane];
     api.reqRef.current++; // drop any listing still in flight
@@ -622,6 +641,7 @@ export const App: React.FC = () => {
       api.shownRef.current = sid;
       panePathMemoryRef.current[pane][sid] = path;
       updateSessionPath(sid, path);
+      checkSessionCompat(sid);
     };
 
     // 1. Instant cache hit
@@ -1139,6 +1159,7 @@ export const App: React.FC = () => {
   const disconnectSession = async (id: string) => {
     if (id === LOCAL_ID) return;
     directoryCache.invalidateSession(id);
+    compatAskedRef.current.delete(id);
     const target = sessionById(id);
     if (target && target.config.protocol !== 'local' && target.currentPath) {
       saveLastRemotePath(target.config, target.currentPath);
@@ -2344,8 +2365,10 @@ export const App: React.FC = () => {
 
     const isNewSession = !sessionsRef.current.some((s) => s.id === sessionId);
     if (!isNewSession) {
-      // Same id as an open tab (older backends reuse the site id): refresh it instead of duplicating
-      setSessions((prev) => prev.map((s) => (s.id === sessionId ? { ...s, config: cfg } : s)));
+      // Same id as an open tab (older backends reuse the site id): refresh it instead of duplicating.
+      // It is a new connection, so its compatibility mode is asked again.
+      compatAskedRef.current.delete(sessionId);
+      setSessions((prev) => prev.map((s) => (s.id === sessionId ? { ...s, config: cfg, compat: undefined } : s)));
     } else {
       setSessions((prev) => [...prev, { id: sessionId, config: cfg, currentPath: initialPath }]);
     }

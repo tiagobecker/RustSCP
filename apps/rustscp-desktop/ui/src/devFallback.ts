@@ -125,5 +125,9 @@ export function getFallbackData<T>(cmd: string, args?: any): T {
     return false as unknown as T;
   }
 
+  if (cmd === 'get_session_compat') {
+    return null as unknown as T;
+  }
+
   return {} as T;
 }

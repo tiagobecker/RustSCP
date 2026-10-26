@@ -369,6 +369,7 @@ impl CodeGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::SftpMode;
 
     const SECRET: &str = "S3cr3t'\"$;@:/#pass";
 
@@ -383,6 +384,7 @@ mod tests {
             auth,
             remote_root: "/".into(),
             tls_fingerprint: None,
+            sftp_mode: SftpMode::Auto,
             group: None,
         }
     }
