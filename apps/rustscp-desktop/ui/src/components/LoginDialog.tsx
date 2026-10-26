@@ -266,8 +266,9 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   const sidebarApiRef = useRef<SiteSidebarApi | null>(null);
   // Escape layers registered by the sidebar (inline rename, search); each returns true when it used the key
   const escapeLayersRef = useRef<Array<() => boolean>>([]);
-  // Name and folder of the open site as the form loaded them: a tree change to them updates the form
-  const formOriginRef = useRef<{ id: string; name: string; group: string } | null>(null);
+  // Name and folder of the open site as the form loaded them: a tree change to them updates the form.
+  // `seen` once the site was found in the list (only then does its absence mean it was deleted)
+  const formOriginRef = useRef<{ id: string; name: string; group: string; seen: boolean } | null>(null);
   // resetForm is declared below the early return; effects reach it through this ref
   const resetFormRef = useRef<() => void>(() => {});
   const passwordRef = useRef<HTMLInputElement>(null);
@@ -366,7 +367,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
     const site = savedSites.find((s) => s.id === id);
     const origin = formOriginRef.current;
     if (!site) {
-      if (origin?.id === id && !isConnecting) {
+      if (origin?.id === id && origin.seen && !isConnecting) {
         formOriginRef.current = null;
         resetFormRef.current();
       }
@@ -377,7 +378,7 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
       if (site.name !== origin.name) setSiteName(site.name);
       if (siteGroup !== origin.group) setGroup(siteGroup);
     }
-    formOriginRef.current = { id, name: site.name, group: siteGroup };
+    formOriginRef.current = { id, name: site.name, group: siteGroup, seen: true };
     // Only tree changes (savedSites) and a new open site matter here
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [savedSites, selectedSiteId]);
@@ -451,9 +452,13 @@ export const LoginDialog: React.FC<LoginDialogProps> = ({
   const handleSelectSite = (site: ConnectionConfig) => {
     // A password hint belongs to the site it was shown for (gatePassword sets it again)
     setPasswordGateId(null);
+    const siteGroup = site.id === 'local' ? '' : normalizeGroup(site.group);
+    // The form's origin is the object loaded here: when the tree hands over a site from before its
+    // own move (a drop, Move to…, Paste), the follow effect sees the newer folder and updates the form
+    formOriginRef.current = { id: site.id, name: site.name, group: siteGroup, seen: false };
     setSelectedSiteId(site.id);
     setSiteName(site.name);
-    setGroup(site.id === 'local' ? '' : normalizeGroup(site.group));
+    setGroup(siteGroup);
     setFolderSuggestOpen(false);
     if (site.id !== 'local') revealFolder(site.group);
     setProtocol(site.protocol);
