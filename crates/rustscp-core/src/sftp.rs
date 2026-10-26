@@ -32,6 +32,11 @@ const SSH_IO_TIMEOUT_MS: u32 = 10_000;
 const SHELL_IO_TIMEOUT_MS: u32 = 2_000;
 /// Keepalive interval so NAT/firewall idle timeouts do not drop the connection.
 const KEEPALIVE_INTERVAL_SECS: u32 = 30;
+/// A folder listing is stopped past this many entries or bytes of names: a broken or
+/// hostile server that never ends READDIR must not use up all memory (2,000,000
+/// entries take about 250 MiB here).
+const MAX_LISTING_ENTRIES: usize = 2_000_000;
+const MAX_LISTING_NAME_BYTES: usize = 128 * 1024 * 1024;
 /// Default limit for one remote command.
 pub const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -156,6 +161,45 @@ impl std::fmt::Debug for SftpDriver {
 
 fn lock<T>(m: &StdMutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Send one SSH keepalive. libssh2's own keepalive timer stays off: while it is on,
+/// every blocking call gives up with LIBSSH2_ERROR_TIMEOUT as soon as the next
+/// keepalive falls due (after anywhere from 1 s to the full I/O timeout), so a slow
+/// but healthy server looked like a lost connection. The timer is switched on for
+/// this one send only, under ssh2's session lock, so no blocking call ever sees it.
+fn send_keepalive(sess: &Session) -> Result<(), ssh2::Error> {
+    // `raw()` holds ssh2's session lock until the end of this function.
+    let mut guard = sess.raw();
+    let raw: *mut libssh2_sys::LIBSSH2_SESSION = &mut *guard;
+    let mut seconds_to_next = 0;
+    // SAFETY: `raw` is the live session and ssh2's lock is held, as ssh2 does for
+    // its own calls. 2 s is libssh2's shortest interval; the last keepalive was
+    // KEEPALIVE_INTERVAL_SECS ago, so this one is due and is sent.
+    let rc = unsafe {
+        libssh2_sys::libssh2_keepalive_config(raw, 0, 2);
+        let rc = libssh2_sys::libssh2_keepalive_send(raw, &mut seconds_to_next);
+        libssh2_sys::libssh2_keepalive_config(raw, 0, 0);
+        rc
+    };
+    if rc < 0 {
+        return Err(ssh2::Error::from_session_error_raw(raw, rc));
+    }
+    Ok(())
+}
+
+/// Close a remote file or folder handle. After a timeout or a lost connection (`stalled`),
+/// closing it would wait for the server again (up to the whole I/O timeout), so it is
+/// closed on a thread of its own and the error returns now.
+fn close_handle<H: Send + 'static>(handle: H, stalled: bool) {
+    if stalled {
+        std::thread::spawn(move || drop(handle));
+    }
+}
+
+/// Did this error come from a connection that timed out or was lost?
+fn is_stalled(e: &CoreError) -> bool {
+    matches!(e, CoreError::Timeout(_) | CoreError::ConnectionFailed(_))
 }
 
 fn join_error(e: task::JoinError) -> CoreError {
@@ -507,33 +551,81 @@ fn is_valid_listing_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\0'])
 }
 
+/// Why a folder could not be listed.
+#[derive(Debug)]
+enum ListingError {
+    Ssh(ssh2::Error),
+    /// The server sent more than [`MAX_LISTING_ENTRIES`] entries or
+    /// [`MAX_LISTING_NAME_BYTES`] of names.
+    TooLarge {
+        entries: usize,
+    },
+}
+
+impl ListingError {
+    fn into_core(self, dir: &str) -> CoreError {
+        match self {
+            ListingError::Ssh(e) => ssh_error(e, format!("Cannot list SFTP directory '{}'", dir)),
+            ListingError::TooLarge { entries } => CoreError::Protocol(format!(
+                "Stopped listing '{}' after {} entries: a folder listing is limited to {} \
+                 entries and {} MiB of names",
+                dir,
+                entries,
+                MAX_LISTING_ENTRIES,
+                MAX_LISTING_NAME_BYTES >> 20
+            )),
+        }
+    }
+}
+
+/// Collect a listing from `next` (`None` at its end) without . and .. and without
+/// names that are not a single path component. More than `max_entries` entries or
+/// `max_name_bytes` of names is an error; skipped names count too, so a server
+/// repeating "." forever is stopped as well.
+fn collect_listing(
+    dir: &str,
+    max_entries: usize,
+    max_name_bytes: usize,
+    mut next: impl FnMut() -> Result<Option<(String, FileStat)>, ssh2::Error>,
+) -> Result<Vec<(String, FileStat)>, ListingError> {
+    let mut out = Vec::new();
+    let (mut entries, mut name_bytes) = (0usize, 0usize);
+    while let Some((name, stat)) = next().map_err(ListingError::Ssh)? {
+        name_bytes = name_bytes.saturating_add(name.len());
+        if entries >= max_entries || name_bytes > max_name_bytes {
+            return Err(ListingError::TooLarge { entries });
+        }
+        entries += 1;
+        if !is_valid_listing_name(&name) {
+            if name != "." && name != ".." && !name.is_empty() {
+                tracing::warn!(
+                    "Ignoring invalid entry name {:?} listed by the server in '{}'",
+                    name,
+                    dir
+                );
+            }
+            continue;
+        }
+        out.push((name, stat));
+    }
+    Ok(out)
+}
+
 /// readdir returning raw entry names (not std::path joins), without . and ..
 /// and without names that are not a single path component.
-fn read_dir_raw(sftp: &SftpBackend, dir: &str) -> Result<Vec<(String, FileStat)>, ssh2::Error> {
-    let mut handle = sftp.opendir(Path::new(dir))?;
-    let mut out = Vec::new();
-    loop {
+fn read_dir_raw(sftp: &SftpBackend, dir: &str) -> Result<Vec<(String, FileStat)>, ListingError> {
+    let mut handle = sftp.opendir(Path::new(dir)).map_err(ListingError::Ssh)?;
+    let listing = collect_listing(dir, MAX_LISTING_ENTRIES, MAX_LISTING_NAME_BYTES, || loop {
         match handle.readdir() {
-            Ok((name, stat)) => {
-                let name = name.to_string_lossy().into_owned();
-                if !is_valid_listing_name(&name) {
-                    if name != "." && name != ".." && !name.is_empty() {
-                        tracing::warn!(
-                            "Ignoring invalid entry name {:?} listed by the server in '{}'",
-                            name,
-                            dir
-                        );
-                    }
-                    continue;
-                }
-                out.push((name, stat));
-            }
-            Err(e) if e.code() == ErrorCode::Session(LIBSSH2_ERROR_FILE) => break,
+            Ok((name, stat)) => return Ok(Some((name.to_string_lossy().into_owned(), stat))),
+            Err(e) if e.code() == ErrorCode::Session(LIBSSH2_ERROR_FILE) => return Ok(None),
             Err(e) if e.code() == ErrorCode::Session(LIBSSH2_ERROR_EAGAIN) => continue,
             Err(e) => return Err(e),
         }
-    }
-    Ok(out)
+    });
+    let stalled = matches!(&listing, Err(ListingError::Ssh(e)) if is_lost(e));
+    close_handle(handle, stalled);
+    listing
 }
 
 /// mkdir -p over SFTP. An existing directory is success.
@@ -568,7 +660,7 @@ fn mkdir_p(sftp: &SftpBackend, dir: &str) -> Result<(), ssh2::Error> {
 
 /// Recursive delete over SFTP. Entries come from readdir (lstat semantics),
 /// so symbolic links are unlinked, never followed.
-fn remove_dir_all_sftp(sftp: &SftpBackend, dir: &str) -> Result<(), ssh2::Error> {
+fn remove_dir_all_sftp(sftp: &SftpBackend, dir: &str) -> CoreResult<()> {
     let mut first_err = None;
     match read_dir_raw(sftp, dir) {
         Ok(entries) => {
@@ -578,6 +670,7 @@ fn remove_dir_all_sftp(sftp: &SftpBackend, dir: &str) -> Result<(), ssh2::Error>
                     remove_dir_all_sftp(sftp, &child)
                 } else {
                     sftp.unlink(Path::new(&child))
+                        .map_err(|e| ssh_error(e, format!("Failed to delete '{}'", child)))
                 };
                 if let Err(e) = res {
                     first_err.get_or_insert(e);
@@ -585,38 +678,46 @@ fn remove_dir_all_sftp(sftp: &SftpBackend, dir: &str) -> Result<(), ssh2::Error>
             }
         }
         Err(e) => {
-            first_err = Some(e);
+            first_err = Some(e.into_core(dir));
         }
     }
     match sftp.rmdir(Path::new(dir)) {
         Ok(()) => Ok(()),
-        Err(e) => Err(first_err.unwrap_or(e)),
+        Err(e) => {
+            Err(first_err
+                .unwrap_or_else(|| ssh_error(e, format!("Failed to delete folder '{}'", dir))))
+        }
     }
 }
 
 /// Sum of file sizes below `path` over SFTP (fallback when `du` is unavailable).
-fn sftp_tree_size(sftp: &SftpBackend, path: &str) -> u64 {
+/// Folders that cannot be read are left out; one too large to list is an error,
+/// not a total that silently misses it.
+fn sftp_tree_size(sftp: &SftpBackend, path: &str) -> CoreResult<u64> {
     let root = match sftp.stat(Path::new(path)) {
         Ok(st) => st,
-        Err(_) => return 0,
+        Err(_) => return Ok(0),
     };
     if !root.is_dir() {
-        return root.size.unwrap_or(0);
+        return Ok(root.size.unwrap_or(0));
     }
     let mut total = 0u64;
     let mut stack = vec![path.to_string()];
     while let Some(dir) = stack.pop() {
-        if let Ok(entries) = read_dir_raw(sftp, &dir) {
-            for (name, stat) in entries {
-                if stat.file_type().is_dir() {
-                    stack.push(join_remote(&dir, &name));
-                } else {
-                    total = total.saturating_add(stat.size.unwrap_or(0));
-                }
+        let entries = match read_dir_raw(sftp, &dir) {
+            Ok(entries) => entries,
+            Err(e @ ListingError::TooLarge { .. }) => return Err(e.into_core(&dir)),
+            Err(ListingError::Ssh(_)) => continue,
+        };
+        for (name, stat) in entries {
+            if stat.file_type().is_dir() {
+                stack.push(join_remote(&dir, &name));
+            } else {
+                total = total.saturating_add(stat.size.unwrap_or(0));
             }
         }
     }
-    total
+    Ok(total)
 }
 
 /// Read up to `length` bytes at `offset`, looping over short reads.
@@ -624,12 +725,25 @@ fn sftp_read_range(sftp: &SftpBackend, path: &str, offset: u64, length: u64) -> 
     if length == 0 {
         return Ok(Bytes::new());
     }
+    let mut file = sftp_open_at(sftp, path, offset)?;
+    let data = sftp_read_into(&mut file, path, length);
+    close_handle(file, data.as_ref().is_err_and(is_stalled));
+    data
+}
+
+/// Open `path` for reading at `offset`.
+fn sftp_open_at(sftp: &SftpBackend, path: &str, offset: u64) -> CoreResult<RemoteFile> {
     let mut file = sftp
         .open(Path::new(path))
         .map_err(|e| ssh_error(e, format!("Failed to open remote file '{}'", path)))?;
     file.seek(SeekFrom::Start(offset))
         .map_err(|e| io_error(e, format!("Failed to seek in '{}'", path)))?;
+    Ok(file)
+}
 
+/// Read up to `length` bytes from the current position of `file`, looping over
+/// short reads.
+fn sftp_read_into(file: &mut RemoteFile, path: &str, length: u64) -> CoreResult<Bytes> {
     let mut out = Vec::with_capacity(length.min(MAX_PREALLOC) as usize);
     let mut buf = vec![0u8; length.min(READ_BUF_MAX) as usize];
     let mut remaining = length;
@@ -651,6 +765,16 @@ fn sftp_read_range(sftp: &SftpBackend, path: &str, offset: u64, length: u64) -> 
         }
     }
     Ok(Bytes::from(out))
+}
+
+/// Write `data` at `offset` (a fresh handle is at 0).
+fn sftp_write_into(file: &mut RemoteFile, path: &str, offset: u64, data: &[u8]) -> CoreResult<()> {
+    if offset > 0 {
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| io_error(e, format!("Failed to seek in '{}'", path)))?;
+    }
+    file.write_all(data)
+        .map_err(|e| io_error(e, format!("Failed to write '{}'", path)))
 }
 
 /// Open for writing; `truncate` creates or truncates and creates missing
@@ -990,12 +1114,13 @@ fn parse_du_output(stdout: &str) -> Option<u64> {
 const CONTENT_SEARCH_MAX_FILE: u64 = 10 * 1024 * 1024;
 
 /// Find Files over plain SFTP, for accounts without a shell: breadth-first
-/// walk with mask matching and an in-memory content search.
+/// walk with mask matching and an in-memory content search. Folders that cannot
+/// be read are skipped; one too large to list is an error, not a silent gap.
 fn sftp_find_walk(
     sftp: &SftpBackend,
     query: &FindFileQuery,
     mask: &FileMaskFilter,
-) -> Vec<FindFileMatch> {
+) -> CoreResult<Vec<FindFileMatch>> {
     let mut results = Vec::new();
     let base = if query.base_path.is_empty() {
         ".".to_string()
@@ -1025,7 +1150,8 @@ fn sftp_find_walk(
         visited += 1;
         let entries = match read_dir_raw(sftp, &dir) {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(e @ ListingError::TooLarge { .. }) => return Err(e.into_core(&dir)),
+            Err(ListingError::Ssh(_)) => continue,
         };
         for (name, stat) in entries {
             let path = join_remote(&dir, &name);
@@ -1083,7 +1209,7 @@ fn sftp_find_walk(
             }
         }
     }
-    results
+    Ok(results)
 }
 
 fn is_dangerous_recursive_target(path: &str) -> bool {
@@ -1198,7 +1324,8 @@ impl SftpDriver {
 
         let host_key = Self::verify_host_key(&sess, config, &store, host_key_pin)?;
 
-        sess.set_keepalive(false, KEEPALIVE_INTERVAL_SECS);
+        // libssh2's keepalive timer stays off (it would cut blocking calls short);
+        // the driver sends keepalives itself (`send_keepalive`).
         Self::authenticate(&sess, config)?;
 
         let info = SessionInfo {
@@ -1505,10 +1632,16 @@ impl SftpDriver {
 
     async fn install_primary_session(&self, session: Session, info: SessionInfo) {
         let mut guard = self.session.lock().await;
-        *guard = Some(session);
+        let old_session = guard.replace(session);
         self.state.session_gen.fetch_add(1, Ordering::SeqCst);
-        *lock(&self.state.sftp_cache) = None;
+        let old_sftp = lock(&self.state.sftp_cache).take();
         *lock(&self.state.info) = info;
+        drop(guard);
+        // Closing them waits for the server (the whole I/O timeout when the old
+        // connection hung): never on the async runtime.
+        if old_session.is_some() || old_sftp.is_some() {
+            task::spawn_blocking(move || drop((old_sftp, old_session)));
+        }
     }
 
     async fn start_shell_session(&self) {
@@ -1554,7 +1687,7 @@ impl SftpDriver {
         let shell = Arc::downgrade(&self.shell_session);
         tokio::spawn(async move {
             let mut ticker =
-                tokio::time::interval(Duration::from_secs(u64::from(KEEPALIVE_INTERVAL_SECS) / 2));
+                tokio::time::interval(Duration::from_secs(u64::from(KEEPALIVE_INTERVAL_SECS)));
             ticker.tick().await;
             loop {
                 ticker.tick().await;
@@ -1562,25 +1695,21 @@ impl SftpDriver {
                 if p.is_none() && s.is_none() {
                     break;
                 }
-                let mut sessions = Vec::new();
-                for m in [p, s].into_iter().flatten() {
-                    if let Ok(g) = m.try_lock() {
-                        if let Some(sess) = g.as_ref() {
-                            sessions.push(sess.clone());
-                        }
+                // One job per connection: a connection whose lock is held by a
+                // stalled call does not hold up the other's keepalive.
+                for m in [s, p].into_iter().flatten() {
+                    let sess = match m.try_lock() {
+                        Ok(g) => g.as_ref().cloned(),
+                        Err(_) => None,
+                    };
+                    if let Some(sess) = sess {
+                        task::spawn_blocking(move || {
+                            if let Err(e) = send_keepalive(&sess) {
+                                tracing::debug!("SSH keepalive failed: {}", e);
+                            }
+                        });
                     }
                 }
-                if sessions.is_empty() {
-                    continue;
-                }
-                let _ = task::spawn_blocking(move || {
-                    for s in sessions {
-                        if let Err(e) = s.keepalive_send() {
-                            tracing::debug!("SSH keepalive failed: {}", e);
-                        }
-                    }
-                })
-                .await;
             }
         });
     }
@@ -1977,11 +2106,17 @@ impl SftpDriver {
             ),
             SftpBackend::Exec(exec) => result.is_err() && exec.is_broken(),
         };
+        let mut dropped = None;
         if broken {
             let mut cache = lock(&self.state.sftp_cache);
             if matches!(cache.as_ref(), Some((_, cached)) if Arc::ptr_eq(cached, &sftp)) {
-                *cache = None;
+                dropped = cache.take();
             }
+        }
+        // The last reference closes the channel, which waits for the server (the
+        // whole I/O timeout when it hung): never on the async runtime.
+        if dropped.is_some() || Arc::strong_count(&sftp) == 1 {
+            task::spawn_blocking(move || drop((dropped, sftp)));
         }
         result
     }
@@ -2462,7 +2597,8 @@ impl VirtualFileSystem for SftpDriver {
         self.with_sftp(move |_, sftp| {
             let dir_entries = match read_dir_raw(sftp, &path_owned) {
                 Ok(entries) => entries,
-                Err(err) => {
+                Err(err @ ListingError::TooLarge { .. }) => return Err(err.into_core(&path_owned)),
+                Err(ListingError::Ssh(err)) => {
                     let denied = err.code() == ErrorCode::SFTP(SFTP_PERMISSION_DENIED)
                         || err.to_string().to_lowercase().contains("permission denied");
                     if denied {
@@ -2559,9 +2695,11 @@ impl VirtualFileSystem for SftpDriver {
             })?;
             let size_hint = file.stat().ok().and_then(|s| s.size).unwrap_or(0);
             let mut buffer = Vec::with_capacity(size_hint.min(MAX_PREALLOC * 16) as usize);
-            file.read_to_end(&mut buffer)
-                .map_err(|e| io_error(e, format!("Failed to read '{}'", path_owned)))?;
-            Ok(Bytes::from(buffer))
+            let read = file
+                .read_to_end(&mut buffer)
+                .map_err(|e| io_error(e, format!("Failed to read '{}'", path_owned)));
+            close_handle(file, read.as_ref().is_err_and(is_stalled));
+            read.map(|_| Bytes::from(buffer))
         })
         .await
     }
@@ -2576,9 +2714,11 @@ impl VirtualFileSystem for SftpDriver {
         let path_owned = self.expand_home(path).await?;
         self.with_sftp(move |_, sftp| {
             let mut file = sftp_open_for_write(sftp, &path_owned, true)?;
-            file.write_all(&data)
-                .map_err(|e| io_error(e, format!("Failed to write '{}'", path_owned)))?;
-            Ok(())
+            let written = file
+                .write_all(&data)
+                .map_err(|e| io_error(e, format!("Failed to write '{}'", path_owned)));
+            close_handle(file, written.as_ref().is_err_and(is_stalled));
+            written
         })
         .await
     }
@@ -2591,13 +2731,9 @@ impl VirtualFileSystem for SftpDriver {
         let path_owned = self.expand_home(path).await?;
         self.with_sftp(move |_, sftp| {
             let mut file = sftp_open_for_write(sftp, &path_owned, offset == 0)?;
-            if offset > 0 {
-                file.seek(SeekFrom::Start(offset))
-                    .map_err(|e| io_error(e, format!("Failed to seek in '{}'", path_owned)))?;
-            }
-            file.write_all(&data)
-                .map_err(|e| io_error(e, format!("Failed to write '{}'", path_owned)))?;
-            Ok(())
+            let written = sftp_write_into(&mut file, &path_owned, offset, &data);
+            close_handle(file, written.as_ref().is_err_and(is_stalled));
+            written
         })
         .await
     }
@@ -2661,7 +2797,6 @@ impl VirtualFileSystem for SftpDriver {
                     }
                 }
                 remove_dir_all_sftp(sftp, &target)
-                    .map_err(|e| ssh_error(e, format!("Failed to delete folder '{}'", target)))
             } else {
                 sftp.rmdir(p)
                     .map_err(|e| ssh_error(e, format!("Failed to delete folder '{}'", target)))
@@ -2779,7 +2914,7 @@ impl VirtualFileSystem for SftpDriver {
             max_results,
         };
         self.with_sftp(move |_, sftp| {
-            Ok(sftp_find_walk(sftp, &query, &FileMaskFilter::new(&mask))
+            Ok(sftp_find_walk(sftp, &query, &FileMaskFilter::new(&mask))?
                 .into_iter()
                 .map(|m| m.entry)
                 .collect())
@@ -2912,7 +3047,7 @@ impl VirtualFileSystem for SftpDriver {
         }
         // No usable shell: walk the tree over SFTP.
         let path_owned = path.to_string();
-        self.with_sftp(move |_, sftp| Ok(sftp_tree_size(sftp, &path_owned)))
+        self.with_sftp(move |_, sftp| sftp_tree_size(sftp, &path_owned))
             .await
     }
 
@@ -2934,7 +3069,7 @@ impl VirtualFileSystem for SftpDriver {
             } else {
                 query.mask.clone()
             };
-            Ok(sftp_find_walk(sftp, &query, &FileMaskFilter::new(&mask)))
+            sftp_find_walk(sftp, &query, &FileMaskFilter::new(&mask))
         })
         .await
     }
@@ -3088,6 +3223,194 @@ mod tests {
         assert!(is_dangerous_recursive_target("."));
         assert!(!is_dangerous_recursive_target("/home/u/tmp"));
         assert_eq!(output_tail(b"abcdef", 3), "...def");
+    }
+
+    #[test]
+    fn listings_are_capped() {
+        let stat = || FileStat {
+            size: Some(1),
+            uid: None,
+            gid: None,
+            perm: Some(0o100644),
+            atime: None,
+            mtime: None,
+        };
+        // A normal listing ends; . and .. and names with a '/' are left out.
+        let mut names = [".", "..", "a", "b/c", "d"].into_iter();
+        let got = collect_listing("/x", 10, 1000, || {
+            Ok(names.next().map(|n| (n.to_string(), stat())))
+        })
+        .unwrap();
+        let got: Vec<_> = got.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(got, ["a", "d"]);
+
+        // Exactly at the limit is fine.
+        let mut left = 3;
+        let got = collect_listing("/x", 3, 1000, || {
+            if left == 0 {
+                return Ok(None);
+            }
+            left -= 1;
+            Ok(Some((format!("f{left}"), stat())))
+        })
+        .unwrap();
+        assert_eq!(got.len(), 3);
+
+        // A server that never ends the listing is stopped at the entry limit...
+        let mut sent = 0u64;
+        let err = collect_listing("/x", 1000, usize::MAX, || {
+            sent += 1;
+            Ok(Some((format!("f{sent}"), stat())))
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, ListingError::TooLarge { entries: 1000 }),
+            "{err:?}"
+        );
+        assert_eq!(sent, 1001);
+        // ...also when it repeats "." forever (nothing is kept, the count still rises)...
+        let err = collect_listing("/x", 50, usize::MAX, || Ok(Some((".".into(), stat()))));
+        assert!(
+            matches!(err, Err(ListingError::TooLarge { entries: 50 })),
+            "{err:?}"
+        );
+        // ...and at the limit for the bytes of names.
+        let err = collect_listing("/x", usize::MAX, 10_000, || {
+            Ok(Some(("n".repeat(100), stat())))
+        });
+        assert!(
+            matches!(err, Err(ListingError::TooLarge { entries: 100 })),
+            "{err:?}"
+        );
+
+        // Reported as a protocol problem of that folder, not as "not found".
+        let err = ListingError::TooLarge { entries: 2_000_000 }.into_core("/big");
+        assert!(matches!(err, CoreError::Protocol(_)), "{err:?}");
+        assert!(err.to_string().contains("'/big'"), "{err}");
+    }
+
+    /// A TCP proxy to `127.0.0.1:target` that holds back what the server sends
+    /// while the returned flag is set. Returns the proxy's port.
+    fn pausing_proxy(target: u16) -> (u16, Arc<AtomicBool>) {
+        use std::io::{Read as _, Write as _};
+        use std::net::{TcpListener, TcpStream};
+        let paused = Arc::new(AtomicBool::new(false));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let p = paused.clone();
+        std::thread::spawn(move || {
+            for client in listener.incoming().flatten() {
+                let server = TcpStream::connect(("127.0.0.1", target)).unwrap();
+                let pump =
+                    |mut from: TcpStream, mut to: TcpStream, hold: Option<Arc<AtomicBool>>| {
+                        std::thread::spawn(move || {
+                            let mut buf = vec![0u8; 64 * 1024];
+                            while let Ok(n @ 1..) = from.read(&mut buf) {
+                                while hold.as_ref().is_some_and(|h| h.load(Ordering::SeqCst)) {
+                                    std::thread::sleep(Duration::from_millis(5));
+                                }
+                                if to.write_all(&buf[..n]).is_err() {
+                                    break;
+                                }
+                            }
+                            let _ = to.shutdown(std::net::Shutdown::Write);
+                        });
+                    };
+                pump(
+                    client.try_clone().unwrap(),
+                    server.try_clone().unwrap(),
+                    None,
+                );
+                pump(server, client, Some(p.clone()));
+            }
+        });
+        (port, paused)
+    }
+
+    fn live_site(port: u16, key: &str) -> ConnectionConfig {
+        ConnectionConfig {
+            id: format!("live-{port}"),
+            name: "live".into(),
+            protocol: Protocol::Sftp,
+            host: "127.0.0.1".into(),
+            port,
+            username: std::env::var("USER").unwrap(),
+            auth: AuthMethod::PrivateKey {
+                path: key.into(),
+                passphrase: None,
+                key_data: None,
+            },
+            remote_root: "/".into(),
+            tls_fingerprint: None,
+            group: None,
+            sftp_mode: crate::types::SftpMode::Auto,
+        }
+    }
+
+    /// The live servers: RUSTSCP_LIVE_SSH_PORT, plus RUSTSCP_LIVE_COMPAT_PORT when set
+    /// (a server without a `Subsystem sftp` line, so the driver uses compatibility
+    /// mode). Yields (port, compatibility mode expected).
+    fn live_ports() -> Vec<(u16, bool)> {
+        let port: u16 = std::env::var("RUSTSCP_LIVE_SSH_PORT")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut ports = vec![(port, false)];
+        if let Ok(p) = std::env::var("RUSTSCP_LIVE_COMPAT_PORT") {
+            ports.push((p.parse().unwrap(), true));
+        }
+        ports
+    }
+
+    /// A slow server is not a lost one, and a silent one fails after the 10 s I/O
+    /// timeout, not later. Same variables as `live_sftp_end_to_end`, plus
+    /// optionally RUSTSCP_LIVE_COMPAT_PORT; about 30 s per server:
+    /// `cargo test -p rustscp-core live_sftp_silent -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn live_sftp_silent_server_timeouts() {
+        let key = std::env::var("RUSTSCP_LIVE_SSH_KEY").unwrap();
+        let dir = std::env::var("RUSTSCP_LIVE_SSH_DIR").unwrap();
+        for (port, compat) in live_ports() {
+            let (proxy_port, paused) = pausing_proxy(port);
+            let slow = SftpDriver::new(live_site(proxy_port, &key));
+            slow.connect().await.unwrap();
+            slow.metadata(&dir).await.unwrap();
+            assert_eq!(slow.compatibility_mode().is_some(), compat, "port {port}");
+            let silent_stat = |secs: u64| {
+                let (slow, paused, dir) = (slow.clone(), paused.clone(), dir.clone());
+                async move {
+                    paused.store(true, Ordering::SeqCst);
+                    let p = paused.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(secs));
+                        p.store(false, Ordering::SeqCst);
+                    });
+                    let t = Instant::now();
+                    let r = slow.metadata(&dir).await;
+                    (r, t.elapsed())
+                }
+            };
+            // Right after a keepalive (libssh2's timer is switched on for it): a
+            // server silent for 4 s is slow, not gone.
+            let (sess, _) = slow.current_session().await.unwrap();
+            task::spawn_blocking(move || send_keepalive(&sess))
+                .await
+                .unwrap()
+                .unwrap();
+            let (r, took) = silent_stat(4).await;
+            assert!(r.is_ok(), "port {port}: {r:?} after {took:?}");
+            assert!(took >= Duration::from_secs(4), "{took:?}");
+            // Silent past the I/O timeout: an error after 10 s, not later.
+            let (r, took) = silent_stat(14).await;
+            assert!(r.is_err(), "port {port}: {r:?}");
+            assert!(
+                took >= Duration::from_millis(8_500) && took < Duration::from_millis(11_500),
+                "port {port}: {took:?} ({r:?})"
+            );
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            slow.metadata(&dir).await.unwrap();
+        }
     }
 
     /// End-to-end check against a real sshd. Ignored by default; run with

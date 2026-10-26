@@ -74,6 +74,9 @@ const SMALL_REPLY: usize = 1024;
 const LISTING_REPLY: usize = 64 * 1024;
 /// A reply that makes no progress for this long fails the request.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+/// libssh2 measures its own timeout in whole seconds, so a timed-out read may
+/// report up to this much early.
+const TIMEOUT_ROUNDING: Duration = Duration::from_millis(1500);
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_SLICE: usize = 64 * 1024;
 
@@ -640,10 +643,11 @@ impl Reader {
                     self.rbuf.extend_from_slice(got);
                     last_progress = Instant::now();
                 }
-                // libssh2 cuts blocking reads short around keepalives: only a
-                // reply that makes no progress for the whole timeout fails.
+                // A timed-out read waited the session's whole I/O timeout
+                // without data; another read is only tried when it ended early
+                // (libssh2 counts whole seconds).
                 Err(e) if e.kind() == ErrorKind::TimedOut => {
-                    if last_progress.elapsed() >= REPLY_TIMEOUT {
+                    if last_progress.elapsed() + TIMEOUT_ROUNDING >= REPLY_TIMEOUT {
                         return Err(self.half.classify(&e));
                     }
                 }

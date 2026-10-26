@@ -3628,6 +3628,7 @@ dependencies = [
  "hex",
  "hmac",
  "libc",
+ "libssh2-sys",
  "notify",
  "pbkdf2",
  "rand 0.8.8",
